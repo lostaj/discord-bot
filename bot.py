@@ -11,7 +11,7 @@ import psutil
 import platform
 from aiohttp import web as aiohttp_web
 from collections import defaultdict, deque
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time
 
 import discord
 from discord.ext import commands, tasks
@@ -1902,7 +1902,7 @@ async def _do_backup(owner_user):
 # ─── BACKGROUND TASKS ─────────────────────────────────────────────────────────
 
 # Fixed: use a proper time object, not a datetime evaluated at startup
-_MIDNIGHT = datetime.time(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0), tzinfo=timezone.utc)
+_MIDNIGHT = time(0, 0, 0, tzinfo=timezone.utc)
 
 @tasks.loop(time=_MIDNIGHT)
 async def midnight_backup():
