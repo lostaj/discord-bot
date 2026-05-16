@@ -7,11 +7,14 @@ import asyncio
 import logging
 import random
 import signal
+import psutil
+import platform
+from aiohttp import web as aiohttp_web
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from groq import AsyncGroq
 import aiohttp
 from dotenv import load_dotenv
@@ -24,17 +27,20 @@ load_dotenv()
 DISCORD_TOKEN      = os.getenv("DISCORD_TOKEN")
 OWNER_ID           = int(os.getenv("OWNER_ID", "0"))
 CMD_PREFIX         = os.getenv("CMD_PREFIX", ".")
-BOT_LOG_CHANNEL_ID = int(os.getenv("BOT_LOG_CHANNEL_ID", "0"))   # <── set in Railway env
+BOT_LOG_CHANNEL_ID = int(os.getenv("BOT_LOG_CHANNEL_ID", "0"))
 
 GROQ_KEYS = [k for k in [os.getenv(f"GROQ_KEY_{i}") for i in range(1, 11)] if k]
 MONGO_URI = os.getenv("MONGO_URI", "")
+HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8080"))
+
+VERSION = "2.0.0"
 
 # ─── ECONOMY CONFIG ────────────────────────────────────────────────────────────
 
-MSG_RARITY   = 1    # 1 = every qualifying message; >1 = 1-in-N chance
-MSG_COOLDOWN = 60   # seconds between coin-earning messages
-MAX_HIST     = 14
+MSG_COOLDOWN = 60
+MAX_HIST     = 20
 MAX_PURGE    = 200
+SNIPE_EXPIRY = 300  # 5 minutes
 
 RANKS = [
     (0,     "💀 Penniless"),
@@ -47,21 +53,21 @@ RANKS = [
     (10000, "🌟 Ajax Legend"),
 ]
 
-MOD_ACTIONS = {
-    "create_role", "delete_role", "rename_role",
-    "create_channel", "delete_channel", "rename_channel", "create_category",
-    "give_role", "remove_role",
-    "ban", "kick", "mute", "unban",
-    "purge", "lock_channel", "unlock_channel", "lockdown", "unlock_all",
-    "set_trust",
-}
-
 def get_rank(coins: int) -> str:
     rank = RANKS[0][1]
     for threshold, title in RANKS:
         if coins >= threshold:
             rank = title
     return rank
+
+def daily_reward(streak: int) -> int:
+    if streak >= 30:
+        return 20
+    if streak >= 7:
+        return 15
+    if streak >= 3:
+        return 12
+    return 10
 
 # ─── LOGGING ───────────────────────────────────────────────────────────────────
 
@@ -70,9 +76,9 @@ log = logging.getLogger(__name__)
 
 # ─── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
 
-DEFAULT_PROMPT = """You are AJ's Assistant, a powerful Discord server bot. You manage roles, channels, members, and more through natural language commands.
+BASE_PROMPT = """You are AJ's Assistant, a powerful Discord server bot. You manage roles, channels, members, and more through natural language commands.
 
-When the owner or a trusted moderator asks you to do something like:
+When the owner asks you to do something like:
 - "make a role called X" / "create a role named X"
 - "make a channel called X" / "create a channel named X"
 - "delete the role X" / "remove the channel X"
@@ -82,8 +88,6 @@ When the owner or a trusted moderator asks you to do something like:
 - "lock the server down" / "lockdown"
 - "rename this channel to X" / "rename role X to Y"
 - "give @user the X role" / "remove the X role from @user"
-- "make @user admin" / "add mod role to @user"
-- "set @user trust to 4"
 - "whois @user"
 - "server report"
 
@@ -110,7 +114,6 @@ The JSON must have an "action" field and relevant params. Examples:
 {"action":"unlock_channel","reason":"Reopening"}
 {"action":"lockdown","reason":"Emergency"}
 {"action":"unlock_all","reason":"Lifting lockdown"}
-{"action":"set_trust","user_id":"123","level":4}
 {"action":"whois","user_id":"123"}
 {"action":"report"}
 {"action":"chat","message":"Your normal conversational reply here"}
@@ -125,8 +128,6 @@ CRITICAL RULES:
 - For ambiguous requests, use action "chat" to ask for clarification.
 - You are friendly, capable, and get things done fast.
 """
-
-BASE_PROMPT = DEFAULT_PROMPT
 
 # ─── DISCORD SETUP ─────────────────────────────────────────────────────────────
 
@@ -163,6 +164,8 @@ mod_logs: deque = deque(maxlen=300)
 dm_logs:  dict  = {}
 economy:  dict  = {}
 activity: dict  = {}
+afk_users: dict = {}
+snipe_cache: dict = {}  # channel_id -> {content, author, author_avatar, ts}
 
 custom_prompt: str | None = None
 prev_prompt:   str | None = None
@@ -174,6 +177,7 @@ error_log:   deque = deque(maxlen=50)
 key_index      = 0
 start_time     = time.time()
 msgs_processed = 0
+_ready_fired   = False
 
 _econ_locks: dict = defaultdict(asyncio.Lock)
 
@@ -266,33 +270,24 @@ async def db_save_prompt():
 async def bot_log(
     title: str,
     description: str = "",
-    color: int = 0x5865F2,
     fields: list[tuple[str, str, bool]] | None = None,
     level: str = "info",
 ):
-    """
-    Send a log embed to the configured BOT_LOG_CHANNEL_ID.
-    Also always logs to the Python logger.
-
-    level: "info" | "warn" | "error" | "mod" | "security"
-    """
     color_map = {
-        "info":     0x5865F2,   # blurple
-        "warn":     0xFFA500,   # orange
-        "error":    0xFF3333,   # red
-        "mod":      0x00C853,   # green
-        "security": 0xFF6B00,   # amber
-        "shutdown": 0x99AAB5,   # grey
-        "startup":  0x43B581,   # green
+        "info":     0x5865F2,
+        "warn":     0xFFA500,
+        "error":    0xFF3333,
+        "mod":      0x00C853,
+        "security": 0xFF6B00,
+        "shutdown": 0x99AAB5,
+        "startup":  0x43B581,
     }
-    color = color_map.get(level, color)
-
+    color = color_map.get(level, 0x5865F2)
     log_fn = log.warning if level in ("warn", "security") else (log.error if level == "error" else log.info)
     log_fn(f"[BOT_LOG:{level.upper()}] {title} — {description[:120]}")
 
     if not BOT_LOG_CHANNEL_ID:
         return
-
     channel = bot.get_channel(BOT_LOG_CHANNEL_ID)
     if not channel:
         return
@@ -307,7 +302,6 @@ async def bot_log(
         for name, value, inline in fields:
             embed.add_field(name=name, value=str(value)[:1024], inline=inline)
     embed.set_footer(text=f"AJ's Assistant • {level.upper()}")
-
     try:
         await channel.send(embed=embed)
     except Exception as e:
@@ -332,7 +326,7 @@ def get_econ(uid: int) -> dict:
     return e
 
 def save_econ(uid: int):
-    asyncio.ensure_future(db_save_economy(str(uid)))
+    asyncio.create_task(db_save_economy(str(uid)))
 
 # ─── COLOR MAP ─────────────────────────────────────────────────────────────────
 
@@ -361,26 +355,25 @@ def resolve_color(name: str) -> discord.Color:
 def active_prompt() -> str:
     return custom_prompt if custom_prompt else BASE_PROMPT
 
-def get_trust(uid: int) -> int:
-    if uid == OWNER_ID:
-        return 5
-    return registry.get(str(uid), {}).get("trust", 2)
+def is_owner(uid: int) -> bool:
+    return uid == OWNER_ID
 
-def set_trust(uid: int, level: int):
-    registry.setdefault(str(uid), {})["trust"] = level
-    registry[str(uid)]["uid"] = str(uid)
-    asyncio.ensure_future(db_save_user(str(uid)))
+def safe_int(val, default: int = 0) -> int:
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
 
 def get_mem(uid: int) -> dict:
     return memory.get(str(uid), {})
 
 def update_mem(uid: int, data: dict):
     memory.setdefault(str(uid), {}).update(data)
-    asyncio.ensure_future(db_save_mem(str(uid)))
+    asyncio.create_task(db_save_mem(str(uid)))
 
 def clear_mem(uid: int):
     memory.pop(str(uid), None)
-    asyncio.ensure_future(db_save_mem(str(uid)))
+    asyncio.create_task(db_save_mem(str(uid)))
 
 def log_mod(action: str, target, by: int, reason: str = ""):
     mod_logs.append({
@@ -390,7 +383,7 @@ def log_mod(action: str, target, by: int, reason: str = ""):
         "reason": reason,
         "ts":     datetime.now(timezone.utc).isoformat(),
     })
-    asyncio.ensure_future(db_save_mod_logs())
+    asyncio.create_task(db_save_mod_logs())
 
 def track_activity(uid: int, cid: int):
     key = str(uid)
@@ -400,23 +393,27 @@ def track_activity(uid: int, cid: int):
     activity[key]["channels"][str(cid)] = activity[key]["channels"].get(str(cid), 0) + 1
 
 def register_user(author: discord.Member | discord.User):
-    key    = str(author.id)
-    is_new = key not in registry
-    registry.setdefault(key, {"trust": 2})
+    key = str(author.id)
+    existing = registry.get(key, {})
+    registry.setdefault(key, {})
     registry[key]["uid"]          = key
     registry[key]["username"]     = author.name
     registry[key]["display_name"] = author.display_name
-    if is_new:
-        asyncio.ensure_future(db_save_user(key))
+    changed = (
+        existing.get("username") != author.name or
+        existing.get("display_name") != author.display_name or
+        key not in existing
+    )
+    if changed:
+        asyncio.create_task(db_save_user(key))
 
-def build_context(msg: discord.Message, trust: int) -> str:
-    is_owner = msg.author.id == OWNER_ID
-    roles    = [r.name for r in getattr(msg.author, "roles", []) if r.name != "@everyone"]
-    mem      = get_mem(msg.author.id)
+def build_context(msg: discord.Message, guild: discord.Guild | None = None) -> str:
+    author   = msg.author
+    owner    = is_owner(author.id)
+    roles    = [r.name for r in getattr(author, "roles", []) if r.name != "@everyone"]
+    mem      = get_mem(author.id)
 
-    parts = [f"[CTX] User={msg.author.name}(ID={msg.author.id}) Trust={trust}"]
-    if is_owner:
-        parts.append("OWNER=true")
+    parts = [f"[CTX] User={author.name}(ID={author.id}) IsOwner={owner}"]
     if roles:
         parts.append(f"Roles={','.join(roles[:5])}")
     if mem:
@@ -426,9 +423,132 @@ def build_context(msg: discord.Message, trust: int) -> str:
     if msg.reference and hasattr(msg.reference, "resolved") and msg.reference.resolved:
         ref = msg.reference.resolved
         parts.append(f'ReplyTo={ref.author.name}:"{ref.content[:80]}"')
+
+    if guild:
+        parts.append(f"Guild={guild.name}(ID={guild.id})")
+        parts.append(f"MemberCount={guild.member_count}")
+        parts.append(f"Channels={len(guild.channels)}")
+        parts.append(f"Roles={len(guild.roles)}")
+        online = sum(1 for m in guild.members if m.status != discord.Status.offline)
+        parts.append(f"Online={online}")
+        boost = guild.premium_subscription_count or 0
+        parts.append(f"BoostLevel={guild.premium_tier} Boosts={boost}")
+        owner_member = guild.owner
+        if owner_member:
+            parts.append(f"GuildOwner={owner_member.name}:{owner_member.id}")
+
     return " | ".join(parts)
 
-# ─── SUSPICIOUS MESSAGE DETECTION ─────────────────────────────────────────────
+async def build_full_server_scan(guild: discord.Guild) -> str:
+    lines = []
+
+    lines.append(f"=== SERVER: {guild.name} (ID: {guild.id}) ===")
+    lines.append(f"Owner: {guild.owner} ({guild.owner_id})")
+    lines.append(f"Created: {guild.created_at.strftime('%Y-%m-%d')}")
+    lines.append(f"Members: {guild.member_count} total")
+    humans = sum(1 for m in guild.members if not m.bot)
+    bots   = sum(1 for m in guild.members if m.bot)
+    online = sum(1 for m in guild.members if m.status != discord.Status.offline)
+    lines.append(f"Humans: {humans} | Bots: {bots} | Online: {online}")
+    lines.append(f"Boost Level: {guild.premium_tier} | Boosts: {guild.premium_subscription_count}")
+    lines.append(f"Verification: {guild.verification_level} | MFA: {guild.mfa_level}")
+    lines.append(f"Description: {guild.description or 'None'}")
+    lines.append(f"Icon: {guild.icon.url if guild.icon else 'None'}")
+    lines.append(f"Banner: {guild.banner.url if guild.banner else 'None'}")
+
+    lines.append("\n=== MEMBERS ===")
+    for m in guild.members:
+        roles = [r.name for r in m.roles if r.name != "@everyone"]
+        joined = m.joined_at.strftime('%Y-%m-%d') if m.joined_at else "unknown"
+        created = m.created_at.strftime('%Y-%m-%d')
+        avatar = str(m.display_avatar.url)
+        status = str(m.status)
+        boosting = bool(m.premium_since)
+        activity_name = str(m.activity) if m.activity else "None"
+        lines.append(
+            f"  {m.display_name} ({m.name}, ID:{m.id}) | Bot:{m.bot} | "
+            f"Joined:{joined} | Created:{created} | Status:{status} | "
+            f"Boosting:{boosting} | Roles:[{', '.join(roles)}] | "
+            f"Avatar:{avatar} | Activity:{activity_name}"
+        )
+
+    lines.append("\n=== ROLES ===")
+    for r in sorted(guild.roles, key=lambda x: x.position, reverse=True):
+        perms = [p for p, v in r.permissions if v]
+        lines.append(
+            f"  {r.name} (ID:{r.id}) | Color:{r.color} | Pos:{r.position} | "
+            f"Members:{len(r.members)} | Mentionable:{r.mentionable} | "
+            f"Hoisted:{r.hoist} | Managed:{r.managed} | Perms:[{', '.join(perms[:8])}]"
+        )
+
+    lines.append("\n=== CATEGORIES ===")
+    for cat in guild.categories:
+        lines.append(f"  {cat.name} (ID:{cat.id}) | Channels:{len(cat.channels)}")
+
+    lines.append("\n=== CHANNELS ===")
+    for ch in guild.channels:
+        cat = ch.category.name if ch.category else "None"
+        if isinstance(ch, discord.TextChannel):
+            lines.append(
+                f"  #{ch.name} (ID:{ch.id}) | Type:text | Cat:{cat} | "
+                f"Topic:{(ch.topic or 'None')[:60]} | NSFW:{ch.is_nsfw()} | "
+                f"Slowmode:{ch.slowmode_delay}s | Pos:{ch.position}"
+            )
+        elif isinstance(ch, discord.VoiceChannel):
+            lines.append(
+                f"  🔊{ch.name} (ID:{ch.id}) | Type:voice | Cat:{cat} | "
+                f"Bitrate:{ch.bitrate} | UserLimit:{ch.user_limit} | Members:{len(ch.members)}"
+            )
+        else:
+            lines.append(f"  {ch.name} (ID:{ch.id}) | Type:{type(ch).__name__} | Cat:{cat}")
+
+    lines.append("\n=== EMOJIS ===")
+    for e in guild.emojis:
+        lines.append(f"  :{e.name}: (ID:{e.id}) | Animated:{e.animated} | URL:{e.url}")
+
+    lines.append("\n=== STICKERS ===")
+    for s in guild.stickers:
+        lines.append(f"  {s.name} (ID:{s.id}) | Format:{s.format}")
+
+    try:
+        bans = [entry async for entry in guild.bans(limit=50)]
+        lines.append(f"\n=== BANS (up to 50) ===")
+        for ban in bans:
+            lines.append(f"  {ban.user} (ID:{ban.user.id}) | Reason:{ban.reason}")
+    except Exception:
+        pass
+
+    try:
+        invites = await guild.invites()
+        lines.append(f"\n=== INVITES ===")
+        for inv in invites:
+            lines.append(
+                f"  {inv.code} | Creator:{inv.inviter} | Uses:{inv.uses} | "
+                f"Max:{inv.max_uses} | Channel:#{inv.channel.name if inv.channel else 'N/A'}"
+            )
+    except Exception:
+        pass
+
+    try:
+        webhooks = await guild.webhooks()
+        lines.append(f"\n=== WEBHOOKS ===")
+        for wh in webhooks:
+            lines.append(f"  {wh.name} (ID:{wh.id}) | Channel:{wh.channel}")
+    except Exception:
+        pass
+
+    try:
+        events = guild.scheduled_events
+        if events:
+            lines.append(f"\n=== SCHEDULED EVENTS ===")
+            for ev in events:
+                lines.append(f"  {ev.name} | Start:{ev.start_time} | Status:{ev.status}")
+    except Exception:
+        pass
+
+    return "\n".join(lines)
+
+# ─── INJECTION DETECTION ──────────────────────────────────────────────────────
 
 INJECTION_PATTERNS = [
     r"ignore (all |previous |your )?instructions",
@@ -436,12 +556,12 @@ INJECTION_PATTERNS = [
     r"you are now",
     r"forget everything",
     r"disregard (all |your )?",
-    r"act as (a |an )?(?!aj)",          # "act as a DAN" etc
+    r"act as (a |an )?(?!aj)",
     r"jailbreak",
     r"pretend (you are|to be)",
     r"override (your )?(instructions|prompt|rules)",
     r"\[system\]",
-    r"<\|",                              # token injection attempts
+    r"<\|",
 ]
 _injection_re = re.compile("|".join(INJECTION_PATTERNS), re.IGNORECASE)
 
@@ -454,7 +574,12 @@ async def call_ai(history: list, system: str | None = None) -> str:
     global key_index, msgs_processed
 
     if not GROQ_KEYS:
-        return '{"action":"chat","message":"No Groq API keys configured. Add GROQ_KEY_1 to your .env file."}'
+        return '{"action":"chat","message":"No Groq API keys configured."}'
+
+    clean_history = [
+        m for m in history
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)
+    ]
 
     sys_content = system if system else active_prompt()
 
@@ -465,7 +590,7 @@ async def call_ai(history: list, system: str | None = None) -> str:
             resp   = await asyncio.wait_for(
                 client.chat.completions.create(
                     model="llama-3.3-70b-versatile",
-                    messages=[{"role": "system", "content": sys_content}] + history,
+                    messages=[{"role": "system", "content": sys_content}] + clean_history,
                     max_tokens=400,
                     temperature=0.4,
                 ),
@@ -504,7 +629,29 @@ async def web_search(query: str) -> str:
     except Exception as e:
         return f"Search error: {e}"
 
-# ─── ACTION EXECUTOR ───────────────────────────────────────────────────────────
+# ─── PARSE AI RESPONSE ────────────────────────────────────────────────────────
+
+def parse_ai_json(raw: str) -> dict | None:
+    raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+    match = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            pass
+    return None
+
+# ─── OWNER MOD ACTIONS SET ────────────────────────────────────────────────────
+
+OWNER_ACTIONS = {
+    "create_role", "delete_role", "rename_role",
+    "create_channel", "delete_channel", "rename_channel", "create_category",
+    "give_role", "remove_role",
+    "ban", "kick", "mute", "unban",
+    "purge", "lock_channel", "unlock_channel", "lockdown", "unlock_all",
+}
+
+# ─── ACTION EXECUTOR ──────────────────────────────────────────────────────────
 
 async def execute_action(msg: discord.Message, data: dict) -> str | None:
     guild  = msg.guild
@@ -524,12 +671,7 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
         try:
             role = await guild.create_role(name=name, color=color, mentionable=mentionable, hoist=hoisted, reason=reason)
             log_mod("create_role", role.id, author.id, name)
-            asyncio.ensure_future(bot_log(
-                "🛡️ Role Created",
-                f"**{name}** created by {author.mention}",
-                fields=[("Role", role.mention, True), ("Requested By", author.display_name, True)],
-                level="mod"
-            ))
+            asyncio.create_task(bot_log("🛡️ Role Created", f"**{name}** created by {author.mention}", fields=[("Role", role.mention, True), ("By", author.display_name, True)], level="mod"))
             return f"✅ Role **{role.name}** created! ({role.mention})"
         except discord.Forbidden:
             return "❌ I don't have permission to create roles."
@@ -545,11 +687,7 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
         try:
             await role.delete(reason=reason)
             log_mod("delete_role", role.id, author.id, name)
-            asyncio.ensure_future(bot_log(
-                "🗑️ Role Deleted",
-                f"**{name}** deleted by {author.mention}",
-                level="mod"
-            ))
+            asyncio.create_task(bot_log("🗑️ Role Deleted", f"**{name}** deleted by {author.mention}", level="mod"))
             return f"✅ Role **{name}** deleted."
         except discord.Forbidden:
             return "❌ Missing permissions."
@@ -566,11 +704,7 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
         try:
             await role.edit(name=new, reason=reason)
             log_mod("rename_role", role.id, author.id, f"{old} → {new}")
-            asyncio.ensure_future(bot_log(
-                "✏️ Role Renamed",
-                f"**{old}** → **{new}** by {author.mention}",
-                level="mod"
-            ))
+            asyncio.create_task(bot_log("✏️ Role Renamed", f"**{old}** → **{new}** by {author.mention}", level="mod"))
             return f"✅ Role renamed from **{old}** to **{new}**."
         except discord.Forbidden:
             return "❌ Missing permissions."
@@ -595,11 +729,7 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
             else:
                 ch = await guild.create_text_channel(name=name, topic=topic, category=category, reason=reason)
             log_mod("create_channel", ch.id, author.id, name)
-            asyncio.ensure_future(bot_log(
-                "📢 Channel Created",
-                f"**#{name}** ({ch_type}) by {author.mention}",
-                level="mod"
-            ))
+            asyncio.create_task(bot_log("📢 Channel Created", f"**#{name}** ({ch_type}) by {author.mention}", level="mod"))
             return f"✅ Channel **#{ch.name}** created! ({ch.mention})"
         except discord.Forbidden:
             return "❌ I don't have permission to create channels."
@@ -615,11 +745,7 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
         try:
             await ch.delete(reason=reason)
             log_mod("delete_channel", ch.id, author.id, name)
-            asyncio.ensure_future(bot_log(
-                "🗑️ Channel Deleted",
-                f"**#{name}** deleted by {author.mention}",
-                level="mod"
-            ))
+            asyncio.create_task(bot_log("🗑️ Channel Deleted", f"**#{name}** deleted by {author.mention}", level="mod"))
             return f"✅ Channel **{name}** deleted."
         except discord.Forbidden:
             return "❌ Missing permissions."
@@ -636,11 +762,7 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
         try:
             await ch.edit(name=new, reason=reason)
             log_mod("rename_channel", ch.id, author.id, f"{old} → {new}")
-            asyncio.ensure_future(bot_log(
-                "✏️ Channel Renamed",
-                f"**#{old}** → **#{new}** by {author.mention}",
-                level="mod"
-            ))
+            asyncio.create_task(bot_log("✏️ Channel Renamed", f"**#{old}** → **#{new}** by {author.mention}", level="mod"))
             return f"✅ Channel renamed to **#{new}**."
         except discord.Forbidden:
             return "❌ Missing permissions."
@@ -654,11 +776,7 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
         try:
             cat = await guild.create_category(name=name, reason=reason)
             log_mod("create_category", cat.id, author.id, name)
-            asyncio.ensure_future(bot_log(
-                "📁 Category Created",
-                f"**{name}** by {author.mention}",
-                level="mod"
-            ))
+            asyncio.create_task(bot_log("📁 Category Created", f"**{name}** by {author.mention}", level="mod"))
             return f"✅ Category **{cat.name}** created!"
         except discord.Forbidden:
             return "❌ Missing permissions."
@@ -667,21 +785,17 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
 
     if action == "give_role":
         if not guild: return "Can't do that in DMs."
-        uid       = int(data.get("user_id", 0))
+        uid_val   = safe_int(data.get("user_id", 0))
         role_name = data.get("role_name", "")
         reason    = data.get("reason", f"Requested by {author.name}")
-        member    = guild.get_member(uid) or (msg.mentions[0] if msg.mentions else None)
+        member    = guild.get_member(uid_val) or (msg.mentions[0] if msg.mentions else None)
         if not member: return "❌ Couldn't find that user."
         role = discord.utils.find(lambda r: r.name.lower() == role_name.lower(), guild.roles)
         if not role: return f"❌ Role **{role_name}** not found."
         try:
             await member.add_roles(role, reason=reason)
             log_mod("give_role", member.id, author.id, role_name)
-            asyncio.ensure_future(bot_log(
-                "🎖️ Role Given",
-                f"**{role_name}** given to {member.mention} by {author.mention}",
-                level="mod"
-            ))
+            asyncio.create_task(bot_log("🎖️ Role Given", f"**{role_name}** → {member.mention} by {author.mention}", level="mod"))
             return f"✅ Gave **{role_name}** to {member.mention}."
         except discord.Forbidden:
             return "❌ Missing permissions."
@@ -690,21 +804,17 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
 
     if action == "remove_role":
         if not guild: return "Can't do that in DMs."
-        uid       = int(data.get("user_id", 0))
+        uid_val   = safe_int(data.get("user_id", 0))
         role_name = data.get("role_name", "")
         reason    = data.get("reason", f"Requested by {author.name}")
-        member    = guild.get_member(uid) or (msg.mentions[0] if msg.mentions else None)
+        member    = guild.get_member(uid_val) or (msg.mentions[0] if msg.mentions else None)
         if not member: return "❌ Couldn't find that user."
         role = discord.utils.find(lambda r: r.name.lower() == role_name.lower(), guild.roles)
         if not role: return f"❌ Role **{role_name}** not found."
         try:
             await member.remove_roles(role, reason=reason)
             log_mod("remove_role", member.id, author.id, role_name)
-            asyncio.ensure_future(bot_log(
-                "🎖️ Role Removed",
-                f"**{role_name}** removed from {member.mention} by {author.mention}",
-                level="mod"
-            ))
+            asyncio.create_task(bot_log("🎖️ Role Removed", f"**{role_name}** from {member.mention} by {author.mention}", level="mod"))
             return f"✅ Removed **{role_name}** from {member.mention}."
         except discord.Forbidden:
             return "❌ Missing permissions."
@@ -713,19 +823,14 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
 
     if action == "ban":
         if not guild: return "Can't do that in DMs."
-        uid    = int(data.get("user_id", 0))
-        reason = data.get("reason", f"Banned by {author.name}")
-        member = guild.get_member(uid) or (msg.mentions[0] if msg.mentions else None)
+        uid_val = safe_int(data.get("user_id", 0))
+        reason  = data.get("reason", f"Banned by {author.name}")
+        member  = guild.get_member(uid_val) or (msg.mentions[0] if msg.mentions else None)
         if not member: return "❌ Couldn't find that user."
         try:
             await guild.ban(member, reason=reason)
             log_mod("ban", member.id, author.id, reason)
-            asyncio.ensure_future(bot_log(
-                "🔨 Member Banned",
-                f"**{member}** (`{member.id}`) banned by {author.mention}",
-                fields=[("Reason", reason, False)],
-                level="mod"
-            ))
+            asyncio.create_task(bot_log("🔨 Member Banned", f"**{member}** banned by {author.mention}", fields=[("Reason", reason, False)], level="mod"))
             return f"🔨 **{member.name}** has been banned. Reason: {reason}"
         except discord.Forbidden:
             return "❌ Missing permissions to ban."
@@ -734,19 +839,14 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
 
     if action == "kick":
         if not guild: return "Can't do that in DMs."
-        uid    = int(data.get("user_id", 0))
-        reason = data.get("reason", f"Kicked by {author.name}")
-        member = guild.get_member(uid) or (msg.mentions[0] if msg.mentions else None)
+        uid_val = safe_int(data.get("user_id", 0))
+        reason  = data.get("reason", f"Kicked by {author.name}")
+        member  = guild.get_member(uid_val) or (msg.mentions[0] if msg.mentions else None)
         if not member: return "❌ Couldn't find that user."
         try:
             await guild.kick(member, reason=reason)
             log_mod("kick", member.id, author.id, reason)
-            asyncio.ensure_future(bot_log(
-                "👢 Member Kicked",
-                f"**{member}** (`{member.id}`) kicked by {author.mention}",
-                fields=[("Reason", reason, False)],
-                level="mod"
-            ))
+            asyncio.create_task(bot_log("👢 Member Kicked", f"**{member}** kicked by {author.mention}", fields=[("Reason", reason, False)], level="mod"))
             return f"👢 **{member.name}** has been kicked. Reason: {reason}"
         except discord.Forbidden:
             return "❌ Missing permissions to kick."
@@ -755,40 +855,31 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
 
     if action == "mute":
         if not guild: return "Can't do that in DMs."
-        uid    = int(data.get("user_id", 0))
-        secs   = int(data.get("seconds", 300))
-        reason = data.get("reason", f"Muted by {author.name}")
-        member = guild.get_member(uid) or (msg.mentions[0] if msg.mentions else None)
+        uid_val = safe_int(data.get("user_id", 0))
+        secs    = safe_int(data.get("seconds", 300))
+        reason  = data.get("reason", f"Muted by {author.name}")
+        member  = guild.get_member(uid_val) or (msg.mentions[0] if msg.mentions else None)
         if not member: return "❌ Couldn't find that user."
-        until  = discord.utils.utcnow() + timedelta(seconds=secs)
+        until   = discord.utils.utcnow() + timedelta(seconds=secs)
         try:
             await member.timeout(until, reason=reason)
             log_mod("mute", member.id, author.id, f"{secs}s — {reason}")
-            asyncio.ensure_future(bot_log(
-                "🔇 Member Muted",
-                f"**{member}** muted for {secs//60}m by {author.mention}",
-                fields=[("Reason", reason, False), ("Duration", f"{secs}s", True)],
-                level="mod"
-            ))
+            asyncio.create_task(bot_log("🔇 Member Muted", f"**{member}** muted {secs//60}m by {author.mention}", fields=[("Reason", reason, False), ("Duration", f"{secs}s", True)], level="mod"))
             return f"🔇 **{member.name}** muted for {secs // 60} min(s). Reason: {reason}"
         except discord.Forbidden:
             return "❌ Missing permissions to mute."
-        except Exception as e:
-            return f"❌ Error: {e}"
+        except discord.HTTPException as e:
+            return f"❌ Could not mute (they may be higher in hierarchy): {e}"
 
     if action == "unban":
         if not guild: return "Can't do that in DMs."
-        uid    = int(data.get("user_id", 0))
-        reason = data.get("reason", "Appeal accepted")
+        uid_val = safe_int(data.get("user_id", 0))
+        reason  = data.get("reason", "Appeal accepted")
         try:
-            user = await bot.fetch_user(uid)
+            user = await bot.fetch_user(uid_val)
             await guild.unban(user, reason=reason)
-            log_mod("unban", uid, author.id, reason)
-            asyncio.ensure_future(bot_log(
-                "✅ Member Unbanned",
-                f"**{user}** (`{uid}`) unbanned by {author.mention}",
-                level="mod"
-            ))
+            log_mod("unban", uid_val, author.id, reason)
+            asyncio.create_task(bot_log("✅ Member Unbanned", f"**{user}** unbanned by {author.mention}", level="mod"))
             return f"✅ **{user.name}** unbanned."
         except discord.NotFound:
             return "❌ User not found in ban list."
@@ -797,16 +888,12 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
 
     if action == "purge":
         if not guild: return "Can't do that in DMs."
-        count  = min(int(data.get("count", 10)), MAX_PURGE)
+        count  = min(safe_int(data.get("count", 10)), MAX_PURGE)
         reason = data.get("reason", f"Purge by {author.name}")
         try:
             deleted = await msg.channel.purge(limit=count + 1)
             log_mod("purge", msg.channel.id, author.id, f"{len(deleted)} msgs")
-            asyncio.ensure_future(bot_log(
-                "🗑️ Messages Purged",
-                f"**{len(deleted)-1}** messages purged in {msg.channel.mention} by {author.mention}",
-                level="mod"
-            ))
+            asyncio.create_task(bot_log("🗑️ Messages Purged", f"**{len(deleted)-1}** msgs purged in {msg.channel.mention} by {author.mention}", level="mod"))
             await msg.channel.send(f"🗑️ Purged **{len(deleted) - 1}** messages.", delete_after=5)
             return None
         except discord.Forbidden:
@@ -823,11 +910,7 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
         try:
             await ch.set_permissions(guild.default_role, overwrite=ow, reason=reason)
             log_mod("lock", ch.id, author.id)
-            asyncio.ensure_future(bot_log(
-                "🔒 Channel Locked",
-                f"{ch.mention} locked by {author.mention}",
-                level="mod"
-            ))
+            asyncio.create_task(bot_log("🔒 Channel Locked", f"{ch.mention} locked by {author.mention}", level="mod"))
             return f"🔒 {ch.mention} is now locked."
         except discord.Forbidden:
             return "❌ Missing permissions."
@@ -843,11 +926,7 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
         try:
             await ch.set_permissions(guild.default_role, overwrite=ow, reason=reason)
             log_mod("unlock", ch.id, author.id)
-            asyncio.ensure_future(bot_log(
-                "🔓 Channel Unlocked",
-                f"{ch.mention} unlocked by {author.mention}",
-                level="mod"
-            ))
+            asyncio.create_task(bot_log("🔓 Channel Unlocked", f"{ch.mention} unlocked by {author.mention}", level="mod"))
             return f"🔓 {ch.mention} is now unlocked."
         except discord.Forbidden:
             return "❌ Missing permissions."
@@ -857,74 +936,56 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
     if action == "lockdown":
         if not guild: return "Can't do that in DMs."
         reason = data.get("reason", f"Lockdown by {author.name}")
-        locked = 0
-        for ch in guild.text_channels:
+        async def lock_ch(ch):
             try:
                 ow = ch.overwrites_for(guild.default_role)
                 ow.send_messages = False
                 await ch.set_permissions(guild.default_role, overwrite=ow)
-                locked += 1
+                return True
             except Exception:
-                pass
+                return False
+        results = await asyncio.gather(*[lock_ch(ch) for ch in guild.text_channels])
+        locked  = sum(results)
         log_mod("lockdown", 0, author.id, reason)
-        asyncio.ensure_future(bot_log(
-            "🚨 SERVER LOCKDOWN",
-            f"**{locked} channels** locked by {author.mention}\nReason: {reason}",
-            level="warn"
-        ))
+        asyncio.create_task(bot_log("🚨 SERVER LOCKDOWN", f"**{locked} channels** locked by {author.mention}\nReason: {reason}", level="warn"))
         return f"🔒 **LOCKDOWN ACTIVE** — {locked} channels locked. Reason: {reason}"
 
     if action == "unlock_all":
         if not guild: return "Can't do that in DMs."
-        reason   = data.get("reason", f"Unlock all by {author.name}")
-        unlocked = 0
-        for ch in guild.text_channels:
+        reason = data.get("reason", f"Unlock all by {author.name}")
+        async def unlock_ch(ch):
             try:
                 ow = ch.overwrites_for(guild.default_role)
                 ow.send_messages = None
                 await ch.set_permissions(guild.default_role, overwrite=ow)
-                unlocked += 1
+                return True
             except Exception:
-                pass
+                return False
+        results  = await asyncio.gather(*[unlock_ch(ch) for ch in guild.text_channels])
+        unlocked = sum(results)
         log_mod("unlock_all", 0, author.id, reason)
-        asyncio.ensure_future(bot_log(
-            "🔓 Server Unlocked",
-            f"**{unlocked} channels** unlocked by {author.mention}",
-            level="mod"
-        ))
+        asyncio.create_task(bot_log("🔓 Server Unlocked", f"**{unlocked} channels** unlocked by {author.mention}", level="mod"))
         return f"🔓 All channels unlocked ({unlocked} total)."
-
-    if action == "set_trust":
-        uid   = int(data.get("user_id", 0))
-        level = int(data.get("level", 2))
-        set_trust(uid, level)
-        member = guild.get_member(uid) if guild else None
-        name   = member.display_name if member else str(uid)
-        asyncio.ensure_future(bot_log(
-            "🔑 Trust Level Changed",
-            f"**{name}** set to trust **{level}** by {author.mention}",
-            level="mod"
-        ))
-        return f"✅ Set **{name}**'s trust level to **{level}**."
 
     if action == "whois":
         if not guild: return "Can't do that in DMs."
-        uid  = int(data.get("user_id", 0))
-        tgt  = guild.get_member(uid) or (msg.mentions[0] if msg.mentions else None)
+        uid_val = safe_int(data.get("user_id", 0))
+        tgt     = guild.get_member(uid_val) or (msg.mentions[0] if msg.mentions else None)
         if not tgt: return "❌ User not found."
-        act   = activity.get(str(tgt.id), {})
-        warns = [e for e in mod_logs if e["target"] == str(tgt.id)]
-        mem   = get_mem(tgt.id)
-        econ  = get_econ(tgt.id)
-        join  = getattr(tgt, "joined_at", None)
-        roles = [r.name for r in tgt.roles if r.name != "@everyone"]
-        lines = [
+        act    = activity.get(str(tgt.id), {})
+        warns  = [e for e in mod_logs if e["target"] == str(tgt.id)]
+        mem    = get_mem(tgt.id)
+        econ   = get_econ(tgt.id)
+        join   = getattr(tgt, "joined_at", None)
+        roles  = [r.name for r in tgt.roles if r.name != "@everyone"]
+        lines  = [
             f"**👤 {tgt.display_name}** (`{tgt.name}` | `{tgt.id}`)",
             f"Joined: {join.strftime('%Y-%m-%d') if join else 'N/A'} | Created: {tgt.created_at.strftime('%Y-%m-%d')}",
-            f"Trust: **{get_trust(tgt.id)}** | Session msgs: {act.get('count', 0)} | Last active: {(act.get('last') or 'never')[:10]}",
+            f"Session msgs: {act.get('count', 0)} | Last active: {(act.get('last') or 'never')[:10]}",
             f"Roles: {', '.join(roles[:8]) or 'none'}",
-            f"Mod actions: {len(warns)}",
+            f"Mod actions on record: {len(warns)}",
             f"Ajax Coins: **{econ['coins']:,}** ({get_rank(econ['coins'])})",
+            f"Avatar: {tgt.display_avatar.url}",
         ]
         if mem:
             lines.append("Notes: " + ", ".join(f"{k}={v}" for k, v in list(mem.items())[:4]))
@@ -949,9 +1010,14 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
         for k, v in richest:
             m = guild.get_member(int(k))
             rich_names.append(f"{m.display_name if m else k} ({v.get('coins', 0):,}🪙)")
+        humans = sum(1 for m in guild.members if not m.bot)
+        bots   = sum(1 for m in guild.members if m.bot)
+        online = sum(1 for m in guild.members if m.status != discord.Status.offline)
         return (
             f"**📊 Server Report — {guild.name}**\n"
-            f"Members: {guild.member_count} | Channels: {len(guild.channels)} | Roles: {len(guild.roles)}\n"
+            f"Members: {guild.member_count} ({humans} humans, {bots} bots) | Online: {online}\n"
+            f"Channels: {len(guild.channels)} | Roles: {len(guild.roles)}\n"
+            f"Boost Level: {guild.premium_tier} | Boosts: {guild.premium_subscription_count}\n"
             f"Most active this week: {', '.join(top_names) or 'no data'}\n"
             f"Inactive 30+ days (session): {inactive}\n"
             f"Tracked this session: {len(activity)}\n"
@@ -961,191 +1027,477 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
 
     return f"❓ Unknown action: {action}"
 
-# ─── PARSE AI RESPONSE ─────────────────────────────────────────────────────────
+# ─── CORE PROCESS (AI) ────────────────────────────────────────────────────────
 
-def parse_ai_json(raw: str) -> dict | None:
-    raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except Exception:
-            pass
-    return None
+async def process(msg: discord.Message, is_dm: bool = False):
+    author  = msg.author
+    uid     = author.id
+    content = msg.content.strip()
+    owner   = is_owner(uid)
 
-# ─── COMMANDS ──────────────────────────────────────────────────────────────────
+    now_ts = time.time()
+    if not owner:
+        cooldown = 4.0
+        last     = rate_limits[uid]
+        if now_ts - last < cooldown:
+            remaining_secs = int(cooldown - (now_ts - last)) + 1
+            embed = discord.Embed(
+                description=f"⏱️ Slow down! Please wait **{remaining_secs}s** before messaging again.",
+                color=0xFFA500,
+                timestamp=datetime.now(timezone.utc),
+            )
+            await msg.reply(embed=embed, mention_author=False)
+            return
+        rate_limits[uid] = now_ts
+
+    if is_suspicious(content):
+        asyncio.create_task(bot_log(
+            "⚠️ Suspicious / Injection Attempt",
+            f"**{author}** (`{uid}`)",
+            fields=[
+                ("Message", f"```{content[:500]}```", False),
+                ("Channel", getattr(msg.channel, "mention", "DM"), True),
+            ],
+            level="security"
+        ))
+
+    if not is_dm:
+        track_activity(uid, msg.channel.id)
+    register_user(author)
+
+    ctx_line        = build_context(msg, msg.guild)
+    system_with_ctx = f"{active_prompt()}\n\n{ctx_line}"
+    user_payload    = content
+
+    hist_key = f"dm_{uid}" if is_dm else f"ch_{msg.channel.id}_u_{uid}"
+    hist     = histories[hist_key]
+
+    hist.append({"role": "user", "content": user_payload})
+    if len(hist) > MAX_HIST:
+        histories[hist_key] = hist[-MAX_HIST:]
+    hist = histories[hist_key]
+
+    if len(histories) > 500:
+        oldest_keys = list(histories.keys())[:100]
+        for k in oldest_keys:
+            del histories[k]
+
+    async with msg.channel.typing():
+        raw = await call_ai(hist, system=system_with_ctx)
+
+    histories[hist_key].append({"role": "assistant", "content": raw})
+    if len(histories[hist_key]) > MAX_HIST:
+        histories[hist_key] = histories[hist_key][-MAX_HIST:]
+
+    parsed = parse_ai_json(raw)
+    if parsed:
+        action = parsed.get("action", "chat")
+        if action in OWNER_ACTIONS and not owner:
+            embed = discord.Embed(
+                description="❌ Only the server owner can use moderation commands.",
+                color=0xFF3333,
+                timestamp=datetime.now(timezone.utc),
+            )
+            await msg.reply(embed=embed, mention_author=False)
+            asyncio.create_task(bot_log(
+                "🔒 Unauthorized Mod Attempt",
+                f"**{author}** (`{uid}`) tried `{action}`",
+                fields=[("Message", content[:300], False)],
+                level="security"
+            ))
+            return
+        reply = await execute_action(msg, parsed)
+        if reply:
+            embed = discord.Embed(
+                description=reply,
+                color=0x5865F2,
+                timestamp=datetime.now(timezone.utc),
+            )
+            await msg.reply(embed=embed, mention_author=False)
+    else:
+        safe_raw = discord.utils.escape_mentions(raw[:1990])
+        embed = discord.Embed(
+            description=safe_raw,
+            color=0x5865F2,
+            timestamp=datetime.now(timezone.utc),
+        )
+        await msg.reply(embed=embed, mention_author=False)
+
+    if is_dm and uid != OWNER_ID:
+        logs = dm_logs.setdefault(str(uid), [])
+        logs.append({
+            "ts":  datetime.now(timezone.utc).isoformat()[:19],
+            "msg": content[:200],
+            "rep": raw[:200],
+        })
+        dm_logs[str(uid)] = logs[-15:]
+        await db_save_dm_logs()
+
+# ─── COMMANDS ─────────────────────────────────────────────────────────────────
 
 @bot.command(name="help")
 async def cmd_help(ctx):
     p = CMD_PREFIX
     embed = discord.Embed(
         title="🤖 AJ's Assistant",
-        description=(
-            "**Mention me or reply to me** and speak naturally — I understand English!\n"
-            "You can also DM me directly.\n\n"
-            "**Natural Language Examples:**\n"
-            f"`@bot make a role called aj shabeel`\n"
-            f"`@bot create a voice channel called music`\n"
-            f"`@bot ban @user spamming`\n"
-            f"`@bot mute @user for 10 minutes`\n"
-            f"`@bot give @user the VIP role`\n"
-            f"`@bot purge 20 messages`\n"
-            f"`@bot lock this channel`\n"
-            f"`@bot what's the capital of France?`"
-        ),
-        color=discord.Color.blurple()
+        description="Mention me or reply to me and speak naturally — I understand English!\nYou can also DM me directly.",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="🛠️ AI & Mod Commands", value=(
-        f"`{p}ask <question>` — Chat with AJ's Assistant\n"
-        f"`{p}whois @user` — User info (trust 4+)\n"
-        f"`{p}report` — Server stats (trust 4+)\n"
-        f"`{p}purge <n>` — Delete messages (trust 4+)\n"
-        f"`{p}search <query>` — Web search (trust 4+)\n"
-        f"`{p}lockdown` — Lock all channels (owner)\n"
-        f"`{p}unlock` — Unlock all channels (owner)\n"
+    embed.add_field(name="💬 AI Commands", value=(
+        f"`{p}ask <question>` — Chat with the bot\n"
+        f"`{p}search <query>` — Web search\n"
+        f"`{p}scan` — Full server scan (owner)\n"
         f"`{p}setprompt <text>` — Change AI personality (owner)\n"
         f"`{p}revertprompt` — Undo prompt change (owner)\n"
-        f"`{p}clearmem @user` — Clear user memory (owner)\n"
-        f"`{p}backup` — DM a full data backup as JSON (owner)\n"
-        f"`{p}debug` — Bot status (owner)"
+        f"`{p}clearmem @user` — Clear user memory (owner)"
     ), inline=False)
-    embed.add_field(name="🪙 Ajax Coins Economy", value=(
-        f"`{p}daily` — Claim your daily reward (50+ coins, streak bonus)\n"
-        f"`{p}balance [@user]` — Check your coin balance\n"
-        f"`{p}leaderboard` — Top 10 richest members\n"
-        f"`{p}pay @user <amount>` — Send coins to someone\n"
-        f"`{p}give @user <amount>` — Give coins (trust 4+)\n"
-        f"`{p}take @user <amount>` — Remove coins (trust 4+)\n"
-        f"`{p}coinreset @user` — Reset a user's coins (owner)\n\n"
-        f"💬 Earn **1 Ajax Coin** per message (1-min cooldown, 5+ chars)\n"
-        f"📅 Claim **50–110 coins** daily with streak bonuses (max day 7)"
+    embed.add_field(name="🛠️ Moderation (owner only)", value=(
+        f"`{p}purge <n>` — Delete messages\n"
+        f"`{p}lockdown` — Lock all channels\n"
+        f"`{p}unlock` — Unlock all channels\n"
+        f"`{p}shutdown` — Shut down the bot\n"
+        f"`{p}whois @user` — User info\n"
+        f"`{p}report` — Server stats\n"
+        f"`{p}backup` — DM a full data backup"
     ), inline=False)
-    embed.add_field(name="🔒 Trust Levels", value=(
-        "**0** — Blocked\n**1** — Restricted\n**2** — Regular (default)\n"
-        "**3** — Trusted\n**4** — Moderator\n**5** — Owner/Admin"
+    embed.add_field(name="🪙 Economy", value=(
+        f"`{p}daily` — Claim daily coins\n"
+        f"`{p}balance [@user]` — Check balance\n"
+        f"`{p}leaderboard` — Top 10 richest\n"
+        f"`{p}pay @user <amount>` — Send coins\n"
+        f"`{p}give @user <amount>` — Give coins (owner)\n"
+        f"`{p}take @user <amount>` — Remove coins (owner)\n"
+        f"`{p}coinreset @user` — Reset coins (owner)"
+    ), inline=False)
+    embed.add_field(name="🔧 Utility", value=(
+        f"`{p}afk [reason]` — Set AFK status\n"
+        f"`{p}snipe` — Show last deleted message\n"
+        f"`{p}membercount` — Server member stats\n"
+        f"`{p}uptime` — Bot uptime\n"
+        f"`{p}botinfo` — Bot stats\n"
+        f"`{p}ping` — Latency check\n"
+        f"`{p}debug` — Debug info (owner)"
+    ), inline=False)
+    embed.add_field(name="🪙 Daily Streak Rewards", value=(
+        "Day 1–2: **10 coins**\n"
+        "Day 3–6: **12 coins**\n"
+        "Day 7–29: **15 coins**\n"
+        "Day 30+: **20 coins**"
     ), inline=True)
-    embed.add_field(name="🪙 Ajax Coin Ranks", value=(
-        "💀 Penniless → 🪨 Gravel Rat (10)\n🥉 Bronze Hoarder (50) → 🥈 Silver Stacker (150)\n"
-        "🥇 Gold Grinder (500) → 💎 Diamond Hands (1k)\n👑 Ajax Royalty (5k) → 🌟 Ajax Legend (10k)"
+    embed.add_field(name="🏅 Coin Ranks", value=(
+        "💀 Penniless → 🪨 Gravel Rat (10)\n"
+        "🥉 Bronze (50) → 🥈 Silver (150)\n"
+        "🥇 Gold (500) → 💎 Diamond (1k)\n"
+        "👑 Royalty (5k) → 🌟 Legend (10k)"
     ), inline=True)
-    embed.set_footer(text=f"AJ's Assistant • Powered by Groq LLaMA • Prefix: {p}")
+    embed.set_footer(text=f"AJ's Assistant v{VERSION} • Prefix: {p}")
     await ctx.reply(embed=embed, mention_author=False)
+
+
+@bot.command(name="ping")
+async def cmd_ping(ctx):
+    embed = discord.Embed(
+        title="🏓 Pong!",
+        description=f"Latency: **{round(bot.latency * 1000)}ms**",
+        color=0x43B581,
+        timestamp=datetime.now(timezone.utc),
+    )
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+@bot.command(name="uptime")
+async def cmd_uptime(ctx):
+    up  = int(time.time() - start_time)
+    d   = up // 86400
+    h   = (up % 86400) // 3600
+    m   = (up % 3600) // 60
+    s   = up % 60
+    embed = discord.Embed(
+        title="⏱️ Bot Uptime",
+        description=f"**{d}d {h}h {m}m {s}s**",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text=f"Started: {datetime.fromtimestamp(start_time, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+@bot.command(name="botinfo")
+async def cmd_botinfo(ctx):
+    up     = int(time.time() - start_time)
+    d, rem = divmod(up, 86400)
+    h, rem = divmod(rem, 3600)
+    m, s   = divmod(rem, 60)
+    mem_mb = psutil.Process().memory_info().rss / 1024 / 1024
+    cpu_p  = psutil.cpu_percent(interval=0.1)
+    embed  = discord.Embed(
+        title="🤖 AJ's Assistant — Bot Info",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.add_field(name="Version",        value=f"`{VERSION}`",                           inline=True)
+    embed.add_field(name="Library",        value=f"`discord.py {discord.__version__}`",    inline=True)
+    embed.add_field(name="Python",         value=f"`{platform.python_version()}`",         inline=True)
+    embed.add_field(name="Ping",           value=f"`{round(bot.latency * 1000)}ms`",       inline=True)
+    embed.add_field(name="Memory",         value=f"`{mem_mb:.1f} MB`",                     inline=True)
+    embed.add_field(name="CPU",            value=f"`{cpu_p:.1f}%`",                        inline=True)
+    embed.add_field(name="Uptime",         value=f"`{d}d {h}h {m}m {s}s`",               inline=True)
+    embed.add_field(name="Servers",        value=f"`{len(bot.guilds)}`",                   inline=True)
+    embed.add_field(name="AI Model",       value="`LLaMA 3.3 70B`",                        inline=True)
+    embed.add_field(name="Msgs Processed", value=f"`{msgs_processed:,}`",                  inline=True)
+    embed.add_field(name="DB",             value="`✅ Connected`" if _db else "`❌ Offline`", inline=True)
+    embed.add_field(name="Groq Keys",      value=f"`{len(GROQ_KEYS)}`",                   inline=True)
+    embed.set_footer(text="AJ's Assistant")
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+@bot.command(name="membercount")
+async def cmd_membercount(ctx):
+    guild  = ctx.guild
+    if not guild:
+        await ctx.reply("This command can only be used in a server.", mention_author=False)
+        return
+    total   = guild.member_count
+    humans  = sum(1 for m in guild.members if not m.bot)
+    bots    = sum(1 for m in guild.members if m.bot)
+    online  = sum(1 for m in guild.members if m.status == discord.Status.online)
+    idle    = sum(1 for m in guild.members if m.status == discord.Status.idle)
+    dnd     = sum(1 for m in guild.members if m.status == discord.Status.dnd)
+    offline = sum(1 for m in guild.members if m.status == discord.Status.offline)
+    embed   = discord.Embed(
+        title=f"👥 {guild.name} — Member Count",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.add_field(name="Total",   value=f"**{total:,}**",   inline=True)
+    embed.add_field(name="Humans",  value=f"**{humans:,}**",  inline=True)
+    embed.add_field(name="Bots",    value=f"**{bots:,}**",    inline=True)
+    embed.add_field(name="🟢 Online",  value=f"**{online:,}**",  inline=True)
+    embed.add_field(name="🌙 Idle",    value=f"**{idle:,}**",    inline=True)
+    embed.add_field(name="🔴 DND",     value=f"**{dnd:,}**",     inline=True)
+    embed.add_field(name="⚫ Offline", value=f"**{offline:,}**", inline=True)
+    embed.add_field(name="Boost Level", value=f"Level {guild.premium_tier} ({guild.premium_subscription_count} boosts)", inline=True)
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+@bot.command(name="afk")
+async def cmd_afk(ctx, *, reason: str = "AFK"):
+    uid = ctx.author.id
+    afk_users[uid] = {
+        "reason": reason,
+        "ts":     datetime.now(timezone.utc),
+    }
+    embed = discord.Embed(
+        description=f"💤 **{ctx.author.display_name}** is now AFK: *{reason}*",
+        color=0x99AAB5,
+        timestamp=datetime.now(timezone.utc),
+    )
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+@bot.command(name="snipe")
+async def cmd_snipe(ctx):
+    cid   = ctx.channel.id
+    entry = snipe_cache.get(cid)
+    if not entry:
+        embed = discord.Embed(
+            description="🔍 Nothing to snipe — no recently deleted messages found.",
+            color=0x99AAB5,
+            timestamp=datetime.now(timezone.utc),
+        )
+        await ctx.reply(embed=embed, mention_author=False)
+        return
+    age = (datetime.now(timezone.utc) - entry["ts"]).total_seconds()
+    if age > SNIPE_EXPIRY:
+        del snipe_cache[cid]
+        embed = discord.Embed(
+            description="⏰ That message expired (older than 5 minutes).",
+            color=0x99AAB5,
+            timestamp=datetime.now(timezone.utc),
+        )
+        await ctx.reply(embed=embed, mention_author=False)
+        return
+    embed = discord.Embed(
+        description=entry["content"] or "*[no text content]*",
+        color=0x5865F2,
+        timestamp=entry["ts"],
+    )
+    embed.set_author(name=entry["author"], icon_url=entry["author_avatar"])
+    embed.set_footer(text=f"Deleted in #{ctx.channel.name} • sniped by {ctx.author.display_name}")
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+@bot.command(name="shutdown")
+async def cmd_shutdown(ctx):
+    if not is_owner(ctx.author.id):
+        return
+    embed = discord.Embed(
+        description="🔴 **Shutting down...** Goodbye!",
+        color=0xFF3333,
+        timestamp=datetime.now(timezone.utc),
+    )
+    await ctx.reply(embed=embed, mention_author=False)
+    await shutdown("channel command")
+
+
+@bot.command(name="scan")
+async def cmd_scan(ctx):
+    if not is_owner(ctx.author.id):
+        return
+    if not ctx.guild:
+        await ctx.reply("Can only scan a server.", mention_author=False)
+        return
+    msg = await ctx.reply("🔍 Scanning server...", mention_author=False)
+    scan = await build_full_server_scan(ctx.guild)
+    raw  = json.dumps({"scan": scan, "ts": datetime.now(timezone.utc).isoformat()}, indent=2)
+    fn   = f"scan_{ctx.guild.id}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+    f_obj = discord.File(fp=io.BytesIO(raw.encode()), filename=fn)
+    embed = discord.Embed(
+        title=f"🔍 Server Scan — {ctx.guild.name}",
+        description=f"Full scan complete. {len(ctx.guild.members)} members, {len(ctx.guild.channels)} channels, {len(ctx.guild.roles)} roles.",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    if ctx.guild.icon:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+    await msg.delete()
+    await ctx.reply(embed=embed, file=f_obj, mention_author=False)
 
 
 @bot.command(name="debug")
 async def cmd_debug(ctx):
-    if ctx.author.id != OWNER_ID:
+    if not is_owner(ctx.author.id):
         return
     up   = int(time.time() - start_time)
     h, m, s = up // 3600, (up % 3600) // 60, up % 60
     errs = "\n".join(f"  [{e['ts'][11:19]}] {e['err'][:80]}" for e in list(error_log)[-5:]) or "  None"
-    await ctx.reply(
-        f"**🛠️ Debug Info — AJ's Assistant**\n"
-        f"Uptime: {h}h {m}m {s}s\n"
-        f"Messages processed: {msgs_processed}\n"
-        f"Active Groq key: #{(key_index % max(len(GROQ_KEYS), 1)) + 1} / {len(GROQ_KEYS)}\n"
-        f"Session tracked members: {len(activity)}\n"
-        f"Registered users: {len(registry)}\n"
-        f"Economy entries: {len(economy)}\n"
-        f"Mod log entries: {len(mod_logs)}\n"
-        f"Bot log channel: {'✅ set' if BOT_LOG_CHANNEL_ID else '❌ not set'}\n"
-        f"Last 5 errors:\n{errs}",
-        mention_author=False
+    embed = discord.Embed(
+        title="🛠️ Debug Info",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
     )
+    embed.add_field(name="Uptime",          value=f"{h}h {m}m {s}s",                              inline=True)
+    embed.add_field(name="Msgs Processed",  value=str(msgs_processed),                             inline=True)
+    embed.add_field(name="Active Groq Key", value=f"#{(key_index % max(len(GROQ_KEYS),1))+1}/{len(GROQ_KEYS)}", inline=True)
+    embed.add_field(name="Tracked Members", value=str(len(activity)),                              inline=True)
+    embed.add_field(name="Registered",      value=str(len(registry)),                              inline=True)
+    embed.add_field(name="Economy Entries", value=str(len(economy)),                               inline=True)
+    embed.add_field(name="Mod Log Entries", value=str(len(mod_logs)),                              inline=True)
+    embed.add_field(name="Log Channel",     value="✅ Set" if BOT_LOG_CHANNEL_ID else "❌ Not set", inline=True)
+    embed.add_field(name="DB",              value="✅ Connected" if _db else "❌ Offline",          inline=True)
+    embed.add_field(name="Last 5 Errors",   value=f"```{errs}```",                                 inline=False)
+    await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.command(name="setprompt")
 async def cmd_setprompt(ctx, *, text: str):
     global custom_prompt, prev_prompt
-    if ctx.author.id != OWNER_ID:
-        return
+    if not is_owner(ctx.author.id): return
     prev_prompt   = custom_prompt
     custom_prompt = text
     await db_save_prompt()
-    asyncio.ensure_future(bot_log(
-        "📝 Prompt Updated",
-        f"Custom prompt set by <@{ctx.author.id}>",
-        fields=[("Preview", text[:200], False)],
-        level="info"
-    ))
-    await ctx.reply("✅ Prompt updated.", mention_author=False)
+    asyncio.create_task(bot_log("📝 Prompt Updated", f"Set by {ctx.author.mention}", fields=[("Preview", text[:200], False)], level="info"))
+    embed = discord.Embed(description="✅ Prompt updated.", color=0x43B581, timestamp=datetime.now(timezone.utc))
+    await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.command(name="revertprompt")
 async def cmd_revertprompt(ctx):
     global custom_prompt, prev_prompt
-    if ctx.author.id != OWNER_ID:
-        return
+    if not is_owner(ctx.author.id): return
     if prev_prompt is not None:
         custom_prompt = prev_prompt
         await db_save_prompt()
-        await ctx.reply("✅ Reverted to previous prompt.", mention_author=False)
+        embed = discord.Embed(description="✅ Reverted to previous prompt.", color=0x43B581, timestamp=datetime.now(timezone.utc))
     else:
-        await ctx.reply("No previous prompt to revert to.", mention_author=False)
+        embed = discord.Embed(description="No previous prompt to revert to.", color=0xFFA500, timestamp=datetime.now(timezone.utc))
+    await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.command(name="search")
 async def cmd_search(ctx, *, query: str):
-    if ctx.author.id != OWNER_ID and get_trust(ctx.author.id) < 4:
-        return
+    if not is_owner(ctx.author.id): return
     result = await web_search(query)
-    await ctx.reply(result, mention_author=False)
+    embed  = discord.Embed(
+        title=f"🔎 Search: {query[:100]}",
+        description=discord.utils.escape_mentions(result[:2000]),
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.command(name="clearmem")
 async def cmd_clearmem(ctx, member: discord.Member = None):
-    if ctx.author.id != OWNER_ID:
-        return
+    if not is_owner(ctx.author.id): return
     if not member:
-        await ctx.reply("Mention a user.", mention_author=False)
+        embed = discord.Embed(description="❌ Mention a user.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
+        await ctx.reply(embed=embed, mention_author=False)
         return
     clear_mem(member.id)
-    await ctx.reply(f"✅ Memory cleared for **{member.display_name}**.", mention_author=False)
+    embed = discord.Embed(description=f"✅ Memory cleared for **{member.display_name}**.", color=0x43B581, timestamp=datetime.now(timezone.utc))
+    await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.command(name="whois")
 async def cmd_whois(ctx, member: discord.Member = None):
-    if get_trust(ctx.author.id) < 4:
-        return
+    if not is_owner(ctx.author.id): return
     if not member:
         if ctx.message.mentions:
             member = ctx.message.mentions[0]
         else:
-            await ctx.reply("Mention a user.", mention_author=False)
+            embed = discord.Embed(description="❌ Mention a user.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
+            await ctx.reply(embed=embed, mention_author=False)
             return
     result = await execute_action(ctx.message, {"action": "whois", "user_id": str(member.id)})
-    await ctx.reply(result, mention_author=False)
+    embed  = discord.Embed(
+        title="👤 User Info",
+        description=result,
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.command(name="report")
 async def cmd_report(ctx):
-    if get_trust(ctx.author.id) < 4:
-        return
+    if not is_owner(ctx.author.id): return
     result = await execute_action(ctx.message, {"action": "report"})
-    await ctx.reply(result, mention_author=False)
+    embed  = discord.Embed(
+        description=result,
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    if ctx.guild and ctx.guild.icon:
+        embed.set_thumbnail(url=ctx.guild.icon.url)
+    await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.command(name="purge")
 async def cmd_purge(ctx, count: int = 10):
-    if get_trust(ctx.author.id) < 4:
-        return
+    if not is_owner(ctx.author.id): return
     await execute_action(ctx.message, {"action": "purge", "count": count})
 
 
 @bot.command(name="lockdown")
 async def cmd_lockdown(ctx):
-    if get_trust(ctx.author.id) < 5:
-        return
+    if not is_owner(ctx.author.id): return
     result = await execute_action(ctx.message, {"action": "lockdown"})
-    await ctx.reply(result, mention_author=False)
+    embed  = discord.Embed(description=result, color=0xFF3333, timestamp=datetime.now(timezone.utc))
+    await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.command(name="unlock")
 async def cmd_unlock(ctx):
-    if get_trust(ctx.author.id) < 5:
-        return
+    if not is_owner(ctx.author.id): return
     result = await execute_action(ctx.message, {"action": "unlock_all"})
-    await ctx.reply(result, mention_author=False)
+    embed  = discord.Embed(description=result, color=0x43B581, timestamp=datetime.now(timezone.utc))
+    await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.command(name="ask")
@@ -1153,40 +1505,43 @@ async def cmd_ask(ctx, *, question: str):
     ctx.message.content = question
     await process(ctx.message)
 
-
-# ─── ECONOMY COMMANDS ──────────────────────────────────────────────────────────
+# ─── ECONOMY COMMANDS ─────────────────────────────────────────────────────────
 
 @bot.command(name="balance", aliases=["bal", "coins", "ajax"])
 async def cmd_balance(ctx, member: discord.Member = None):
     target = member or ctx.author
     econ   = get_econ(target.id)
     rank   = get_rank(econ["coins"])
-    embed  = discord.Embed(title="🪙 Ajax Coins Balance", color=0xF5C400)
+    embed  = discord.Embed(title="🪙 Ajax Coins Balance", color=0xF5C400, timestamp=datetime.now(timezone.utc))
     embed.set_author(name=target.display_name, icon_url=target.display_avatar.url)
-    embed.add_field(name="Current Balance",       value=f"**{econ['coins']:,} Ajax Coins**", inline=False)
-    embed.add_field(name="Total Ever Earned",     value=f"{econ['total_earned']:,}",         inline=True)
-    embed.add_field(name="Messages That Counted", value=f"{econ['messages_counted']:,}",     inline=True)
-    embed.add_field(name="Rank",                  value=rank,                                inline=False)
+    embed.add_field(name="Balance",           value=f"**{econ['coins']:,} Ajax Coins**", inline=False)
+    embed.add_field(name="Total Ever Earned", value=f"{econ['total_earned']:,}",         inline=True)
+    embed.add_field(name="Messages Counted",  value=f"{econ['messages_counted']:,}",     inline=True)
+    embed.add_field(name="Rank",              value=rank,                                inline=True)
+    streak = econ.get("daily_streak", 0)
+    if streak > 0:
+        embed.add_field(name="Daily Streak", value=f"🔥 {streak} day{'s' if streak != 1 else ''}", inline=True)
     if econ["last_message_ts"]:
         last = datetime.fromisoformat(econ["last_message_ts"])
         if last.tzinfo is None:
             last = last.replace(tzinfo=timezone.utc)
-        next_ts = last + timedelta(seconds=MSG_COOLDOWN)
-        now     = datetime.now(timezone.utc)
-        if next_ts > now:
-            remaining = int((next_ts - now).total_seconds())
-            embed.set_footer(text=f"⏳ Next coin in ~{remaining}s — keep chatting!")
+        next_ts   = last + timedelta(seconds=MSG_COOLDOWN)
+        now       = datetime.now(timezone.utc)
+        remaining = int((next_ts - now).total_seconds())
+        if remaining > 0:
+            embed.set_footer(text=f"⏳ Next coin in ~{remaining}s")
         else:
-            embed.set_footer(text="✅ Your next message can earn a coin!")
+            embed.set_footer(text="✅ Your next message earns a coin!")
     else:
-        embed.set_footer(text="💬 Send a message to start earning Ajax Coins!")
+        embed.set_footer(text="💬 Send a message to start earning!")
     await ctx.send(embed=embed)
 
 
 @bot.command(name="leaderboard", aliases=["lb", "top"])
 async def cmd_leaderboard(ctx):
     if not economy:
-        await ctx.send("No coins have been earned yet!")
+        embed = discord.Embed(description="No coins have been earned yet!", color=0xF5C400, timestamp=datetime.now(timezone.utc))
+        await ctx.send(embed=embed)
         return
     sorted_users = sorted(economy.items(), key=lambda x: x[1].get("coins", 0), reverse=True)[:10]
     medals       = ["🥇", "🥈", "🥉"] + ["🔹"] * 7
@@ -1196,8 +1551,12 @@ async def cmd_leaderboard(ctx):
         name   = member.display_name if member else f"Unknown ({uid})"
         coins  = udata.get("coins", 0)
         lines.append(f"{medals[i]} **{name}** — {coins:,} coins  {get_rank(coins)}")
-    embed = discord.Embed(title="🏆 Ajax Coins Leaderboard", color=0xF5C400)
-    embed.description = "\n".join(lines) or "No entries yet."
+    embed = discord.Embed(
+        title="🏆 Ajax Coins Leaderboard",
+        description="\n".join(lines) or "No entries yet.",
+        color=0xF5C400,
+        timestamp=datetime.now(timezone.utc),
+    )
     embed.set_footer(text="Earn 1 coin per minute of active chatting")
     await ctx.send(embed=embed)
 
@@ -1205,37 +1564,44 @@ async def cmd_leaderboard(ctx):
 @bot.command(name="pay")
 async def cmd_pay(ctx, member: discord.Member = None, amount: int = 0):
     if not member:
-        await ctx.reply("❌ Mention a user to pay.", mention_author=False); return
+        embed = discord.Embed(description="❌ Mention a user to pay.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
+        await ctx.reply(embed=embed, mention_author=False); return
     if member.bot:
-        await ctx.reply("❌ You can't pay bots.", mention_author=False); return
+        embed = discord.Embed(description="❌ You can't pay bots.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
+        await ctx.reply(embed=embed, mention_author=False); return
     if member == ctx.author:
-        await ctx.reply("❌ You can't pay yourself.", mention_author=False); return
+        embed = discord.Embed(description="❌ You can't pay yourself.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
+        await ctx.reply(embed=embed, mention_author=False); return
     if amount <= 0:
-        await ctx.reply("❌ Amount must be positive.", mention_author=False); return
+        embed = discord.Embed(description="❌ Amount must be positive.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
+        await ctx.reply(embed=embed, mention_author=False); return
 
-    async with _econ_locks[ctx.author.id]:
-        sender = get_econ(ctx.author.id)
-        if sender["coins"] < amount:
-            await ctx.reply(f"❌ You only have **{sender['coins']:,} Ajax Coins**.", mention_author=False)
-            return
-        async with _econ_locks[member.id]:
+    # Deadlock-safe: always lock lower ID first
+    first_id, second_id = sorted([ctx.author.id, member.id])
+    async with _econ_locks[first_id]:
+        async with _econ_locks[second_id]:
+            sender   = get_econ(ctx.author.id)
             receiver = get_econ(member.id)
+            if sender["coins"] < amount:
+                embed = discord.Embed(description=f"❌ You only have **{sender['coins']:,} Ajax Coins**.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
+                await ctx.reply(embed=embed, mention_author=False)
+                return
             sender["coins"]   -= amount
             receiver["coins"] += amount
             save_econ(ctx.author.id)
             save_econ(member.id)
 
-    await ctx.reply(
-        f"💸 {ctx.author.mention} sent **{amount:,} Ajax Coins** to {member.mention}!",
-        mention_author=False
+    embed = discord.Embed(
+        title="💸 Coins Sent!",
+        description=f"{ctx.author.mention} sent **{amount:,} Ajax Coins** to {member.mention}!",
+        color=0xF5C400,
+        timestamp=datetime.now(timezone.utc),
     )
+    await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.command(name="daily")
 async def cmd_daily(ctx):
-    BASE_REWARD  = 50
-    STREAK_BONUS = 10
-
     async with _econ_locks[ctx.author.id]:
         econ = get_econ(ctx.author.id)
         now  = datetime.now(timezone.utc)
@@ -1256,7 +1622,8 @@ async def cmd_daily(ctx):
                 embed = discord.Embed(
                     title="⏳ Daily Already Claimed",
                     description=f"Come back in **{h}h {m}m** for your next reward!",
-                    color=discord.Color.red()
+                    color=0xFF3333,
+                    timestamp=datetime.now(timezone.utc),
                 )
                 embed.set_footer(text=f"Current streak: {streak} day(s) 🔥")
                 await ctx.reply(embed=embed, mention_author=False)
@@ -1264,67 +1631,87 @@ async def cmd_daily(ctx):
             elif hours_since > 48:
                 streak = 0
 
-        streak              = min(streak + 1, 7)
-        reward              = BASE_REWARD + (STREAK_BONUS * (streak - 1))
+        streak = min(streak + 1, 999)
+        reward = daily_reward(streak)
+
         econ["coins"]        += reward
         econ["total_earned"] += reward
         econ["last_daily"]    = now.isoformat()
         econ["daily_streak"]  = streak
         save_econ(ctx.author.id)
 
-    streak_bar = "🔥" * streak + "⬜" * (7 - streak)
-    embed = discord.Embed(title="🪙 Daily Reward Claimed!", color=0xF5C400)
+    if streak >= 30:
+        tier_label = "🌟 Month+ Streak!"
+    elif streak >= 7:
+        tier_label = "🔥 Week Streak!"
+    elif streak >= 3:
+        tier_label = "⚡ 3-Day Streak!"
+    else:
+        tier_label = "✨ Day " + str(streak)
+
+    bar_filled = min(streak, 7)
+    streak_bar = "🟨" * bar_filled + "⬜" * (7 - bar_filled)
+
+    embed = discord.Embed(
+        title="🪙 Daily Reward Claimed!",
+        color=0xF5C400,
+        timestamp=datetime.now(timezone.utc),
+    )
     embed.set_author(name=ctx.author.display_name, icon_url=ctx.author.display_avatar.url)
     embed.add_field(name="Reward",      value=f"**+{reward:,} Ajax Coins**",      inline=True)
     embed.add_field(name="New Balance", value=f"**{econ['coins']:,} Ajax Coins**", inline=True)
-    embed.add_field(
-        name="Streak",
-        value=f"{streak_bar}\n**Day {streak}** {'🔥 MAX!' if streak == 7 else ''}",
-        inline=False
-    )
-    embed.set_footer(text="Come back tomorrow to keep your streak! Streak resets if you miss a day.")
+    embed.add_field(name="Streak",      value=f"{streak_bar}\n**{tier_label}** (Day {streak})", inline=False)
+    embed.set_footer(text="Come back tomorrow to keep your streak! Miss a day and it resets.")
     await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.command(name="give")
 async def cmd_give(ctx, member: discord.Member = None, amount: int = 0):
-    if ctx.author.id != OWNER_ID and get_trust(ctx.author.id) < 4:
-        await ctx.reply("❌ You need trust level 4+ to give coins.", mention_author=False); return
+    if not is_owner(ctx.author.id):
+        embed = discord.Embed(description="❌ Only the owner can give coins.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
+        await ctx.reply(embed=embed, mention_author=False); return
     if not member:
-        await ctx.reply("❌ Mention a user.", mention_author=False); return
+        embed = discord.Embed(description="❌ Mention a user.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
+        await ctx.reply(embed=embed, mention_author=False); return
     if amount <= 0:
-        await ctx.reply("❌ Amount must be positive.", mention_author=False); return
+        embed = discord.Embed(description="❌ Amount must be positive.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
+        await ctx.reply(embed=embed, mention_author=False); return
     async with _econ_locks[member.id]:
         econ = get_econ(member.id)
         econ["coins"]        += amount
         econ["total_earned"] += amount
         save_econ(member.id)
     log_mod("give_coins", member.id, ctx.author.id, str(amount))
-    await ctx.reply(f"✅ Gave **{amount:,} Ajax Coins** to {member.mention}.", mention_author=False)
+    embed = discord.Embed(description=f"✅ Gave **{amount:,} Ajax Coins** to {member.mention}.", color=0x43B581, timestamp=datetime.now(timezone.utc))
+    await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.command(name="take")
 async def cmd_take(ctx, member: discord.Member = None, amount: int = 0):
-    if ctx.author.id != OWNER_ID and get_trust(ctx.author.id) < 4:
-        await ctx.reply("❌ You need trust level 4+ to take coins.", mention_author=False); return
+    if not is_owner(ctx.author.id):
+        embed = discord.Embed(description="❌ Only the owner can take coins.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
+        await ctx.reply(embed=embed, mention_author=False); return
     if not member:
-        await ctx.reply("❌ Mention a user.", mention_author=False); return
+        embed = discord.Embed(description="❌ Mention a user.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
+        await ctx.reply(embed=embed, mention_author=False); return
     if amount <= 0:
-        await ctx.reply("❌ Amount must be positive.", mention_author=False); return
+        embed = discord.Embed(description="❌ Amount must be positive.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
+        await ctx.reply(embed=embed, mention_author=False); return
     async with _econ_locks[member.id]:
         econ = get_econ(member.id)
         econ["coins"] = max(0, econ["coins"] - amount)
         save_econ(member.id)
     log_mod("take_coins", member.id, ctx.author.id, str(amount))
-    await ctx.reply(f"✅ Removed **{amount:,} Ajax Coins** from {member.mention}.", mention_author=False)
+    embed = discord.Embed(description=f"✅ Removed **{amount:,} Ajax Coins** from {member.mention}.", color=0x43B581, timestamp=datetime.now(timezone.utc))
+    await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.command(name="coinreset")
 async def cmd_coinreset(ctx, member: discord.Member = None):
-    if ctx.author.id != OWNER_ID:
-        return
+    if not is_owner(ctx.author.id): return
     if not member:
-        await ctx.reply("❌ Mention a user.", mention_author=False); return
+        embed = discord.Embed(description="❌ Mention a user.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
+        await ctx.reply(embed=embed, mention_author=False); return
     async with _econ_locks[member.id]:
         key = str(member.id)
         economy[key] = {
@@ -1333,14 +1720,19 @@ async def cmd_coinreset(ctx, member: discord.Member = None):
             "last_daily": None, "daily_streak": 0,
         }
         save_econ(member.id)
-    await ctx.reply(f"✅ Reset **{member.display_name}**'s Ajax Coins.", mention_author=False)
+    embed = discord.Embed(description=f"✅ Reset **{member.display_name}**'s Ajax Coins.", color=0x43B581, timestamp=datetime.now(timezone.utc))
+    await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.command(name="backup")
 async def cmd_backup(ctx):
-    if ctx.author.id != OWNER_ID:
-        return
-    await ctx.reply("📦 Generating backup, check your DMs!", mention_author=False)
+    if not is_owner(ctx.author.id): return
+    await _do_backup(ctx.author)
+    embed = discord.Embed(description="📦 Backup sent to your DMs!", color=0x43B581, timestamp=datetime.now(timezone.utc))
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+async def _do_backup(owner_user):
     backup_data = {
         "generated_at":  datetime.now(timezone.utc).isoformat(),
         "economy":       economy,
@@ -1355,144 +1747,79 @@ async def cmd_backup(ctx):
     total_coins = sum(v.get("coins", 0) for v in economy.values())
     embed = discord.Embed(
         title="📦 AJ's Assistant — Full Backup",
-        description="Keep this file safe.",
+        description="Automatic or manual backup. Keep this file safe.",
         color=0xF5C400,
-        timestamp=datetime.now(timezone.utc)
+        timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="Economy entries",      value=f"{len(economy):,} users", inline=True)
-    embed.add_field(name="Coins in circulation", value=f"{total_coins:,} 🪙",      inline=True)
-    embed.add_field(name="Registered users",     value=f"{len(registry):,}",       inline=True)
-    embed.add_field(name="Mod log entries",      value=f"{len(mod_logs):,}",        inline=True)
-    embed.add_field(name="Memory entries",       value=f"{len(memory):,}",          inline=True)
+    embed.add_field(name="Economy Users",        value=f"{len(economy):,}",    inline=True)
+    embed.add_field(name="Coins in Circulation", value=f"{total_coins:,} 🪙",  inline=True)
+    embed.add_field(name="Registered Users",     value=f"{len(registry):,}",   inline=True)
+    embed.add_field(name="Mod Log Entries",      value=f"{len(mod_logs):,}",   inline=True)
+    embed.add_field(name="Memory Entries",       value=f"{len(memory):,}",     inline=True)
     embed.set_footer(text=f"File: {filename}")
     try:
-        dm = await ctx.author.create_dm()
+        dm = await owner_user.create_dm()
         await dm.send(embed=embed, file=file_obj)
     except discord.Forbidden:
-        await ctx.reply("❌ Couldn't DM you — make sure your DMs are open.", mention_author=False)
+        log.error("Could not DM backup to owner — DMs may be closed.")
 
+# ─── BACKGROUND TASKS ─────────────────────────────────────────────────────────
 
-@bot.command(name="ping")
-async def cmd_ping(ctx):
-    await ctx.reply(f"🏓 Pong! `{round(bot.latency * 1000)}ms`", mention_author=False)
+@tasks.loop(time=datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timetz())
+async def midnight_backup():
+    if not OWNER_ID: return
+    try:
+        owner = await bot.fetch_user(OWNER_ID)
+        await _do_backup(owner)
+        log.info("Midnight backup sent.")
+    except Exception as e:
+        log.error(f"Midnight backup failed: {e}")
 
-# ─── CORE PROCESS (AI) ─────────────────────────────────────────────────────────
-
-async def process(msg: discord.Message, is_dm: bool = False):
-    author  = msg.author
-    uid     = author.id
-    trust   = get_trust(uid)
-    content = msg.content.strip()
-
-    if trust == 0:
-        asyncio.ensure_future(bot_log(
-            "🚫 Blocked User Tried to Message",
-            f"**{author}** (`{uid}`) — trust 0 — sent: `{content[:200]}`",
-            level="security"
-        ))
-        return
-
-    # Rate limiting
-    if uid != OWNER_ID:
-        cooldown = 1.5 if trust >= 4 else 4.0
-        now      = time.time()
-        if now - rate_limits[uid] < cooldown:
-            await msg.reply("⏱️ Slow down a bit!", mention_author=False)
-            return
-        rate_limits[uid] = now
-
-    # Injection detection
-    if is_suspicious(content):
-        asyncio.ensure_future(bot_log(
-            "⚠️ Suspicious / Injection Attempt",
-            f"**{author}** (`{uid}`) | Trust: {trust}",
-            fields=[
-                ("Message", f"```{content[:500]}```", False),
-                ("Channel", getattr(msg.channel, "mention", "DM"), True),
-            ],
-            level="security"
-        ))
-
-    if not is_dm:
-        track_activity(uid, msg.channel.id)
-    register_user(author)
-
-    ctx_line = build_context(msg, trust)
-    # Context goes into the system prompt, NOT the user message, so it can't be overridden
-    system_with_ctx = f"{active_prompt()}\n\n{ctx_line}"
-    user_payload    = content   # clean user message only
-
-    hist_key = f"dm_{uid}" if is_dm else str(msg.channel.id)
-    hist     = histories[hist_key]
-    hist.append({"role": "user", "content": user_payload})
-    if len(hist) > MAX_HIST:
-        histories[hist_key] = hist[-MAX_HIST:]
-    hist = histories[hist_key]
-
-    async with msg.channel.typing():
-        raw = await call_ai(hist, system=system_with_ctx)
-
-    histories[hist_key].append({"role": "assistant", "content": raw})
-    if len(histories[hist_key]) > MAX_HIST:
-        histories[hist_key] = histories[hist_key][-MAX_HIST:]
-
-    parsed = parse_ai_json(raw)
-    if parsed:
-        action = parsed.get("action", "chat")
-        if action in MOD_ACTIONS and trust < 4:
-            await msg.reply("❌ You don't have permission to do that (requires trust level 4+).", mention_author=False)
-            asyncio.ensure_future(bot_log(
-                "🔒 Unauthorized Mod Attempt",
-                f"**{author}** (`{uid}`) tried `{action}` with trust **{trust}**",
-                fields=[("Message", content[:300], False)],
-                level="security"
-            ))
-            return
-        reply = await execute_action(msg, parsed)
-        if reply:
-            await msg.reply(reply, mention_author=False)
-    else:
-        await msg.reply(raw[:1990], mention_author=False)
-
-    if is_dm and uid != OWNER_ID:
-        logs = dm_logs.setdefault(str(uid), [])
-        logs.append({
-            "ts":  datetime.now(timezone.utc).isoformat()[:19],
-            "msg": content[:200],
-            "rep": raw[:200],
-        })
-        dm_logs[str(uid)] = logs[-15:]
-        await db_save_dm_logs()
-
-# ─── EVENTS ────────────────────────────────────────────────────────────────────
+# ─── EVENTS ───────────────────────────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
+    global _ready_fired
+    if _ready_fired:
+        return
+    _ready_fired = True
+
     await db_init()
     await db_load()
+    midnight_backup.start()
     log.info(f"✅ AJ's Assistant ready as {bot.user} (ID: {bot.user.id})")
     await bot.change_presence(
         activity=discord.Activity(type=discord.ActivityType.watching, name="the server 👁️")
     )
-
-    # Log startup — fires on every Railway restart too
-    guilds = len(bot.guilds)
+    guilds        = len(bot.guilds)
     total_members = sum(g.member_count for g in bot.guilds)
-    asyncio.ensure_future(bot_log(
-        "🟢 Bot Started / Restarted",
+    asyncio.create_task(bot_log(
+        "🟢 Bot Started",
         f"**{bot.user}** is online",
         fields=[
-            ("Guilds",         str(guilds),         True),
-            ("Total Members",  str(total_members),  True),
-            ("Economy Users",  str(len(economy)),   True),
-            ("Registered",     str(len(registry)),  True),
-            ("Mod Logs",       str(len(mod_logs)),  True),
-            ("Groq Keys",      str(len(GROQ_KEYS)), True),
-            ("DB Connected",   "✅ Yes" if _db else "❌ No", True),
-            ("Log Channel",    "✅ Set" if BOT_LOG_CHANNEL_ID else "❌ Not set", True),
+            ("Guilds",        str(guilds),         True),
+            ("Total Members", str(total_members),  True),
+            ("Economy Users", str(len(economy)),   True),
+            ("Registered",    str(len(registry)),  True),
+            ("Mod Logs",      str(len(mod_logs)),  True),
+            ("Groq Keys",     str(len(GROQ_KEYS)), True),
+            ("DB",            "✅ Yes" if _db else "❌ No", True),
+            ("Log Channel",   "✅ Set" if BOT_LOG_CHANNEL_ID else "❌ Not set", True),
         ],
         level="startup"
     ))
+
+
+@bot.event
+async def on_message_delete(msg: discord.Message):
+    if msg.author.bot: return
+    if not isinstance(msg.channel, discord.TextChannel): return
+    snipe_cache[msg.channel.id] = {
+        "content":      msg.content,
+        "author":       str(msg.author),
+        "author_avatar": str(msg.author.display_avatar.url),
+        "ts":           datetime.now(timezone.utc),
+    }
 
 
 @bot.event
@@ -1505,9 +1832,34 @@ async def on_message(msg: discord.Message):
     is_dm   = isinstance(msg.channel, discord.DMChannel)
     content = msg.content.strip()
 
-    # ── Economy coin earning ────────────────────────────────────────────────────
+    # ── AFK check ──────────────────────────────────────────────────────────────
+    uid = msg.author.id
+    if uid in afk_users and not content.startswith(CMD_PREFIX):
+        data = afk_users.pop(uid)
+        ago  = datetime.now(timezone.utc) - data["ts"]
+        mins = int(ago.total_seconds() // 60)
+        embed = discord.Embed(
+            description=f"👋 Welcome back, {msg.author.mention}! Removed your AFK. *(was away {mins}m)*",
+            color=0x43B581,
+            timestamp=datetime.now(timezone.utc),
+        )
+        await msg.channel.send(embed=embed, delete_after=8)
+
+    # ── Notify if someone pings an AFK user ───────────────────────────────────
+    for mentioned in msg.mentions:
+        if mentioned.id in afk_users and mentioned.id != uid:
+            data  = afk_users[mentioned.id]
+            since = datetime.now(timezone.utc) - data["ts"]
+            mins  = int(since.total_seconds() // 60)
+            embed = discord.Embed(
+                description=f"💤 **{mentioned.display_name}** is AFK: *{data['reason']}* *(for {mins}m)*",
+                color=0x99AAB5,
+                timestamp=datetime.now(timezone.utc),
+            )
+            await msg.channel.send(embed=embed, delete_after=10)
+
+    # ── Economy coin earning ───────────────────────────────────────────────────
     if not is_dm and not content.startswith(CMD_PREFIX) and len(content) >= 5:
-        uid = msg.author.id
         async with _econ_locks[uid]:
             econ = get_econ(uid)
             now  = datetime.now(timezone.utc)
@@ -1519,19 +1871,18 @@ async def on_message(msg: discord.Message):
                 if (now - last).total_seconds() < MSG_COOLDOWN:
                     can_earn = False
             if can_earn:
-                if MSG_RARITY <= 1 or random.randint(1, MSG_RARITY) == 1:
-                    econ["coins"]            += 1
-                    econ["total_earned"]     += 1
-                    econ["messages_counted"] += 1
-                    econ["last_message_ts"]   = now.isoformat()
-                    save_econ(uid)
+                econ["coins"]            += 1
+                econ["total_earned"]     += 1
+                econ["messages_counted"] += 1
+                econ["last_message_ts"]   = now.isoformat()
+                save_econ(uid)
 
-    # ── Passive tracking ────────────────────────────────────────────────────────
+    # ── Passive tracking ──────────────────────────────────────────────────────
     if not is_dm and bot.user not in (msg.mentions or []):
         track_activity(msg.author.id, msg.channel.id)
         register_user(msg.author)
 
-    # ── AI response logic ───────────────────────────────────────────────────────
+    # ── AI response logic ─────────────────────────────────────────────────────
     mentioned    = bot.user in (msg.mentions or [])
     reply_to_bot = (
         msg.reference and
@@ -1550,7 +1901,7 @@ async def on_message(msg: discord.Message):
         err = f"on_message error: {e}"
         log.error(err)
         error_log.append({"ts": datetime.now(timezone.utc).isoformat(), "err": err})
-        asyncio.ensure_future(bot_log(
+        asyncio.create_task(bot_log(
             "❌ Unhandled Error in on_message",
             f"`{type(e).__name__}: {e}`",
             fields=[
@@ -1561,7 +1912,12 @@ async def on_message(msg: discord.Message):
             level="error"
         ))
         try:
-            await msg.reply(f"❌ Error — {type(e).__name__}: {e}", mention_author=False)
+            embed = discord.Embed(
+                description=f"❌ Error — `{type(e).__name__}: {e}`",
+                color=0xFF3333,
+                timestamp=datetime.now(timezone.utc),
+            )
+            await msg.reply(embed=embed, mention_author=False)
         except Exception:
             pass
 
@@ -1569,16 +1925,19 @@ async def on_message(msg: discord.Message):
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MemberNotFound):
-        await ctx.reply("❌ Couldn't find that member.", mention_author=False)
+        embed = discord.Embed(description="❌ Couldn't find that member.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
+        await ctx.reply(embed=embed, mention_author=False)
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.reply(f"❌ Missing argument. Try `{CMD_PREFIX}help`.", mention_author=False)
+        embed = discord.Embed(description=f"❌ Missing argument. Try `{CMD_PREFIX}help`.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
+        await ctx.reply(embed=embed, mention_author=False)
     elif isinstance(error, commands.BadArgument):
-        await ctx.reply("❌ Invalid argument (make sure amounts are numbers).", mention_author=False)
+        embed = discord.Embed(description="❌ Invalid argument (make sure amounts are numbers).", color=0xFF3333, timestamp=datetime.now(timezone.utc))
+        await ctx.reply(embed=embed, mention_author=False)
     elif isinstance(error, commands.CommandNotFound):
         pass
     else:
         log.error(f"Command error: {error}")
-        asyncio.ensure_future(bot_log(
+        asyncio.create_task(bot_log(
             "⚠️ Command Error",
             f"`{type(error).__name__}: {error}`",
             fields=[("Command", ctx.message.content[:200], False)],
@@ -1588,12 +1947,13 @@ async def on_command_error(ctx, error):
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    asyncio.ensure_future(bot_log(
+    asyncio.create_task(bot_log(
         "📥 Member Joined",
         f"**{member}** (`{member.id}`) joined **{member.guild.name}**",
         fields=[
             ("Account Created", member.created_at.strftime("%Y-%m-%d"), True),
             ("Member Count",    str(member.guild.member_count),          True),
+            ("Avatar",          str(member.display_avatar.url),          False),
         ],
         level="info"
     ))
@@ -1601,7 +1961,7 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    asyncio.ensure_future(bot_log(
+    asyncio.create_task(bot_log(
         "📤 Member Left / Removed",
         f"**{member}** (`{member.id}`) left **{member.guild.name}**",
         fields=[("Member Count", str(member.guild.member_count), True)],
@@ -1611,8 +1971,8 @@ async def on_member_remove(member: discord.Member):
 
 @bot.event
 async def on_member_ban(guild: discord.Guild, user: discord.User):
-    asyncio.ensure_future(bot_log(
-        "🔨 Member Banned (Discord Audit)",
+    asyncio.create_task(bot_log(
+        "🔨 Member Banned",
         f"**{user}** (`{user.id}`) was banned from **{guild.name}**",
         level="mod"
     ))
@@ -1620,30 +1980,53 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
 
 @bot.event
 async def on_member_unban(guild: discord.Guild, user: discord.User):
-    asyncio.ensure_future(bot_log(
-        "✅ Member Unbanned (Discord Audit)",
+    asyncio.create_task(bot_log(
+        "✅ Member Unbanned",
         f"**{user}** (`{user.id}`) was unbanned from **{guild.name}**",
         level="mod"
     ))
 
-# ─── GRACEFUL SHUTDOWN ─────────────────────────────────────────────────────────
+# ─── HEALTH CHECK HTTP SERVER ─────────────────────────────────────────────────
+
+async def health_handler(request):
+    return aiohttp_web.Response(
+        text=json.dumps({
+            "status":   "ok",
+            "bot":      str(bot.user) if bot.user else "not ready",
+            "uptime_s": int(time.time() - start_time),
+            "guilds":   len(bot.guilds),
+            "latency_ms": round(bot.latency * 1000),
+        }),
+        content_type="application/json"
+    )
+
+async def start_health_server():
+    app    = aiohttp_web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    runner = aiohttp_web.AppRunner(app)
+    await runner.setup()
+    site   = aiohttp_web.TCPSite(runner, "0.0.0.0", HEALTH_PORT)
+    await site.start()
+    log.info(f"✅ Health check server running on port {HEALTH_PORT}")
+
+# ─── GRACEFUL SHUTDOWN ────────────────────────────────────────────────────────
 
 async def shutdown(signal_name: str = "SIGTERM"):
-    asyncio.ensure_future(bot_log(
+    asyncio.create_task(bot_log(
         "🔴 Bot Shutting Down",
         f"Received `{signal_name}` — saving data and disconnecting…",
         level="shutdown"
     ))
-    # Give the log a moment to send
     await asyncio.sleep(1.5)
     await bot.close()
 
-def _handle_signal(sig):
+def _handle_signal(sig, loop):
     name = signal.Signals(sig).name
     log.info(f"Received {name}, shutting down…")
-    asyncio.ensure_future(shutdown(name))
+    loop.create_task(shutdown(name))
 
-# ─── RUN ───────────────────────────────────────────────────────────────────────
+# ─── RUN ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
@@ -1658,9 +2041,11 @@ if __name__ == "__main__":
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            loop.add_signal_handler(sig, _handle_signal, sig)
+            loop.add_signal_handler(sig, _handle_signal, sig, loop)
         except NotImplementedError:
-            pass  # Windows doesn't support add_signal_handler
+            pass
+
+    loop.run_until_complete(start_health_server())
 
     try:
         loop.run_until_complete(bot.start(DISCORD_TOKEN))
