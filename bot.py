@@ -34,7 +34,7 @@ GROQ_KEYS   = [k for k in [os.getenv(f"GROQ_KEY_{i}") for i in range(1, 11)] if 
 MONGO_URI   = os.getenv("MONGO_URI", "")
 HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8080"))
 
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 # ─── ECONOMY CONFIG ────────────────────────────────────────────────────────────
 
@@ -43,7 +43,7 @@ WORK_COOLDOWN = 3600   # 1 hour
 MAX_HIST      = 20
 MAX_PURGE     = 200
 SNIPE_EXPIRY  = 300    # 5 minutes
-TEMP_MSG_TTL  = 25     # FIX #16: was 10s — too short for mobile users
+TEMP_MSG_TTL  = 25
 
 RANKS = [
     (0,     "💀 Penniless"),
@@ -77,7 +77,6 @@ def get_rank(coins: int) -> str:
     return rank
 
 def daily_reward(streak: int) -> int:
-    # FIX #19: documented that reward caps at 30 days but streak continues to 999
     if streak >= 30: return 20
     if streak >= 7:  return 15
     if streak >= 3:  return 12
@@ -148,12 +147,11 @@ CRITICAL RULES:
 intents = discord.Intents.all()
 bot     = commands.Bot(command_prefix=CMD_PREFIX, intents=intents, help_command=None)
 
-# ─── GROQ CLIENT POOL (built once at startup) ──────────────────────────────────
+# ─── GROQ CLIENT POOL ──────────────────────────────────────────────────────────
 
-groq_clients: dict = {}  # key -> AsyncGroq instance, populated in on_ready
+groq_clients: dict = {}
 
 # ─── SHARED HTTP SESSION ───────────────────────────────────────────────────────
-# FIX #15: reuse a single aiohttp session instead of creating one per request
 
 _http_session: aiohttp.ClientSession | None = None
 
@@ -166,7 +164,7 @@ async def get_http_session() -> aiohttp.ClientSession:
 # ─── MONGODB ───────────────────────────────────────────────────────────────────
 
 _mongo_client = None
-_db           = None
+_db           = None  # AsyncIOMotorDatabase or None
 
 async def db_init():
     global _mongo_client, _db
@@ -183,7 +181,14 @@ async def db_init():
         _db = None
 
 def _col(name: str):
-    return _db[name] if _db else None
+    # Guard: only return collection if _db is actually set
+    if _db is None:
+        return None
+    return _db[name]
+
+def _db_ok() -> bool:
+    """Single safe truthiness check for the DB connection."""
+    return _db is not None
 
 # ─── IN-MEMORY STATE ───────────────────────────────────────────────────────────
 
@@ -194,11 +199,10 @@ dm_logs:     dict  = {}
 economy:     dict  = {}
 activity:    dict  = {}
 afk_users:   dict  = {}
-snipe_cache: dict  = {}  # channel_id -> {content, author, author_avatar, created_at, cached_at}
+snipe_cache: dict  = {}
 
 custom_prompt:  str | None  = None
 prev_prompt:    str | None  = None
-# FIX #18: full prompt history stack for unlimited undo
 prompt_history: list        = []
 
 histories:   dict  = defaultdict(list)
@@ -210,18 +214,15 @@ start_time     = time.time()
 msgs_processed = 0
 _ready_fired   = False
 
-# FIX #10: use WeakValueDictionary so locks for inactive users are GC'd
 import weakref
-_econ_locks_store: dict = {}  # strong refs kept here while lock is in use
+_econ_locks_store: dict = {}
 
 def _get_econ_lock(uid: int) -> asyncio.Lock:
-    """Return (creating if needed) a per-user asyncio.Lock."""
     if uid not in _econ_locks_store:
         _econ_locks_store[uid] = asyncio.Lock()
     return _econ_locks_store[uid]
 
 def _cleanup_econ_locks():
-    """Remove unlocked locks for users who are no longer active."""
     to_del = [uid for uid, lk in _econ_locks_store.items() if not lk.locked()]
     for uid in to_del:
         del _econ_locks_store[uid]
@@ -230,7 +231,7 @@ def _cleanup_econ_locks():
 
 async def db_load():
     global memory, registry, custom_prompt, prompt_history
-    if not _db:
+    if not _db_ok():
         return
     try:
         async for doc in _col("registry").find({}, {"_id": 0}):
@@ -262,14 +263,14 @@ async def db_load():
         log.error(f"db_load error: {e}")
 
 async def db_save_user(uid: str):
-    if not _db: return
+    if not _db_ok(): return
     try:
         await _col("registry").update_one({"uid": uid}, {"$set": registry[uid]}, upsert=True)
     except Exception as e:
         log.error(f"db_save_user: {e}")
 
 async def db_save_mem(uid: str):
-    if not _db: return
+    if not _db_ok(): return
     try:
         await _col("memory").update_one(
             {"uid": uid}, {"$set": {"uid": uid, "data": memory.get(uid, {})}}, upsert=True
@@ -278,7 +279,7 @@ async def db_save_mem(uid: str):
         log.error(f"db_save_mem: {e}")
 
 async def db_save_economy(uid: str):
-    if not _db: return
+    if not _db_ok(): return
     try:
         doc = {"uid": uid, **economy.get(uid, {})}
         await _col("economy").update_one({"uid": uid}, {"$set": doc}, upsert=True)
@@ -286,8 +287,7 @@ async def db_save_economy(uid: str):
         log.error(f"db_save_economy: {e}")
 
 async def db_save_mod_logs():
-    # FIX #11: use $push with $slice to avoid rewriting entire array every time
-    if not _db: return
+    if not _db_ok(): return
     try:
         await _col("meta").update_one(
             {"_id": "mod_logs"},
@@ -298,7 +298,7 @@ async def db_save_mod_logs():
         log.error(f"db_save_mod_logs: {e}")
 
 async def db_save_dm_logs():
-    if not _db: return
+    if not _db_ok(): return
     try:
         await _col("meta").update_one(
             {"_id": "dm_logs"}, {"$set": {"data": dm_logs}}, upsert=True
@@ -307,19 +307,18 @@ async def db_save_dm_logs():
         log.error(f"db_save_dm_logs: {e}")
 
 async def db_save_prompt():
-    if not _db: return
+    if not _db_ok(): return
     try:
         await _col("meta").update_one(
             {"_id": "prompt"},
-            {"$set": {"text": custom_prompt, "history": prompt_history[-20:]}},  # keep last 20
+            {"$set": {"text": custom_prompt, "history": prompt_history[-20:]}},
             upsert=True,
         )
     except Exception as e:
         log.error(f"db_save_prompt: {e}")
 
-# FIX #17: persist error log to DB periodically
 async def db_save_error_log():
-    if not _db: return
+    if not _db_ok(): return
     try:
         await _col("meta").update_one(
             {"_id": "error_log"},
@@ -408,7 +407,6 @@ def get_econ(uid: int) -> dict:
     return e
 
 async def save_econ(uid: int):
-    """Await the DB save directly — call inside the lock."""
     await db_save_economy(str(uid))
 
 # ─── COLOR MAP ─────────────────────────────────────────────────────────────────
@@ -510,7 +508,6 @@ def build_context(msg: discord.Message, guild: discord.Guild | None = None) -> s
     if msg.mentions:
         parts.append("Mentions=" + ",".join(f"{m.name}:{m.id}" for m in msg.mentions[:3]))
 
-    # FIX #9: guard against DeletedReferencedMessage (has no .author/.content)
     if (
         msg.reference
         and hasattr(msg.reference, "resolved")
@@ -656,9 +653,7 @@ INJECTION_PATTERNS = [
     r"<\|",
 ]
 _injection_re = re.compile("|".join(INJECTION_PATTERNS), re.IGNORECASE)
-
-# FIX #5: strip zero-width chars and casefold before checking
-_ZERO_WIDTH = re.compile(r'[\u200b-\u200f\u202a-\u202e\ufeff]')
+_ZERO_WIDTH   = re.compile(r'[\u200b-\u200f\u202a-\u202e\ufeff]')
 
 def is_suspicious(content: str) -> bool:
     cleaned = _ZERO_WIDTH.sub('', content).casefold()
@@ -706,7 +701,6 @@ async def call_ai(history: list, system: str | None = None) -> str:
         log.error(err)
         error_log.append({"ts": datetime.now(timezone.utc).isoformat(), "err": err})
         key_index = (key_index + 1) % len(GROQ_KEYS)
-        # FIX #8: add jitter to avoid thundering herd on simultaneous failures
         await asyncio.sleep(0.3 + random.uniform(0, 0.5))
 
     return '{"action":"chat","message":"All API keys are rate limited. Try again in a moment."}'
@@ -714,7 +708,6 @@ async def call_ai(history: list, system: str | None = None) -> str:
 # ─── WEB SEARCH ────────────────────────────────────────────────────────────────
 
 async def web_search(query: str) -> str:
-    # FIX #6: use quote_plus for proper URL encoding instead of stripping chars
     try:
         encoded = quote_plus(query[:200])
         session = await get_http_session()
@@ -735,7 +728,6 @@ async def web_search(query: str) -> str:
 # ─── PARSE AI RESPONSE ────────────────────────────────────────────────────────
 
 def parse_ai_json(raw: str) -> dict | None:
-    # FIX #2: try full parse first (handles nested JSON/braces in strings)
     cleaned = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
     try:
         result = json.loads(cleaned)
@@ -743,7 +735,6 @@ def parse_ai_json(raw: str) -> dict | None:
             return result
     except Exception:
         pass
-    # Fallback: find outermost {...} block
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if match:
         try:
@@ -1191,7 +1182,6 @@ async def process(msg: discord.Message, content_override: str | None = None, is_
         histories[hist_key] = hist[-MAX_HIST:]
     hist = histories[hist_key]
 
-    # FIX #1: evict oldest 100 keys to keep memory bounded; insertion order preserved in Python 3.7+
     if len(histories) > 500:
         for k in list(histories.keys())[:100]:
             del histories[k]
@@ -1364,7 +1354,7 @@ async def cmd_botinfo(ctx):
     embed.add_field(name="Servers",        value=f"`{len(bot.guilds)}`",                       inline=True)
     embed.add_field(name="AI Model",       value="`LLaMA 3.3 70B`",                            inline=True)
     embed.add_field(name="Msgs Processed", value=f"`{msgs_processed:,}`",                      inline=True)
-    embed.add_field(name="DB",             value="`✅ Connected`" if _db else "`❌ Offline`",    inline=True)
+    embed.add_field(name="DB",             value="`✅ Connected`" if _db_ok() else "`❌ Offline`", inline=True)
     embed.add_field(name="Groq Keys",      value=f"`{len(GROQ_KEYS)}`",                        inline=True)
     embed.set_footer(text="AJ's Assistant")
     await ctx.reply(embed=embed, mention_author=False)
@@ -1441,7 +1431,6 @@ async def cmd_snipe(ctx):
     embed = discord.Embed(
         description=entry["content"] or "*[no text content]*",
         color=0x5865F2,
-        # FIX #4: show the original message creation time, not when it was cached
         timestamp=entry["created_at"],
     )
     embed.set_author(name=entry["author"], icon_url=entry["author_avatar"])
@@ -1515,7 +1504,7 @@ async def cmd_debug(ctx):
     embed.add_field(name="Mod Log Entries", value=str(len(mod_logs)),                                    inline=True)
     embed.add_field(name="Prompt History",  value=str(len(prompt_history)),                              inline=True)
     embed.add_field(name="Log Channel",     value="✅ Set" if BOT_LOG_CHANNEL_ID else "❌ Not set",       inline=True)
-    embed.add_field(name="DB",              value="✅ Connected" if _db else "❌ Offline",                 inline=True)
+    embed.add_field(name="DB",              value="✅ Connected" if _db_ok() else "❌ Offline",            inline=True)
     embed.add_field(name="Last 5 Errors",   value=f"```{errs}```",                                       inline=False)
     await ctx.reply(embed=embed, mention_author=False)
 
@@ -1525,7 +1514,6 @@ async def cmd_setprompt(ctx, *, text: str):
     global custom_prompt, prompt_history
     if not is_owner(ctx.author.id):
         await deny(ctx); return
-    # FIX #18: push to history stack before overwriting (unlimited undo)
     prompt_history.append(custom_prompt)
     custom_prompt = text
     await db_save_prompt()
@@ -1788,7 +1776,6 @@ async def cmd_pay(ctx, member: discord.Member = None, amount: int = 0):
         embed = discord.Embed(description="❌ Max transfer is **10,000 coins** at a time.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
         await ctx.reply(embed=embed, mention_author=False); return
 
-    # Deadlock-safe: always lock lower ID first
     first_id, second_id = sorted([ctx.author.id, member.id])
     async with _get_econ_lock(first_id):
         async with _get_econ_lock(second_id):
@@ -1815,8 +1802,9 @@ async def cmd_pay(ctx, member: discord.Member = None, amount: int = 0):
 
 @bot.command(name="daily")
 async def cmd_daily(ctx):
-    async with _get_econ_lock(ctx.author.id):
-        econ   = get_econ(ctx.author.id)
+    uid = ctx.author.id
+    async with _get_econ_lock(uid):
+        econ   = get_econ(uid)
         now    = datetime.now(timezone.utc)
         streak = econ.get("daily_streak", 0)
 
@@ -1847,7 +1835,7 @@ async def cmd_daily(ctx):
         econ["total_earned"] += reward
         econ["last_daily"]    = now.isoformat()
         econ["daily_streak"]  = streak
-        await save_econ(ctx.author.id)
+        await save_econ(uid)
 
     if streak >= 30:
         tier_label = "🌟 Month+ Streak!"
@@ -1977,12 +1965,10 @@ async def _do_backup(owner_user):
 
 # ─── BACKGROUND TASKS ─────────────────────────────────────────────────────────
 
-# FIX (original crash): use dt_time (imported as `from datetime import time as dt_time`)
 _MIDNIGHT = dt_time(0, 0, 0, tzinfo=timezone.utc)
 
 @tasks.loop(time=_MIDNIGHT)
 async def midnight_backup():
-    # FIX #7: guard against running before bot is fully ready
     if not OWNER_ID or not bot.is_ready():
         return
     try:
@@ -1995,25 +1981,19 @@ async def midnight_backup():
 
 @tasks.loop(minutes=5)
 async def snipe_cleanup():
-    """Evict expired snipe entries and stale rate_limit / econ_lock entries."""
-    now     = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
 
-    # Snipe expiry
     expired = [cid for cid, entry in snipe_cache.items()
                if (now - entry["cached_at"]).total_seconds() > SNIPE_EXPIRY]
     for cid in expired:
         snipe_cache.pop(cid, None)
 
-    # FIX #14: purge stale rate_limit entries older than 1 hour
     cutoff      = time.time() - 3600
     stale_rates = [uid for uid, ts in list(rate_limits.items()) if ts < cutoff]
     for uid in stale_rates:
         del rate_limits[uid]
 
-    # FIX #10: clean up idle econ locks
     _cleanup_econ_locks()
-
-    # FIX #17: persist error log periodically
     await db_save_error_log()
 
     if expired or stale_rates:
@@ -2047,13 +2027,13 @@ async def on_ready():
         "🟢 Bot Started",
         f"**{bot.user}** is online • {discord_ts(started_at, 'F')}",
         fields=[
-            ("Guilds",        str(guilds),         True),
-            ("Total Members", str(total_members),  True),
-            ("Economy Users", str(len(economy)),   True),
-            ("Registered",    str(len(registry)),  True),
-            ("Mod Logs",      str(len(mod_logs)),  True),
-            ("Groq Keys",     str(len(GROQ_KEYS)), True),
-            ("DB",            "✅ Yes" if _db else "❌ No", True),
+            ("Guilds",        str(guilds),              True),
+            ("Total Members", str(total_members),       True),
+            ("Economy Users", str(len(economy)),        True),
+            ("Registered",    str(len(registry)),       True),
+            ("Mod Logs",      str(len(mod_logs)),       True),
+            ("Groq Keys",     str(len(GROQ_KEYS)),      True),
+            ("DB",            "✅ Yes" if _db_ok() else "❌ No", True),
             ("Log Channel",   "✅ Set" if BOT_LOG_CHANNEL_ID else "❌ Not set", True),
         ],
         level="startup",
@@ -2064,13 +2044,12 @@ async def on_ready():
 async def on_message_delete(msg: discord.Message):
     if msg.author.bot: return
     if not isinstance(msg.channel, discord.TextChannel): return
-    # FIX #4: store both created_at (for display) and cached_at (for expiry)
     snipe_cache[msg.channel.id] = {
         "content":       msg.content,
         "author":        str(msg.author),
         "author_avatar": str(msg.author.display_avatar.url),
-        "created_at":    msg.created_at,           # original message timestamp
-        "cached_at":     datetime.now(timezone.utc),  # when we cached it (for expiry)
+        "created_at":    msg.created_at,
+        "cached_at":     datetime.now(timezone.utc),
     }
 
 
@@ -2083,8 +2062,7 @@ async def on_message(msg: discord.Message):
 
     is_dm   = isinstance(msg.channel, discord.DMChannel)
     content = msg.content.strip()
-
-    uid = msg.author.id
+    uid     = msg.author.id
 
     # ── AFK: remove sender's AFK if they send a non-command ──────────────────
     if uid in afk_users and not content.startswith(CMD_PREFIX):
@@ -2130,7 +2108,6 @@ async def on_message(msg: discord.Message):
                 econ["last_message_ts"]   = now.isoformat()
                 await save_econ(uid)
 
-    # FIX #13: only track activity / register for non-command, non-DM messages
     is_prefix_cmd = content.startswith(CMD_PREFIX) and len(content) > 1
     if not is_dm and not is_prefix_cmd:
         track_activity(uid, msg.channel.id)
@@ -2277,7 +2254,6 @@ async def shutdown(signal_name: str = "SIGTERM"):
         f"Received `{signal_name}` — saving data and disconnecting… {discord_ts(datetime.now(timezone.utc), 'T')}",
         level="shutdown",
     ))
-    # Close shared HTTP session cleanly
     global _http_session
     if _http_session and not _http_session.closed:
         await _http_session.close()
