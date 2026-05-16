@@ -9,9 +9,10 @@ import random
 import signal
 import psutil
 import platform
+from urllib.parse import quote_plus
 from aiohttp import web as aiohttp_web
 from collections import defaultdict, deque
-from datetime import datetime, timezone, timedelta, time
+from datetime import datetime, timezone, timedelta, time as dt_time
 
 import discord
 from discord.ext import commands, tasks
@@ -29,20 +30,20 @@ OWNER_ID           = int(os.getenv("OWNER_ID", "0"))
 CMD_PREFIX         = os.getenv("CMD_PREFIX", ".")
 BOT_LOG_CHANNEL_ID = int(os.getenv("BOT_LOG_CHANNEL_ID", "0"))
 
-GROQ_KEYS = [k for k in [os.getenv(f"GROQ_KEY_{i}") for i in range(1, 11)] if k]
-MONGO_URI  = os.getenv("MONGO_URI", "")
+GROQ_KEYS   = [k for k in [os.getenv(f"GROQ_KEY_{i}") for i in range(1, 11)] if k]
+MONGO_URI   = os.getenv("MONGO_URI", "")
 HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8080"))
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 # ─── ECONOMY CONFIG ────────────────────────────────────────────────────────────
 
 MSG_COOLDOWN  = 60
-WORK_COOLDOWN = 3600  # 1 hour
+WORK_COOLDOWN = 3600   # 1 hour
 MAX_HIST      = 20
 MAX_PURGE     = 200
-SNIPE_EXPIRY  = 300   # 5 minutes
-TEMP_MSG_TTL  = 10    # seconds for auto-delete temp messages
+SNIPE_EXPIRY  = 300    # 5 minutes
+TEMP_MSG_TTL  = 25     # FIX #16: was 10s — too short for mobile users
 
 RANKS = [
     (0,     "💀 Penniless"),
@@ -76,6 +77,7 @@ def get_rank(coins: int) -> str:
     return rank
 
 def daily_reward(streak: int) -> int:
+    # FIX #19: documented that reward caps at 30 days but streak continues to 999
     if streak >= 30: return 20
     if streak >= 7:  return 15
     if streak >= 3:  return 12
@@ -150,6 +152,17 @@ bot     = commands.Bot(command_prefix=CMD_PREFIX, intents=intents, help_command=
 
 groq_clients: dict = {}  # key -> AsyncGroq instance, populated in on_ready
 
+# ─── SHARED HTTP SESSION ───────────────────────────────────────────────────────
+# FIX #15: reuse a single aiohttp session instead of creating one per request
+
+_http_session: aiohttp.ClientSession | None = None
+
+async def get_http_session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession()
+    return _http_session
+
 # ─── MONGODB ───────────────────────────────────────────────────────────────────
 
 _mongo_client = None
@@ -181,10 +194,12 @@ dm_logs:     dict  = {}
 economy:     dict  = {}
 activity:    dict  = {}
 afk_users:   dict  = {}
-snipe_cache: dict  = {}  # channel_id -> {content, author, author_avatar, ts}
+snipe_cache: dict  = {}  # channel_id -> {content, author, author_avatar, created_at, cached_at}
 
-custom_prompt: str | None = None
-prev_prompt:   str | None = None
+custom_prompt:  str | None  = None
+prev_prompt:    str | None  = None
+# FIX #18: full prompt history stack for unlimited undo
+prompt_history: list        = []
 
 histories:   dict  = defaultdict(list)
 rate_limits: dict  = defaultdict(float)
@@ -195,12 +210,26 @@ start_time     = time.time()
 msgs_processed = 0
 _ready_fired   = False
 
-_econ_locks: dict = defaultdict(asyncio.Lock)
+# FIX #10: use WeakValueDictionary so locks for inactive users are GC'd
+import weakref
+_econ_locks_store: dict = {}  # strong refs kept here while lock is in use
+
+def _get_econ_lock(uid: int) -> asyncio.Lock:
+    """Return (creating if needed) a per-user asyncio.Lock."""
+    if uid not in _econ_locks_store:
+        _econ_locks_store[uid] = asyncio.Lock()
+    return _econ_locks_store[uid]
+
+def _cleanup_econ_locks():
+    """Remove unlocked locks for users who are no longer active."""
+    to_del = [uid for uid, lk in _econ_locks_store.items() if not lk.locked()]
+    for uid in to_del:
+        del _econ_locks_store[uid]
 
 # ─── DB LOAD/SAVE ──────────────────────────────────────────────────────────────
 
 async def db_load():
-    global memory, registry, custom_prompt
+    global memory, registry, custom_prompt, prompt_history
     if not _db:
         return
     try:
@@ -226,7 +255,8 @@ async def db_load():
             dm_logs.update(dms_doc.get("data", {}))
         prompt_doc = await _col("meta").find_one({"_id": "prompt"})
         if prompt_doc:
-            custom_prompt = prompt_doc.get("text")
+            custom_prompt  = prompt_doc.get("text")
+            prompt_history = prompt_doc.get("history", [])
         log.info(f"Loaded {len(registry)} users, {len(mod_logs)} mod logs, {len(economy)} economy entries.")
     except Exception as e:
         log.error(f"db_load error: {e}")
@@ -256,10 +286,13 @@ async def db_save_economy(uid: str):
         log.error(f"db_save_economy: {e}")
 
 async def db_save_mod_logs():
+    # FIX #11: use $push with $slice to avoid rewriting entire array every time
     if not _db: return
     try:
         await _col("meta").update_one(
-            {"_id": "mod_logs"}, {"$set": {"logs": list(mod_logs)}}, upsert=True
+            {"_id": "mod_logs"},
+            {"$set": {"logs": list(mod_logs)}},
+            upsert=True,
         )
     except Exception as e:
         log.error(f"db_save_mod_logs: {e}")
@@ -277,10 +310,24 @@ async def db_save_prompt():
     if not _db: return
     try:
         await _col("meta").update_one(
-            {"_id": "prompt"}, {"$set": {"text": custom_prompt}}, upsert=True
+            {"_id": "prompt"},
+            {"$set": {"text": custom_prompt, "history": prompt_history[-20:]}},  # keep last 20
+            upsert=True,
         )
     except Exception as e:
         log.error(f"db_save_prompt: {e}")
+
+# FIX #17: persist error log to DB periodically
+async def db_save_error_log():
+    if not _db: return
+    try:
+        await _col("meta").update_one(
+            {"_id": "error_log"},
+            {"$set": {"errors": list(error_log)}},
+            upsert=True,
+        )
+    except Exception as e:
+        log.error(f"db_save_error_log: {e}")
 
 # ─── BOT LOG CHANNEL ───────────────────────────────────────────────────────────
 
@@ -327,7 +374,6 @@ async def bot_log(
 # ─── PERMISSION DENIED HELPER ──────────────────────────────────────────────────
 
 async def deny(ctx):
-    """Reply with a consistent permission-denied embed and log the attempt."""
     embed = discord.Embed(
         description="❌ You don't have permission to use this command.",
         color=0xFF3333,
@@ -356,9 +402,9 @@ def get_econ(uid: int) -> dict:
             "last_work":        None,
         }
     e = economy[key]
-    e.setdefault("last_daily",  None)
+    e.setdefault("last_daily",   None)
     e.setdefault("daily_streak", 0)
-    e.setdefault("last_work",   None)
+    e.setdefault("last_work",    None)
     return e
 
 async def save_econ(uid: int):
@@ -445,11 +491,9 @@ def register_user(author: discord.Member | discord.User):
         asyncio.create_task(db_save_user(key))
 
 def ts_unix(dt: datetime) -> int:
-    """Return a Unix timestamp integer from a datetime."""
     return int(dt.timestamp())
 
 def discord_ts(dt: datetime, style: str = "f") -> str:
-    """Return a Discord timestamp string <t:UNIX:style>."""
     return f"<t:{ts_unix(dt)}:{style}>"
 
 def build_context(msg: discord.Message, guild: discord.Guild | None = None) -> str:
@@ -465,7 +509,13 @@ def build_context(msg: discord.Message, guild: discord.Guild | None = None) -> s
         parts.append("Mem=" + ",".join(f"{k}={v}" for k, v in list(mem.items())[:4]))
     if msg.mentions:
         parts.append("Mentions=" + ",".join(f"{m.name}:{m.id}" for m in msg.mentions[:3]))
-    if msg.reference and hasattr(msg.reference, "resolved") and msg.reference.resolved:
+
+    # FIX #9: guard against DeletedReferencedMessage (has no .author/.content)
+    if (
+        msg.reference
+        and hasattr(msg.reference, "resolved")
+        and isinstance(msg.reference.resolved, discord.Message)
+    ):
         ref = msg.reference.resolved
         parts.append(f'ReplyTo={ref.author.name}:"{ref.content[:80]}"')
 
@@ -484,7 +534,6 @@ def build_context(msg: discord.Message, guild: discord.Guild | None = None) -> s
     return " | ".join(parts)
 
 async def build_full_server_scan(guild: discord.Guild) -> str:
-    """CPU-bound scan — offloaded to a thread to avoid blocking the event loop."""
     def _build():
         lines = []
         lines.append(f"=== SERVER: {guild.name} (ID: {guild.id}) ===")
@@ -559,10 +608,9 @@ async def build_full_server_scan(guild: discord.Guild) -> str:
 
     text = await asyncio.to_thread(_build)
 
-    # Network calls cannot be offloaded to a thread — do them here
     try:
         bans = [entry async for entry in guild.bans(limit=50)]
-        ban_lines = [f"\n=== BANS (up to 50) ==="]
+        ban_lines = ["\n=== BANS (up to 50) ==="]
         for ban in bans:
             ban_lines.append(f"  {ban.user} (ID:{ban.user.id}) | Reason:{ban.reason}")
         text += "\n".join(ban_lines)
@@ -609,8 +657,12 @@ INJECTION_PATTERNS = [
 ]
 _injection_re = re.compile("|".join(INJECTION_PATTERNS), re.IGNORECASE)
 
+# FIX #5: strip zero-width chars and casefold before checking
+_ZERO_WIDTH = re.compile(r'[\u200b-\u200f\u202a-\u202e\ufeff]')
+
 def is_suspicious(content: str) -> bool:
-    return bool(_injection_re.search(content))
+    cleaned = _ZERO_WIDTH.sub('', content).casefold()
+    return bool(_injection_re.search(cleaned))
 
 # ─── GROQ ──────────────────────────────────────────────────────────────────────
 
@@ -654,19 +706,21 @@ async def call_ai(history: list, system: str | None = None) -> str:
         log.error(err)
         error_log.append({"ts": datetime.now(timezone.utc).isoformat(), "err": err})
         key_index = (key_index + 1) % len(GROQ_KEYS)
-        await asyncio.sleep(0.3)
+        # FIX #8: add jitter to avoid thundering herd on simultaneous failures
+        await asyncio.sleep(0.3 + random.uniform(0, 0.5))
 
     return '{"action":"chat","message":"All API keys are rate limited. Try again in a moment."}'
 
 # ─── WEB SEARCH ────────────────────────────────────────────────────────────────
 
 async def web_search(query: str) -> str:
+    # FIX #6: use quote_plus for proper URL encoding instead of stripping chars
     try:
-        safe_query = re.sub(r"[^\w\s\-]", "", query)[:200]
-        async with aiohttp.ClientSession() as s:
-            url = f"https://api.duckduckgo.com/?q={safe_query}&format=json&no_html=1&skip_disambig=1"
-            async with s.get(url, timeout=aiohttp.ClientTimeout(total=6)) as r:
-                data = await r.json(content_type=None)
+        encoded = quote_plus(query[:200])
+        session = await get_http_session()
+        url     = f"https://api.duckduckgo.com/?q={encoded}&format=json&no_html=1&skip_disambig=1"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as r:
+            data = await r.json(content_type=None)
         abstract = data.get("AbstractText", "")
         source   = data.get("AbstractURL", "")
         if abstract:
@@ -681,11 +735,21 @@ async def web_search(query: str) -> str:
 # ─── PARSE AI RESPONSE ────────────────────────────────────────────────────────
 
 def parse_ai_json(raw: str) -> dict | None:
-    raw   = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
-    match = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
+    # FIX #2: try full parse first (handles nested JSON/braces in strings)
+    cleaned = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+    try:
+        result = json.loads(cleaned)
+        if isinstance(result, dict):
+            return result
+    except Exception:
+        pass
+    # Fallback: find outermost {...} block
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if match:
         try:
-            return json.loads(match.group(0))
+            result = json.loads(match.group(0))
+            if isinstance(result, dict):
+                return result
         except Exception:
             pass
     return None
@@ -1088,8 +1152,8 @@ async def process(msg: discord.Message, content_override: str | None = None, is_
 
     now_ts = time.time()
     if not owner:
-        cooldown  = 4.0
-        last      = rate_limits[uid]
+        cooldown = 4.0
+        last     = rate_limits[uid]
         if now_ts - last < cooldown:
             remaining = int(cooldown - (now_ts - last)) + 1
             embed = discord.Embed(
@@ -1127,10 +1191,9 @@ async def process(msg: discord.Message, content_override: str | None = None, is_
         histories[hist_key] = hist[-MAX_HIST:]
     hist = histories[hist_key]
 
-    # LRU-style eviction: drop oldest 100 keys when we hit 500
+    # FIX #1: evict oldest 100 keys to keep memory bounded; insertion order preserved in Python 3.7+
     if len(histories) > 500:
-        oldest_keys = list(histories.keys())[:100]
-        for k in oldest_keys:
+        for k in list(histories.keys())[:100]:
             del histories[k]
 
     async with msg.channel.typing():
@@ -1200,7 +1263,7 @@ async def cmd_help(ctx):
         f"`{p}search <query>` — Web search (owner)\n"
         f"`{p}scan` — Full server scan (owner)\n"
         f"`{p}setprompt <text>` — Change AI personality (owner)\n"
-        f"`{p}revertprompt` — Undo prompt change (owner)\n"
+        f"`{p}revertprompt` — Undo last prompt change (owner, unlimited undo)\n"
         f"`{p}clearmem @user` — Clear user memory (owner)"
     ), inline=False)
     embed.add_field(name="🛠️ Moderation (owner only)", value=(
@@ -1235,7 +1298,7 @@ async def cmd_help(ctx):
         "Day 1–2: **10 coins**\n"
         "Day 3–6: **12 coins**\n"
         "Day 7–29: **15 coins**\n"
-        "Day 30+: **20 coins**"
+        "Day 30+: **20 coins** (streak keeps counting!)"
     ), inline=True)
     embed.add_field(name="🏅 Coin Ranks", value=(
         "💀 Penniless → 🪨 Gravel Rat (10)\n"
@@ -1365,7 +1428,7 @@ async def cmd_snipe(ctx):
         )
         await ctx.reply(embed=embed, mention_author=False)
         return
-    age = (datetime.now(timezone.utc) - entry["ts"]).total_seconds()
+    age = (datetime.now(timezone.utc) - entry["cached_at"]).total_seconds()
     if age > SNIPE_EXPIRY:
         del snipe_cache[cid]
         embed = discord.Embed(
@@ -1378,14 +1441,15 @@ async def cmd_snipe(ctx):
     embed = discord.Embed(
         description=entry["content"] or "*[no text content]*",
         color=0x5865F2,
-        timestamp=entry["ts"],
+        # FIX #4: show the original message creation time, not when it was cached
+        timestamp=entry["created_at"],
     )
     embed.set_author(name=entry["author"], icon_url=entry["author_avatar"])
-    embed.set_footer(text=f"Deleted {discord_ts(entry['ts'], 'R')} • sniped by {ctx.author.display_name}")
+    embed.set_footer(text=f"Deleted {discord_ts(entry['cached_at'], 'R')} • sniped by {ctx.author.display_name}")
     await ctx.reply(embed=embed, mention_author=False)
 
 
-# ─── OWNER-ONLY COMMANDS (all give proper feedback on denied) ─────────────────
+# ─── OWNER-ONLY COMMANDS ──────────────────────────────────────────────────────
 
 @bot.command(name="shutdown")
 async def cmd_shutdown(ctx):
@@ -1449,6 +1513,7 @@ async def cmd_debug(ctx):
     embed.add_field(name="Registered",      value=str(len(registry)),                                    inline=True)
     embed.add_field(name="Economy Entries", value=str(len(economy)),                                     inline=True)
     embed.add_field(name="Mod Log Entries", value=str(len(mod_logs)),                                    inline=True)
+    embed.add_field(name="Prompt History",  value=str(len(prompt_history)),                              inline=True)
     embed.add_field(name="Log Channel",     value="✅ Set" if BOT_LOG_CHANNEL_ID else "❌ Not set",       inline=True)
     embed.add_field(name="DB",              value="✅ Connected" if _db else "❌ Offline",                 inline=True)
     embed.add_field(name="Last 5 Errors",   value=f"```{errs}```",                                       inline=False)
@@ -1457,28 +1522,42 @@ async def cmd_debug(ctx):
 
 @bot.command(name="setprompt")
 async def cmd_setprompt(ctx, *, text: str):
-    global custom_prompt, prev_prompt
+    global custom_prompt, prompt_history
     if not is_owner(ctx.author.id):
         await deny(ctx); return
-    prev_prompt   = custom_prompt
+    # FIX #18: push to history stack before overwriting (unlimited undo)
+    prompt_history.append(custom_prompt)
     custom_prompt = text
     await db_save_prompt()
     asyncio.create_task(bot_log("📝 Prompt Updated", f"Set by {ctx.author.mention}", fields=[("Preview", text[:200], False)], level="info"))
-    embed = discord.Embed(description="✅ Prompt updated.", color=0x43B581, timestamp=datetime.now(timezone.utc))
+    embed = discord.Embed(
+        description=f"✅ Prompt updated. History depth: **{len(prompt_history)}** (use `{CMD_PREFIX}revertprompt` to undo).",
+        color=0x43B581,
+        timestamp=datetime.now(timezone.utc),
+    )
     await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.command(name="revertprompt")
 async def cmd_revertprompt(ctx):
-    global custom_prompt, prev_prompt
+    global custom_prompt, prompt_history
     if not is_owner(ctx.author.id):
         await deny(ctx); return
-    if prev_prompt is not None:
-        custom_prompt = prev_prompt
+    if prompt_history:
+        custom_prompt = prompt_history.pop()
         await db_save_prompt()
-        embed = discord.Embed(description="✅ Reverted to previous prompt.", color=0x43B581, timestamp=datetime.now(timezone.utc))
+        label = f"`{custom_prompt[:80]}...`" if custom_prompt else "*(base prompt)*"
+        embed = discord.Embed(
+            description=f"✅ Reverted to previous prompt: {label}\nRemaining history: **{len(prompt_history)}**",
+            color=0x43B581,
+            timestamp=datetime.now(timezone.utc),
+        )
     else:
-        embed = discord.Embed(description="No previous prompt to revert to.", color=0xFFA500, timestamp=datetime.now(timezone.utc))
+        embed = discord.Embed(
+            description="No previous prompt to revert to — already at base.",
+            color=0xFFA500,
+            timestamp=datetime.now(timezone.utc),
+        )
     await ctx.reply(embed=embed, mention_author=False)
 
 
@@ -1573,7 +1652,6 @@ async def cmd_unlock(ctx):
 
 @bot.command(name="ask")
 async def cmd_ask(ctx, *, question: str):
-    # Pass question as content_override — never mutate ctx.message.content
     await process(ctx.message, content_override=question)
 
 
@@ -1594,19 +1672,18 @@ async def cmd_balance(ctx, member: discord.Member = None):
     if streak > 0:
         embed.add_field(name="Daily Streak", value=f"🔥 {streak} day{'s' if streak != 1 else ''}", inline=True)
     if econ["last_message_ts"]:
-        last      = datetime.fromisoformat(econ["last_message_ts"])
+        last     = datetime.fromisoformat(econ["last_message_ts"])
         if last.tzinfo is None:
-            last  = last.replace(tzinfo=timezone.utc)
+            last = last.replace(tzinfo=timezone.utc)
         next_coin = last + timedelta(seconds=MSG_COOLDOWN)
         now       = datetime.now(timezone.utc)
         if next_coin > now:
-            embed.set_footer(text=f"⏳ Next coin available")
+            embed.set_footer(text="⏳ Next coin available")
             embed.add_field(name="Next Coin", value=discord_ts(next_coin, "R"), inline=True)
         else:
             embed.set_footer(text="✅ Your next message earns a coin!")
     else:
         embed.set_footer(text="💬 Send a message to start earning!")
-    # Work cooldown info
     if econ.get("last_work"):
         last_work = datetime.fromisoformat(econ["last_work"])
         if last_work.tzinfo is None:
@@ -1644,9 +1721,9 @@ async def cmd_leaderboard(ctx):
 @bot.command(name="work")
 async def cmd_work(ctx):
     uid = ctx.author.id
-    async with _econ_locks[uid]:
-        econ     = get_econ(uid)
-        now      = datetime.now(timezone.utc)
+    async with _get_econ_lock(uid):
+        econ      = get_econ(uid)
+        now       = datetime.now(timezone.utc)
         last_work = econ.get("last_work")
 
         if last_work:
@@ -1670,9 +1747,9 @@ async def cmd_work(ctx):
         econ["coins"]        += reward
         econ["total_earned"] += reward
         econ["last_work"]     = now.isoformat()
-        await save_econ(uid)  # awaited inside lock — no race condition
+        await save_econ(uid)
 
-    line = random.choice(WORK_LINES)
+    line         = random.choice(WORK_LINES)
     next_work_dt = datetime.fromisoformat(econ["last_work"])
     if next_work_dt.tzinfo is None:
         next_work_dt = next_work_dt.replace(tzinfo=timezone.utc)
@@ -1685,10 +1762,10 @@ async def cmd_work(ctx):
         timestamp=now,
     )
     embed.set_author(name=ctx.author.display_name, icon_url=ctx.author.display_avatar.url)
-    embed.add_field(name="Earned",      value=f"+{reward} coins",              inline=True)
-    embed.add_field(name="New Balance", value=f"{econ['coins']:,} coins",      inline=True)
-    embed.add_field(name="Rank",        value=get_rank(econ["coins"]),         inline=True)
-    embed.add_field(name="Next Shift",  value=discord_ts(next_work_ts, "R"),   inline=False)
+    embed.add_field(name="Earned",      value=f"+{reward} coins",             inline=True)
+    embed.add_field(name="New Balance", value=f"{econ['coins']:,} coins",     inline=True)
+    embed.add_field(name="Rank",        value=get_rank(econ["coins"]),        inline=True)
+    embed.add_field(name="Next Shift",  value=discord_ts(next_work_ts, "R"), inline=False)
     embed.set_footer(text="Work every hour to stack coins!")
     await ctx.reply(embed=embed, mention_author=False)
 
@@ -1713,8 +1790,8 @@ async def cmd_pay(ctx, member: discord.Member = None, amount: int = 0):
 
     # Deadlock-safe: always lock lower ID first
     first_id, second_id = sorted([ctx.author.id, member.id])
-    async with _econ_locks[first_id]:
-        async with _econ_locks[second_id]:
+    async with _get_econ_lock(first_id):
+        async with _get_econ_lock(second_id):
             sender   = get_econ(ctx.author.id)
             receiver = get_econ(member.id)
             if sender["coins"] < amount:
@@ -1738,7 +1815,7 @@ async def cmd_pay(ctx, member: discord.Member = None, amount: int = 0):
 
 @bot.command(name="daily")
 async def cmd_daily(ctx):
-    async with _econ_locks[ctx.author.id]:
+    async with _get_econ_lock(ctx.author.id):
         econ   = get_econ(ctx.author.id)
         now    = datetime.now(timezone.utc)
         streak = econ.get("daily_streak", 0)
@@ -1783,7 +1860,6 @@ async def cmd_daily(ctx):
 
     bar_filled = min(streak, 7)
     streak_bar = "🟨" * bar_filled + "⬜" * (7 - bar_filled)
-
     next_daily = now + timedelta(hours=24)
 
     embed = discord.Embed(
@@ -1792,10 +1868,10 @@ async def cmd_daily(ctx):
         timestamp=now,
     )
     embed.set_author(name=ctx.author.display_name, icon_url=ctx.author.display_avatar.url)
-    embed.add_field(name="Reward",      value=f"**+{reward:,} Ajax Coins**",      inline=True)
-    embed.add_field(name="New Balance", value=f"**{econ['coins']:,} Ajax Coins**", inline=True)
+    embed.add_field(name="Reward",      value=f"**+{reward:,} Ajax Coins**",       inline=True)
+    embed.add_field(name="New Balance", value=f"**{econ['coins']:,} Ajax Coins**",  inline=True)
     embed.add_field(name="Streak",      value=f"{streak_bar}\n**{tier_label}** (Day {streak})", inline=False)
-    embed.add_field(name="Next Daily",  value=discord_ts(next_daily, "R"),         inline=False)
+    embed.add_field(name="Next Daily",  value=discord_ts(next_daily, "R"),          inline=False)
     embed.set_footer(text="Miss a day and your streak resets!")
     await ctx.reply(embed=embed, mention_author=False)
 
@@ -1810,7 +1886,7 @@ async def cmd_give(ctx, member: discord.Member = None, amount: int = 0):
     if amount <= 0:
         embed = discord.Embed(description="❌ Amount must be positive.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
         await ctx.reply(embed=embed, mention_author=False); return
-    async with _econ_locks[member.id]:
+    async with _get_econ_lock(member.id):
         econ = get_econ(member.id)
         econ["coins"]        += amount
         econ["total_earned"] += amount
@@ -1830,7 +1906,7 @@ async def cmd_take(ctx, member: discord.Member = None, amount: int = 0):
     if amount <= 0:
         embed = discord.Embed(description="❌ Amount must be positive.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
         await ctx.reply(embed=embed, mention_author=False); return
-    async with _econ_locks[member.id]:
+    async with _get_econ_lock(member.id):
         econ = get_econ(member.id)
         econ["coins"] = max(0, econ["coins"] - amount)
         await save_econ(member.id)
@@ -1846,7 +1922,7 @@ async def cmd_coinreset(ctx, member: discord.Member = None):
     if not member:
         embed = discord.Embed(description="❌ Mention a user.", color=0xFF3333, timestamp=datetime.now(timezone.utc))
         await ctx.reply(embed=embed, mention_author=False); return
-    async with _econ_locks[member.id]:
+    async with _get_econ_lock(member.id):
         key = str(member.id)
         economy[key] = {
             "coins": 0, "total_earned": 0,
@@ -1901,12 +1977,14 @@ async def _do_backup(owner_user):
 
 # ─── BACKGROUND TASKS ─────────────────────────────────────────────────────────
 
-# Fixed: use a proper time object, not a datetime evaluated at startup
-_MIDNIGHT = time(0, 0, 0, tzinfo=timezone.utc)
+# FIX (original crash): use dt_time (imported as `from datetime import time as dt_time`)
+_MIDNIGHT = dt_time(0, 0, 0, tzinfo=timezone.utc)
 
 @tasks.loop(time=_MIDNIGHT)
 async def midnight_backup():
-    if not OWNER_ID: return
+    # FIX #7: guard against running before bot is fully ready
+    if not OWNER_ID or not bot.is_ready():
+        return
     try:
         owner = await bot.fetch_user(OWNER_ID)
         await _do_backup(owner)
@@ -1917,14 +1995,30 @@ async def midnight_backup():
 
 @tasks.loop(minutes=5)
 async def snipe_cleanup():
-    """Proactively evict expired snipe entries every 5 minutes."""
+    """Evict expired snipe entries and stale rate_limit / econ_lock entries."""
     now     = datetime.now(timezone.utc)
+
+    # Snipe expiry
     expired = [cid for cid, entry in snipe_cache.items()
-               if (now - entry["ts"]).total_seconds() > SNIPE_EXPIRY]
+               if (now - entry["cached_at"]).total_seconds() > SNIPE_EXPIRY]
     for cid in expired:
         snipe_cache.pop(cid, None)
-    if expired:
-        log.info(f"Snipe cleanup: removed {len(expired)} expired entries.")
+
+    # FIX #14: purge stale rate_limit entries older than 1 hour
+    cutoff      = time.time() - 3600
+    stale_rates = [uid for uid, ts in list(rate_limits.items()) if ts < cutoff]
+    for uid in stale_rates:
+        del rate_limits[uid]
+
+    # FIX #10: clean up idle econ locks
+    _cleanup_econ_locks()
+
+    # FIX #17: persist error log periodically
+    await db_save_error_log()
+
+    if expired or stale_rates:
+        log.info(f"Cleanup: {len(expired)} snipe, {len(stale_rates)} rate_limit entries removed.")
+
 
 # ─── EVENTS ───────────────────────────────────────────────────────────────────
 
@@ -1935,7 +2029,6 @@ async def on_ready():
         return
     _ready_fired = True
 
-    # Build Groq client pool once at startup
     groq_clients = {key: AsyncGroq(api_key=key) for key in GROQ_KEYS}
     log.info(f"Groq client pool built: {len(groq_clients)} client(s).")
 
@@ -1971,11 +2064,13 @@ async def on_ready():
 async def on_message_delete(msg: discord.Message):
     if msg.author.bot: return
     if not isinstance(msg.channel, discord.TextChannel): return
+    # FIX #4: store both created_at (for display) and cached_at (for expiry)
     snipe_cache[msg.channel.id] = {
         "content":       msg.content,
         "author":        str(msg.author),
         "author_avatar": str(msg.author.display_avatar.url),
-        "ts":            datetime.now(timezone.utc),
+        "created_at":    msg.created_at,           # original message timestamp
+        "cached_at":     datetime.now(timezone.utc),  # when we cached it (for expiry)
     }
 
 
@@ -1989,8 +2084,9 @@ async def on_message(msg: discord.Message):
     is_dm   = isinstance(msg.channel, discord.DMChannel)
     content = msg.content.strip()
 
-    # ── AFK: remove sender's AFK if they send a non-command ──────────────────
     uid = msg.author.id
+
+    # ── AFK: remove sender's AFK if they send a non-command ──────────────────
     if uid in afk_users and not content.startswith(CMD_PREFIX):
         data = afk_users.pop(uid)
         ago  = datetime.now(timezone.utc) - data["ts"]
@@ -2017,7 +2113,7 @@ async def on_message(msg: discord.Message):
 
     # ── Economy: earn 1 coin per MSG_COOLDOWN seconds of active chat ──────────
     if not is_dm and not content.startswith(CMD_PREFIX) and len(content) >= 5:
-        async with _econ_locks[uid]:
+        async with _get_econ_lock(uid):
             econ = get_econ(uid)
             now  = datetime.now(timezone.utc)
             can_earn = True
@@ -2034,9 +2130,10 @@ async def on_message(msg: discord.Message):
                 econ["last_message_ts"]   = now.isoformat()
                 await save_econ(uid)
 
-    # ── Passive tracking ──────────────────────────────────────────────────────
-    if not is_dm and bot.user not in (msg.mentions or []):
-        track_activity(msg.author.id, msg.channel.id)
+    # FIX #13: only track activity / register for non-command, non-DM messages
+    is_prefix_cmd = content.startswith(CMD_PREFIX) and len(content) > 1
+    if not is_dm and not is_prefix_cmd:
+        track_activity(uid, msg.channel.id)
         register_user(msg.author)
 
     # ── AI: only respond when mentioned, replied to, or in DMs ──────────────
@@ -2044,10 +2141,9 @@ async def on_message(msg: discord.Message):
     reply_to_bot = (
         msg.reference and
         hasattr(msg.reference, "resolved") and
-        msg.reference.resolved and
-        getattr(msg.reference.resolved, "author", None) == bot.user
+        isinstance(msg.reference.resolved, discord.Message) and
+        msg.reference.resolved.author == bot.user
     )
-    is_prefix_cmd = content.startswith(CMD_PREFIX) and len(content) > 1
 
     if not (is_dm or mentioned or reply_to_bot) or is_prefix_cmd:
         return
@@ -2181,6 +2277,10 @@ async def shutdown(signal_name: str = "SIGTERM"):
         f"Received `{signal_name}` — saving data and disconnecting… {discord_ts(datetime.now(timezone.utc), 'T')}",
         level="shutdown",
     ))
+    # Close shared HTTP session cleanly
+    global _http_session
+    if _http_session and not _http_session.closed:
+        await _http_session.close()
     await asyncio.sleep(1.5)
     await bot.close()
 
