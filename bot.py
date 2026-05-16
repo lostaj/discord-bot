@@ -245,7 +245,12 @@ def get_econ(uid: int) -> dict:
             "total_earned":     0,
             "last_message_ts":  None,
             "messages_counted": 0,
+            "last_daily":       None,
+            "daily_streak":     0,
         }
+    # Backfill missing fields for existing users loaded from DB
+    economy[key].setdefault("last_daily", None)
+    economy[key].setdefault("daily_streak", 0)
     return economy[key]
 
 def save_econ(uid: int):
@@ -814,17 +819,20 @@ async def cmd_help(ctx):
         f"`{p}setprompt <text>` — Change AI personality (owner)\n"
         f"`{p}revertprompt` — Undo prompt change (owner)\n"
         f"`{p}clearmem @user` — Clear user memory (owner)\n"
+        f"`{p}backup` — DM a full data backup as JSON (owner)\n"
         f"`{p}debug` — Bot status (owner)"
     ), inline=False)
 
     embed.add_field(name="🪙 Ajax Coins Economy", value=(
+        f"`{p}daily` — Claim your daily reward (50+ coins, streak bonus)\n"
         f"`{p}balance [@user]` — Check your coin balance\n"
         f"`{p}leaderboard` — Top 10 richest members\n"
         f"`{p}pay @user <amount>` — Send coins to someone\n"
         f"`{p}give @user <amount>` — Give coins (trust 4+)\n"
         f"`{p}take @user <amount>` — Remove coins (trust 4+)\n"
         f"`{p}coinreset @user` — Reset a user's coins (owner)\n\n"
-        f"💬 Earn **1 Ajax Coin** per message (1-min cooldown, 5+ chars)"
+        f"💬 Earn **1 Ajax Coin** per message (1-min cooldown, 5+ chars)\n"
+        f"📅 Claim **50–110 coins** daily with streak bonuses (max day 7)"
     ), inline=False)
 
     embed.add_field(name="🔒 Trust Levels", value=(
@@ -1050,6 +1058,69 @@ async def cmd_pay(ctx, member: discord.Member = None, amount: int = 0):
     )
 
 
+@bot.command(name="daily")
+async def cmd_daily(ctx):
+    """Claim your daily Ajax Coins reward."""
+    econ = get_econ(ctx.author.id)
+    now  = datetime.now(timezone.utc)
+
+    # Base reward + streak bonus (caps at 7-day streak)
+    BASE_REWARD   = 50
+    STREAK_BONUS  = 10  # extra coins per streak day
+
+    last_daily = econ.get("last_daily")
+    streak     = econ.get("daily_streak", 0)
+
+    if last_daily:
+        last_dt = datetime.fromisoformat(last_daily)
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+
+        hours_since = (now - last_dt).total_seconds() / 3600
+
+        if hours_since < 24:
+            # Still on cooldown
+            next_claim = last_dt + timedelta(hours=24)
+            remaining  = next_claim - now
+            h = int(remaining.total_seconds() // 3600)
+            m = int((remaining.total_seconds() % 3600) // 60)
+            embed = discord.Embed(
+                title="⏳ Daily Already Claimed",
+                description=f"Come back in **{h}h {m}m** for your next reward!",
+                color=discord.Color.red()
+            )
+            embed.set_footer(text=f"Current streak: {streak} day(s) 🔥")
+            await ctx.reply(embed=embed, mention_author=False)
+            return
+        elif hours_since > 48:
+            # Streak broken (missed a day)
+            streak = 0
+        # else within 24–48h window: streak continues
+
+    # Calculate reward
+    streak      = min(streak + 1, 7)  # cap streak display at 7
+    reward      = BASE_REWARD + (STREAK_BONUS * (streak - 1))
+
+    econ["coins"]        += reward
+    econ["total_earned"] += reward
+    econ["last_daily"]    = now.isoformat()
+    econ["daily_streak"]  = streak
+    save_econ(ctx.author.id)
+
+    # Build embed
+    streak_bar = "🔥" * streak + "⬜" * (7 - streak)
+    embed = discord.Embed(
+        title="🪙 Daily Reward Claimed!",
+        color=0xF5C400
+    )
+    embed.set_author(name=ctx.author.display_name, icon_url=ctx.author.display_avatar.url)
+    embed.add_field(name="Reward",         value=f"**+{reward:,} Ajax Coins**",          inline=True)
+    embed.add_field(name="New Balance",    value=f"**{econ['coins']:,} Ajax Coins**",     inline=True)
+    embed.add_field(name="Streak",         value=f"{streak_bar}\n**Day {streak}** {'🔥 MAX!' if streak == 7 else ''}", inline=False)
+    embed.set_footer(text="Come back tomorrow to keep your streak! Streak resets if you miss a day.")
+    await ctx.reply(embed=embed, mention_author=False)
+
+
 @bot.command(name="give")
 async def cmd_give(ctx, member: discord.Member = None, amount: int = 0):
     if ctx.author.id != OWNER_ID and get_trust(ctx.author.id) < 4:
@@ -1100,6 +1171,50 @@ async def cmd_coinreset(ctx, member: discord.Member = None):
     economy[key] = {"coins": 0, "total_earned": 0, "last_message_ts": None, "messages_counted": 0}
     save_econ(member.id)
     await ctx.reply(f"✅ Reset **{member.display_name}**'s Ajax Coins.", mention_author=False)
+
+
+@bot.command(name="backup")
+async def cmd_backup(ctx):
+    """(Owner) DMs you a full JSON backup of all bot data."""
+    if ctx.author.id != OWNER_ID:
+        return
+
+    await ctx.reply("📦 Generating backup, check your DMs!", mention_author=False)
+
+    import io
+    backup_data = {
+        "generated_at":  datetime.now(timezone.utc).isoformat(),
+        "economy":       economy,
+        "registry":      registry,
+        "mod_logs":      mod_logs[-300:],
+        "memory":        memory,
+        "custom_prompt": custom_prompt,
+    }
+
+    raw      = json.dumps(backup_data, indent=2, default=str)
+    filename = f"backup_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+    file_obj = discord.File(fp=io.BytesIO(raw.encode()), filename=filename)
+
+    total_coins = sum(v.get("coins", 0) for v in economy.values())
+
+    embed = discord.Embed(
+        title="📦 AJ's Assistant — Full Backup",
+        description="Keep this file safe. You can use it to restore data if anything goes wrong.",
+        color=0xF5C400,
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="Economy entries",      value=f"{len(economy):,} users",  inline=True)
+    embed.add_field(name="Coins in circulation", value=f"{total_coins:,} 🪙",       inline=True)
+    embed.add_field(name="Registered users",     value=f"{len(registry):,}",        inline=True)
+    embed.add_field(name="Mod log entries",      value=f"{len(mod_logs):,}",         inline=True)
+    embed.add_field(name="Memory entries",       value=f"{len(memory):,}",           inline=True)
+    embed.set_footer(text=f"File: {filename}")
+
+    try:
+        dm = await ctx.author.create_dm()
+        await dm.send(embed=embed, file=file_obj)
+    except discord.Forbidden:
+        await ctx.reply("❌ Couldn't DM you — make sure your DMs are open.", mention_author=False)
 
 
 @bot.command(name="ping")
