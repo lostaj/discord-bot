@@ -19,22 +19,47 @@ load_dotenv()
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 
-DISCORD_TOKEN  = os.getenv("DISCORD_TOKEN")
-OWNER_ID       = int(os.getenv("OWNER_ID", "0"))
-CMD_PREFIX     = os.getenv("CMD_PREFIX", ".")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+OWNER_ID      = int(os.getenv("OWNER_ID", "0"))
+CMD_PREFIX    = os.getenv("CMD_PREFIX", ".")
 
-GROQ_KEYS  = [k for k in [os.getenv(f"GROQ_KEY_{i}") for i in range(1, 11)] if k]
-MONGO_URI  = os.getenv("MONGO_URI", "")  # MongoDB Atlas connection string
+GROQ_KEYS = [k for k in [os.getenv(f"GROQ_KEY_{i}") for i in range(1, 11)] if k]
+MONGO_URI = os.getenv("MONGO_URI", "")
+
+# ─── ECONOMY CONFIG ────────────────────────────────────────────────────────────
+
+MSG_RARITY   = 1   # 1 = every qualifying message earns; >1 = 1-in-N chance
+MSG_COOLDOWN = 60  # seconds between coin-earning messages
+
+RANKS = [
+    (0,     "💀 Penniless"),
+    (10,    "🪨 Gravel Rat"),
+    (50,    "🥉 Bronze Hoarder"),
+    (150,   "🥈 Silver Stacker"),
+    (500,   "🥇 Gold Grinder"),
+    (1000,  "💎 Diamond Hands"),
+    (5000,  "👑 Ajax Royalty"),
+    (10000, "🌟 Ajax Legend"),
+]
+
+def get_rank(coins: int) -> str:
+    rank = RANKS[0][1]
+    for threshold, title in RANKS:
+        if coins >= threshold:
+            rank = title
+    return rank
+
+# ─── LOGGING ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 # ─── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
 
-DEFAULT_PROMPT = """You are a powerful Discord server assistant bot. You can manage roles, channels, members, and more through natural language commands.
+DEFAULT_PROMPT = """You are AJ's Assistant, a powerful Discord server bot. You manage roles, channels, members, and more through natural language commands.
 
 When the owner or a trusted moderator asks you to do something like:
-- "make a role called X" / "create a role named X" / "add a role X"
+- "make a role called X" / "create a role named X"
 - "make a channel called X" / "create a channel named X"
 - "delete the role X" / "remove the channel X"
 - "ban @user" / "kick @user" / "mute @user for 10 mins"
@@ -94,15 +119,12 @@ BASE_PROMPT = DEFAULT_PROMPT
 intents = discord.Intents.all()
 bot     = commands.Bot(command_prefix=CMD_PREFIX, intents=intents, help_command=None)
 
-# ─── MONGODB STORAGE ───────────────────────────────────────────────────────────
-# All persistent data lives in MongoDB Atlas (free tier).
-# Activity and conversation history stay in RAM (no need to persist those).
+# ─── MONGODB ───────────────────────────────────────────────────────────────────
 
 _mongo_client = None
 _db           = None
 
 async def db_init():
-    """Connect to MongoDB. Called once on bot ready."""
     global _mongo_client, _db
     if not MONGO_URI:
         log.warning("⚠️  MONGO_URI not set — data won't persist across restarts.")
@@ -119,20 +141,22 @@ async def db_init():
 def _col(name: str):
     return _db[name] if _db else None
 
-# ── In-memory caches (written through to Mongo on change) ──────────────────────
+# ─── IN-MEMORY CACHES ──────────────────────────────────────────────────────────
+
 memory:   dict = {}   # uid → {key: val}
 registry: dict = {}   # uid → {trust, username, display_name}
-mod_logs: list = []   # last 300 mod actions (in-memory, persisted)
+mod_logs: list = []   # last 300 mod actions
 dm_logs:  dict = {}   # uid → last 15 DM exchanges
-
-activity: dict = {}   # in-memory only — not persisted
+economy:  dict = {}   # uid → {coins, total_earned, last_message_ts, messages_counted}
+activity: dict = {}   # in-memory only
 
 custom_prompt: str | None = None
 prev_prompt:   str | None = None
 
+# ─── DB LOAD/SAVE ──────────────────────────────────────────────────────────────
+
 async def db_load():
-    """Load all collections into memory caches on startup."""
-    global memory, registry, mod_logs, dm_logs, custom_prompt
+    global memory, registry, mod_logs, dm_logs, custom_prompt, economy
     if not _db:
         return
     try:
@@ -140,6 +164,13 @@ async def db_load():
             registry[doc["uid"]] = doc
         async for doc in _col("memory").find({}, {"_id": 0}):
             memory[doc["uid"]] = doc.get("data", {})
+        async for doc in _col("economy").find({}, {"_id": 0}):
+            economy[doc["uid"]] = {
+                "coins":             doc.get("coins", 0),
+                "total_earned":      doc.get("total_earned", 0),
+                "last_message_ts":   doc.get("last_message_ts"),
+                "messages_counted":  doc.get("messages_counted", 0),
+            }
         logs_doc = await _col("meta").find_one({"_id": "mod_logs"})
         if logs_doc:
             mod_logs[:] = logs_doc.get("logs", [])
@@ -149,16 +180,14 @@ async def db_load():
         prompt_doc = await _col("meta").find_one({"_id": "prompt"})
         if prompt_doc:
             custom_prompt = prompt_doc.get("text")
-        log.info(f"Loaded {len(registry)} users, {len(mod_logs)} mod logs from MongoDB.")
+        log.info(f"Loaded {len(registry)} users, {len(mod_logs)} mod logs, {len(economy)} economy entries.")
     except Exception as e:
         log.error(f"db_load error: {e}")
 
 async def db_save_user(uid: str):
     if not _db: return
     try:
-        await _col("registry").update_one(
-            {"uid": uid}, {"$set": registry[uid]}, upsert=True
-        )
+        await _col("registry").update_one({"uid": uid}, {"$set": registry[uid]}, upsert=True)
     except Exception as e:
         log.error(f"db_save_user: {e}")
 
@@ -170,6 +199,14 @@ async def db_save_mem(uid: str):
         )
     except Exception as e:
         log.error(f"db_save_mem: {e}")
+
+async def db_save_economy(uid: str):
+    if not _db: return
+    try:
+        doc = {"uid": uid, **economy.get(uid, {})}
+        await _col("economy").update_one({"uid": uid}, {"$set": doc}, upsert=True)
+    except Exception as e:
+        log.error(f"db_save_economy: {e}")
 
 async def db_save_mod_logs():
     if not _db: return
@@ -198,6 +235,22 @@ async def db_save_prompt():
     except Exception as e:
         log.error(f"db_save_prompt: {e}")
 
+# ─── ECONOMY HELPERS ───────────────────────────────────────────────────────────
+
+def get_econ(uid: int) -> dict:
+    key = str(uid)
+    if key not in economy:
+        economy[key] = {
+            "coins":            0,
+            "total_earned":     0,
+            "last_message_ts":  None,
+            "messages_counted": 0,
+        }
+    return economy[key]
+
+def save_econ(uid: int):
+    asyncio.ensure_future(db_save_economy(str(uid)))
+
 # ─── RUNTIME STATE ─────────────────────────────────────────────────────────────
 
 key_index      = 0
@@ -221,7 +274,7 @@ COLOR_MAP = {
     "teal":    discord.Color.teal(),
     "gold":    discord.Color.gold(),
     "default": discord.Color.default(),
-    "random":  None,  # handled at call site
+    "random":  None,
 }
 
 def resolve_color(name: str) -> discord.Color:
@@ -276,13 +329,13 @@ def track_activity(uid: int, cid: int):
     activity[key]["channels"][str(cid)] = activity[key]["channels"].get(str(cid), 0) + 1
 
 def register_user(author: discord.Member | discord.User):
-    key = str(author.id)
+    key    = str(author.id)
     is_new = key not in registry
     registry.setdefault(key, {"trust": 2})
     registry[key]["uid"]          = key
     registry[key]["username"]     = author.name
     registry[key]["display_name"] = author.display_name
-    if is_new:  # only save to DB on first sight
+    if is_new:
         asyncio.ensure_future(db_save_user(key))
 
 def build_context(msg: discord.Message, trust: int) -> str:
@@ -312,7 +365,7 @@ async def call_ai(history: list) -> str:
     if not GROQ_KEYS:
         return '{"action":"chat","message":"No Groq API keys configured. Add GROQ_KEY_1 to your .env file."}'
 
-    for attempt in range(len(GROQ_KEYS)):
+    for _ in range(len(GROQ_KEYS)):
         key = GROQ_KEYS[key_index % len(GROQ_KEYS)]
         try:
             client = AsyncGroq(api_key=key)
@@ -356,66 +409,52 @@ async def web_search(query: str) -> str:
 
 # ─── ACTION EXECUTOR ───────────────────────────────────────────────────────────
 
-async def execute_action(msg: discord.Message, data: dict) -> str:
-    """Execute a parsed AI action. Returns a reply string."""
+async def execute_action(msg: discord.Message, data: dict) -> str | None:
     guild  = msg.guild
     author = msg.author
     action = data.get("action", "chat")
 
-    # ── chat ──────────────────────────────────────────────────────────────────
     if action == "chat":
         return data.get("message", "...")
 
-    # ── create_role ───────────────────────────────────────────────────────────
     if action == "create_role":
-        if not guild:
-            return "Can't create roles in DMs."
+        if not guild: return "Can't create roles in DMs."
         name        = data.get("name", "New Role")
         color       = resolve_color(data.get("color", "random"))
         mentionable = data.get("mentionable", False)
         hoisted     = data.get("hoisted", False)
         reason      = data.get("reason", f"Requested by {author.name}")
         try:
-            role = await guild.create_role(
-                name=name, color=color,
-                mentionable=mentionable, hoist=hoisted,
-                reason=reason
-            )
+            role = await guild.create_role(name=name, color=color, mentionable=mentionable, hoist=hoisted, reason=reason)
             log_mod("create_role", role.id, author.id, name)
             return f"✅ Role **{role.name}** created! ({role.mention})"
         except discord.Forbidden:
             return "❌ I don't have permission to create roles."
         except Exception as e:
-            return f"❌ Error creating role: {e}"
+            return f"❌ Error: {e}"
 
-    # ── delete_role ───────────────────────────────────────────────────────────
     if action == "delete_role":
-        if not guild:
-            return "Can't do that in DMs."
+        if not guild: return "Can't do that in DMs."
         name   = data.get("name", "")
         reason = data.get("reason", f"Requested by {author.name}")
         role   = discord.utils.find(lambda r: r.name.lower() == name.lower(), guild.roles)
-        if not role:
-            return f"❌ Role **{name}** not found."
+        if not role: return f"❌ Role **{name}** not found."
         try:
             await role.delete(reason=reason)
             log_mod("delete_role", role.id, author.id, name)
             return f"✅ Role **{name}** deleted."
         except discord.Forbidden:
-            return "❌ Missing permissions to delete that role."
+            return "❌ Missing permissions."
         except Exception as e:
             return f"❌ Error: {e}"
 
-    # ── rename_role ───────────────────────────────────────────────────────────
     if action == "rename_role":
-        if not guild:
-            return "Can't do that in DMs."
+        if not guild: return "Can't do that in DMs."
         old    = data.get("old_name", "")
         new    = data.get("new_name", "")
         reason = data.get("reason", f"Requested by {author.name}")
         role   = discord.utils.find(lambda r: r.name.lower() == old.lower(), guild.roles)
-        if not role:
-            return f"❌ Role **{old}** not found."
+        if not role: return f"❌ Role **{old}** not found."
         try:
             await role.edit(name=new, reason=reason)
             log_mod("rename_role", role.id, author.id, f"{old} → {new}")
@@ -425,16 +464,14 @@ async def execute_action(msg: discord.Message, data: dict) -> str:
         except Exception as e:
             return f"❌ Error: {e}"
 
-    # ── create_channel ────────────────────────────────────────────────────────
     if action == "create_channel":
-        if not guild:
-            return "Can't create channels in DMs."
-        name      = data.get("name", "new-channel").lower().replace(" ", "-")
-        ch_type   = data.get("type", "text").lower()
-        topic     = data.get("topic", None)
-        reason    = data.get("reason", f"Requested by {author.name}")
-        cat_name  = data.get("category", None)
-        category  = None
+        if not guild: return "Can't create channels in DMs."
+        name     = data.get("name", "new-channel").lower().replace(" ", "-")
+        ch_type  = data.get("type", "text").lower()
+        topic    = data.get("topic", None)
+        reason   = data.get("reason", f"Requested by {author.name}")
+        cat_name = data.get("category", None)
+        category = None
         if cat_name:
             category = discord.utils.find(lambda c: c.name.lower() == cat_name.lower(), guild.categories)
         try:
@@ -451,15 +488,12 @@ async def execute_action(msg: discord.Message, data: dict) -> str:
         except Exception as e:
             return f"❌ Error: {e}"
 
-    # ── delete_channel ────────────────────────────────────────────────────────
     if action == "delete_channel":
-        if not guild:
-            return "Can't do that in DMs."
+        if not guild: return "Can't do that in DMs."
         name   = data.get("name", "")
         reason = data.get("reason", f"Requested by {author.name}")
         ch     = discord.utils.find(lambda c: c.name.lower() == name.lower().replace(" ", "-"), guild.channels)
-        if not ch:
-            return f"❌ Channel **{name}** not found."
+        if not ch: return f"❌ Channel **{name}** not found."
         try:
             await ch.delete(reason=reason)
             log_mod("delete_channel", ch.id, author.id, name)
@@ -469,16 +503,13 @@ async def execute_action(msg: discord.Message, data: dict) -> str:
         except Exception as e:
             return f"❌ Error: {e}"
 
-    # ── rename_channel ────────────────────────────────────────────────────────
     if action == "rename_channel":
-        if not guild:
-            return "Can't do that in DMs."
+        if not guild: return "Can't do that in DMs."
         old    = data.get("old_name", "").lower().replace(" ", "-")
         new    = data.get("new_name", "").lower().replace(" ", "-")
         reason = data.get("reason", f"Requested by {author.name}")
         ch     = discord.utils.find(lambda c: c.name.lower() == old, guild.channels)
-        if not ch:
-            return f"❌ Channel **{old}** not found."
+        if not ch: return f"❌ Channel **{old}** not found."
         try:
             await ch.edit(name=new, reason=reason)
             log_mod("rename_channel", ch.id, author.id, f"{old} → {new}")
@@ -488,10 +519,8 @@ async def execute_action(msg: discord.Message, data: dict) -> str:
         except Exception as e:
             return f"❌ Error: {e}"
 
-    # ── create_category ───────────────────────────────────────────────────────
     if action == "create_category":
-        if not guild:
-            return "Can't do that in DMs."
+        if not guild: return "Can't do that in DMs."
         name   = data.get("name", "New Category")
         reason = data.get("reason", f"Requested by {author.name}")
         try:
@@ -503,19 +532,18 @@ async def execute_action(msg: discord.Message, data: dict) -> str:
         except Exception as e:
             return f"❌ Error: {e}"
 
-    # ── give_role ─────────────────────────────────────────────────────────────
     if action == "give_role":
-        if not guild:
-            return "Can't do that in DMs."
+        if not guild: return "Can't do that in DMs."
         uid       = int(data.get("user_id", 0))
         role_name = data.get("role_name", "")
         reason    = data.get("reason", f"Requested by {author.name}")
-        member    = guild.get_member(uid) or next((m for m in msg.mentions if m.id == uid), msg.mentions[0] if msg.mentions else None)
-        if not member:
-            return "❌ Couldn't find that user."
+        member    = guild.get_member(uid) or next(
+            (m for m in msg.mentions if m.id == uid),
+            msg.mentions[0] if msg.mentions else None
+        )
+        if not member: return "❌ Couldn't find that user."
         role = discord.utils.find(lambda r: r.name.lower() == role_name.lower(), guild.roles)
-        if not role:
-            return f"❌ Role **{role_name}** not found."
+        if not role: return f"❌ Role **{role_name}** not found."
         try:
             await member.add_roles(role, reason=reason)
             log_mod("give_role", member.id, author.id, role_name)
@@ -525,19 +553,15 @@ async def execute_action(msg: discord.Message, data: dict) -> str:
         except Exception as e:
             return f"❌ Error: {e}"
 
-    # ── remove_role ───────────────────────────────────────────────────────────
     if action == "remove_role":
-        if not guild:
-            return "Can't do that in DMs."
+        if not guild: return "Can't do that in DMs."
         uid       = int(data.get("user_id", 0))
         role_name = data.get("role_name", "")
         reason    = data.get("reason", f"Requested by {author.name}")
         member    = guild.get_member(uid) or (msg.mentions[0] if msg.mentions else None)
-        if not member:
-            return "❌ Couldn't find that user."
+        if not member: return "❌ Couldn't find that user."
         role = discord.utils.find(lambda r: r.name.lower() == role_name.lower(), guild.roles)
-        if not role:
-            return f"❌ Role **{role_name}** not found."
+        if not role: return f"❌ Role **{role_name}** not found."
         try:
             await member.remove_roles(role, reason=reason)
             log_mod("remove_role", member.id, author.id, role_name)
@@ -547,15 +571,12 @@ async def execute_action(msg: discord.Message, data: dict) -> str:
         except Exception as e:
             return f"❌ Error: {e}"
 
-    # ── ban ───────────────────────────────────────────────────────────────────
     if action == "ban":
-        if not guild:
-            return "Can't do that in DMs."
+        if not guild: return "Can't do that in DMs."
         uid    = int(data.get("user_id", 0))
         reason = data.get("reason", f"Banned by {author.name}")
         member = guild.get_member(uid) or (msg.mentions[0] if msg.mentions else None)
-        if not member:
-            return "❌ Couldn't find that user."
+        if not member: return "❌ Couldn't find that user."
         try:
             await guild.ban(member, reason=reason)
             log_mod("ban", member.id, author.id, reason)
@@ -565,15 +586,12 @@ async def execute_action(msg: discord.Message, data: dict) -> str:
         except Exception as e:
             return f"❌ Error: {e}"
 
-    # ── kick ──────────────────────────────────────────────────────────────────
     if action == "kick":
-        if not guild:
-            return "Can't do that in DMs."
+        if not guild: return "Can't do that in DMs."
         uid    = int(data.get("user_id", 0))
         reason = data.get("reason", f"Kicked by {author.name}")
         member = guild.get_member(uid) or (msg.mentions[0] if msg.mentions else None)
-        if not member:
-            return "❌ Couldn't find that user."
+        if not member: return "❌ Couldn't find that user."
         try:
             await guild.kick(member, reason=reason)
             log_mod("kick", member.id, author.id, reason)
@@ -583,31 +601,25 @@ async def execute_action(msg: discord.Message, data: dict) -> str:
         except Exception as e:
             return f"❌ Error: {e}"
 
-    # ── mute ──────────────────────────────────────────────────────────────────
     if action == "mute":
-        if not guild:
-            return "Can't do that in DMs."
+        if not guild: return "Can't do that in DMs."
         uid    = int(data.get("user_id", 0))
         secs   = int(data.get("seconds", 300))
         reason = data.get("reason", f"Muted by {author.name}")
         member = guild.get_member(uid) or (msg.mentions[0] if msg.mentions else None)
-        if not member:
-            return "❌ Couldn't find that user."
+        if not member: return "❌ Couldn't find that user."
         until  = discord.utils.utcnow() + timedelta(seconds=secs)
         try:
             await member.timeout(until, reason=reason)
             log_mod("mute", member.id, author.id, f"{secs}s — {reason}")
-            mins = secs // 60
-            return f"🔇 **{member.name}** muted for {mins} min(s). Reason: {reason}"
+            return f"🔇 **{member.name}** muted for {secs // 60} min(s). Reason: {reason}"
         except discord.Forbidden:
             return "❌ Missing permissions to mute."
         except Exception as e:
             return f"❌ Error: {e}"
 
-    # ── unban ─────────────────────────────────────────────────────────────────
     if action == "unban":
-        if not guild:
-            return "Can't do that in DMs."
+        if not guild: return "Can't do that in DMs."
         uid    = int(data.get("user_id", 0))
         reason = data.get("reason", "Appeal accepted")
         try:
@@ -620,26 +632,22 @@ async def execute_action(msg: discord.Message, data: dict) -> str:
         except Exception as e:
             return f"❌ Error: {e}"
 
-    # ── purge ─────────────────────────────────────────────────────────────────
     if action == "purge":
-        if not guild:
-            return "Can't do that in DMs."
+        if not guild: return "Can't do that in DMs."
         count  = min(int(data.get("count", 10)), 200)
         reason = data.get("reason", f"Purge by {author.name}")
         try:
             deleted = await msg.channel.purge(limit=count + 1)
             log_mod("purge", msg.channel.id, author.id, f"{len(deleted)} msgs")
             await msg.channel.send(f"🗑️ Purged **{len(deleted) - 1}** messages.", delete_after=5)
-            return None  # already replied
+            return None
         except discord.Forbidden:
             return "❌ Missing permissions to purge."
         except Exception as e:
             return f"❌ Error: {e}"
 
-    # ── lock_channel ──────────────────────────────────────────────────────────
     if action == "lock_channel":
-        if not guild:
-            return "Can't do that in DMs."
+        if not guild: return "Can't do that in DMs."
         reason = data.get("reason", f"Locked by {author.name}")
         ch     = msg.channel
         ow     = ch.overwrites_for(guild.default_role)
@@ -653,10 +661,8 @@ async def execute_action(msg: discord.Message, data: dict) -> str:
         except Exception as e:
             return f"❌ Error: {e}"
 
-    # ── unlock_channel ────────────────────────────────────────────────────────
     if action == "unlock_channel":
-        if not guild:
-            return "Can't do that in DMs."
+        if not guild: return "Can't do that in DMs."
         reason = data.get("reason", f"Unlocked by {author.name}")
         ch     = msg.channel
         ow     = ch.overwrites_for(guild.default_role)
@@ -670,12 +676,10 @@ async def execute_action(msg: discord.Message, data: dict) -> str:
         except Exception as e:
             return f"❌ Error: {e}"
 
-    # ── lockdown ──────────────────────────────────────────────────────────────
     if action == "lockdown":
-        if not guild:
-            return "Can't do that in DMs."
-        reason  = data.get("reason", f"Lockdown by {author.name}")
-        locked  = 0
+        if not guild: return "Can't do that in DMs."
+        reason = data.get("reason", f"Lockdown by {author.name}")
+        locked = 0
         for ch in guild.text_channels:
             try:
                 ow = ch.overwrites_for(guild.default_role)
@@ -687,12 +691,10 @@ async def execute_action(msg: discord.Message, data: dict) -> str:
         log_mod("lockdown", 0, author.id, reason)
         return f"🔒 **LOCKDOWN ACTIVE** — {locked} channels locked. Reason: {reason}"
 
-    # ── unlock_all ────────────────────────────────────────────────────────────
     if action == "unlock_all":
-        if not guild:
-            return "Can't do that in DMs."
-        reason    = data.get("reason", f"Unlock all by {author.name}")
-        unlocked  = 0
+        if not guild: return "Can't do that in DMs."
+        reason   = data.get("reason", f"Unlock all by {author.name}")
+        unlocked = 0
         for ch in guild.text_channels:
             try:
                 ow = ch.overwrites_for(guild.default_role)
@@ -704,7 +706,6 @@ async def execute_action(msg: discord.Message, data: dict) -> str:
         log_mod("unlock_all", 0, author.id, reason)
         return f"🔓 All channels unlocked ({unlocked} total)."
 
-    # ── set_trust ─────────────────────────────────────────────────────────────
     if action == "set_trust":
         uid   = int(data.get("user_id", 0))
         level = int(data.get("level", 2))
@@ -713,34 +714,31 @@ async def execute_action(msg: discord.Message, data: dict) -> str:
         name   = member.display_name if member else str(uid)
         return f"✅ Set **{name}**'s trust level to **{level}**."
 
-    # ── whois ─────────────────────────────────────────────────────────────────
     if action == "whois":
-        if not guild:
-            return "Can't do that in DMs."
-        uid    = int(data.get("user_id", 0))
-        tgt    = guild.get_member(uid) or (msg.mentions[0] if msg.mentions else None)
-        if not tgt:
-            return "❌ User not found."
-        act    = activity.get(str(tgt.id), {})
-        warns  = [e for e in mod_logs if e["target"] == str(tgt.id)]
-        mem    = get_mem(tgt.id)
-        join   = getattr(tgt, "joined_at", None)
-        roles  = [r.name for r in tgt.roles if r.name != "@everyone"]
-        lines  = [
+        if not guild: return "Can't do that in DMs."
+        uid  = int(data.get("user_id", 0))
+        tgt  = guild.get_member(uid) or (msg.mentions[0] if msg.mentions else None)
+        if not tgt: return "❌ User not found."
+        act   = activity.get(str(tgt.id), {})
+        warns = [e for e in mod_logs if e["target"] == str(tgt.id)]
+        mem   = get_mem(tgt.id)
+        econ  = get_econ(tgt.id)
+        join  = getattr(tgt, "joined_at", None)
+        roles = [r.name for r in tgt.roles if r.name != "@everyone"]
+        lines = [
             f"**👤 {tgt.display_name}** (`{tgt.name}` | `{tgt.id}`)",
             f"Joined: {join.strftime('%Y-%m-%d') if join else 'N/A'} | Created: {tgt.created_at.strftime('%Y-%m-%d')}",
             f"Trust: **{get_trust(tgt.id)}** | Session msgs: {act.get('count', 0)} | Last active: {(act.get('last') or 'never')[:10]}",
             f"Roles: {', '.join(roles[:8]) or 'none'}",
             f"Mod actions: {len(warns)}",
+            f"Ajax Coins: **{econ['coins']:,}** ({get_rank(econ['coins'])})",
         ]
         if mem:
             lines.append("Notes: " + ", ".join(f"{k}={v}" for k, v in list(mem.items())[:4]))
         return "\n".join(lines)
 
-    # ── report ────────────────────────────────────────────────────────────────
     if action == "report":
-        if not guild:
-            return "No guild context."
+        if not guild: return "No guild context."
         week_ago  = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
         month_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         top = sorted(
@@ -751,15 +749,21 @@ async def execute_action(msg: discord.Message, data: dict) -> str:
         for k, v in top:
             m = guild.get_member(int(k))
             top_names.append(f"{m.display_name if m else k} ({v['count']})")
-        inactive = sum(1 for v in activity.values() if (v.get("last") or "") < month_ago)
+        inactive       = sum(1 for v in activity.values() if (v.get("last") or "") < month_ago)
         recent_actions = len([e for e in mod_logs if e["ts"] >= week_ago])
+        richest        = sorted(economy.items(), key=lambda x: x[1].get("coins", 0), reverse=True)[:3]
+        rich_names     = []
+        for k, v in richest:
+            m = guild.get_member(int(k))
+            rich_names.append(f"{m.display_name if m else k} ({v.get('coins', 0):,}🪙)")
         return (
             f"**📊 Server Report — {guild.name}**\n"
             f"Members: {guild.member_count} | Channels: {len(guild.channels)} | Roles: {len(guild.roles)}\n"
             f"Most active this week: {', '.join(top_names) or 'no data'}\n"
             f"Inactive 30+ days (session): {inactive}\n"
             f"Tracked this session: {len(activity)}\n"
-            f"Mod actions this week: {recent_actions}"
+            f"Mod actions this week: {recent_actions}\n"
+            f"Ajax Coin richest: {', '.join(rich_names) or 'no data'}"
         )
 
     return f"❓ Unknown action: {action}"
@@ -767,9 +771,7 @@ async def execute_action(msg: discord.Message, data: dict) -> str:
 # ─── PARSE AI RESPONSE ─────────────────────────────────────────────────────────
 
 def parse_ai_json(raw: str) -> dict | None:
-    # Strip markdown code fences if present
     raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
-    # Try to extract JSON object
     match = re.search(r"\{.*\}", raw, re.DOTALL)
     if match:
         try:
@@ -778,17 +780,17 @@ def parse_ai_json(raw: str) -> dict | None:
             pass
     return None
 
-# ─── COMMAND HANDLERS ──────────────────────────────────────────────────────────
+# ─── COMMANDS ──────────────────────────────────────────────────────────────────
 
 @bot.command(name="help")
 async def cmd_help(ctx):
     p = CMD_PREFIX
     embed = discord.Embed(
-        title="🤖 Bot Commands & Natural Language",
+        title="🤖 AJ's Assistant",
         description=(
-            "Just **mention me or reply to me** and speak naturally — I understand English!\n"
+            "**Mention me or reply to me** and speak naturally — I understand English!\n"
             "You can also DM me directly.\n\n"
-            "**Examples:**\n"
+            "**Natural Language Examples:**\n"
             f"`@bot make a role called aj shabeel`\n"
             f"`@bot create a voice channel called music`\n"
             f"`@bot ban @user spamming`\n"
@@ -796,35 +798,54 @@ async def cmd_help(ctx):
             f"`@bot give @user the VIP role`\n"
             f"`@bot purge 20 messages`\n"
             f"`@bot lock this channel`\n"
-            f"`@bot delete the role called temp`\n"
-            f"`@bot what's 2+2?` (chat mode)\n"
+            f"`@bot what's the capital of France?`"
         ),
         color=discord.Color.blurple()
     )
-    embed.add_field(name="📌 Prefix Commands", value=(
-        f"`{p}help` — This menu\n"
-        f"`{p}ask <question>` — Chat with the AI\n"
-        f"`{p}search <query>` — Web search (owner)\n"
-        f"`{p}debug` — Bot status (owner)\n"
-        f"`{p}setprompt <text>` — Change AI personality (owner)\n"
-        f"`{p}revertprompt` — Undo prompt change (owner)\n"
-        f"`{p}clearmem @user` — Clear user memory (owner)\n"
+
+    embed.add_field(name="🛠️ AI & Mod Commands", value=(
+        f"`{p}ask <question>` — Chat with AJ's Assistant\n"
         f"`{p}whois @user` — User info (trust 4+)\n"
         f"`{p}report` — Server stats (trust 4+)\n"
         f"`{p}purge <n>` — Delete messages (trust 4+)\n"
-        f"`{p}lockdown` — Lock all channels (trust 5)\n"
-        f"`{p}unlock` — Unlock all channels (trust 5)\n"
+        f"`{p}search <query>` — Web search (trust 4+)\n"
+        f"`{p}lockdown` — Lock all channels (owner)\n"
+        f"`{p}unlock` — Unlock all channels (owner)\n"
+        f"`{p}setprompt <text>` — Change AI personality (owner)\n"
+        f"`{p}revertprompt` — Undo prompt change (owner)\n"
+        f"`{p}clearmem @user` — Clear user memory (owner)\n"
+        f"`{p}debug` — Bot status (owner)"
     ), inline=False)
+
+    embed.add_field(name="🪙 Ajax Coins Economy", value=(
+        f"`{p}balance [@user]` — Check your coin balance\n"
+        f"`{p}leaderboard` — Top 10 richest members\n"
+        f"`{p}pay @user <amount>` — Send coins to someone\n"
+        f"`{p}give @user <amount>` — Give coins (trust 4+)\n"
+        f"`{p}take @user <amount>` — Remove coins (trust 4+)\n"
+        f"`{p}coinreset @user` — Reset a user's coins (owner)\n\n"
+        f"💬 Earn **1 Ajax Coin** per message (1-min cooldown, 5+ chars)"
+    ), inline=False)
+
     embed.add_field(name="🔒 Trust Levels", value=(
-        "**0** — Blocked (silent)\n"
+        "**0** — Blocked\n"
         "**1** — Restricted\n"
         "**2** — Regular user (default)\n"
         "**3** — Trusted user\n"
         "**4** — Moderator\n"
         "**5** — Owner/Admin"
-    ), inline=False)
-    embed.set_footer(text=f"Powered by Groq LLaMA | Prefix: {p}")
+    ), inline=True)
+
+    embed.add_field(name="🪙 Ajax Coin Ranks", value=(
+        "💀 Penniless → 🪨 Gravel Rat (10)\n"
+        "🥉 Bronze Hoarder (50) → 🥈 Silver Stacker (150)\n"
+        "🥇 Gold Grinder (500) → 💎 Diamond Hands (1k)\n"
+        "👑 Ajax Royalty (5k) → 🌟 Ajax Legend (10k)"
+    ), inline=True)
+
+    embed.set_footer(text=f"AJ's Assistant • Powered by Groq LLaMA • Prefix: {p}")
     await ctx.reply(embed=embed, mention_author=False)
+
 
 @bot.command(name="debug")
 async def cmd_debug(ctx):
@@ -834,16 +855,18 @@ async def cmd_debug(ctx):
     h, m, s = up // 3600, (up % 3600) // 60, up % 60
     errs  = "\n".join(f"  [{e['ts'][11:19]}] {e['err'][:80]}" for e in error_log[-5:]) or "  None"
     await ctx.reply(
-        f"**🛠️ Debug Info**\n"
+        f"**🛠️ Debug Info — AJ's Assistant**\n"
         f"Uptime: {h}h {m}m {s}s\n"
         f"Messages processed: {msgs_processed}\n"
         f"Active Groq key: #{(key_index % max(len(GROQ_KEYS), 1)) + 1} / {len(GROQ_KEYS)}\n"
         f"Session tracked members: {len(activity)}\n"
         f"Registered users: {len(registry)}\n"
+        f"Economy entries: {len(economy)}\n"
         f"Mod log entries: {len(mod_logs)}\n"
         f"Last 5 errors:\n{errs}",
         mention_author=False
     )
+
 
 @bot.command(name="setprompt")
 async def cmd_setprompt(ctx, *, text: str):
@@ -853,7 +876,8 @@ async def cmd_setprompt(ctx, *, text: str):
     prev_prompt   = custom_prompt
     custom_prompt = text
     await db_save_prompt()
-    await ctx.reply("✅ Prompt updated — survives restarts too.", mention_author=False)
+    await ctx.reply("✅ Prompt updated.", mention_author=False)
+
 
 @bot.command(name="revertprompt")
 async def cmd_revertprompt(ctx):
@@ -867,12 +891,14 @@ async def cmd_revertprompt(ctx):
     else:
         await ctx.reply("No previous prompt to revert to.", mention_author=False)
 
+
 @bot.command(name="search")
 async def cmd_search(ctx, *, query: str):
     if ctx.author.id != OWNER_ID and get_trust(ctx.author.id) < 4:
         return
     result = await web_search(query)
     await ctx.reply(result, mention_author=False)
+
 
 @bot.command(name="clearmem")
 async def cmd_clearmem(ctx, member: discord.Member = None):
@@ -884,10 +910,10 @@ async def cmd_clearmem(ctx, member: discord.Member = None):
     clear_mem(member.id)
     await ctx.reply(f"✅ Memory cleared for **{member.display_name}**.", mention_author=False)
 
+
 @bot.command(name="whois")
 async def cmd_whois(ctx, member: discord.Member = None):
-    trust = get_trust(ctx.author.id)
-    if trust < 4:
+    if get_trust(ctx.author.id) < 4:
         return
     if not member:
         if ctx.message.mentions:
@@ -895,9 +921,9 @@ async def cmd_whois(ctx, member: discord.Member = None):
         else:
             await ctx.reply("Mention a user.", mention_author=False)
             return
-    data   = {"action": "whois", "user_id": str(member.id)}
-    result = await execute_action(ctx.message, data)
+    result = await execute_action(ctx.message, {"action": "whois", "user_id": str(member.id)})
     await ctx.reply(result, mention_author=False)
+
 
 @bot.command(name="report")
 async def cmd_report(ctx):
@@ -906,11 +932,13 @@ async def cmd_report(ctx):
     result = await execute_action(ctx.message, {"action": "report"})
     await ctx.reply(result, mention_author=False)
 
+
 @bot.command(name="purge")
 async def cmd_purge(ctx, count: int = 10):
     if get_trust(ctx.author.id) < 4:
         return
     await execute_action(ctx.message, {"action": "purge", "count": count})
+
 
 @bot.command(name="lockdown")
 async def cmd_lockdown(ctx):
@@ -919,6 +947,7 @@ async def cmd_lockdown(ctx):
     result = await execute_action(ctx.message, {"action": "lockdown"})
     await ctx.reply(result, mention_author=False)
 
+
 @bot.command(name="unlock")
 async def cmd_unlock(ctx):
     if get_trust(ctx.author.id) < 5:
@@ -926,12 +955,158 @@ async def cmd_unlock(ctx):
     result = await execute_action(ctx.message, {"action": "unlock_all"})
     await ctx.reply(result, mention_author=False)
 
+
 @bot.command(name="ask")
 async def cmd_ask(ctx, *, question: str):
     ctx.message.content = question
     await process(ctx.message)
 
-# ─── CORE PROCESS ──────────────────────────────────────────────────────────────
+
+# ─── ECONOMY COMMANDS ──────────────────────────────────────────────────────────
+
+@bot.command(name="balance", aliases=["bal", "coins", "ajax"])
+async def cmd_balance(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    econ   = get_econ(target.id)
+    rank   = get_rank(econ["coins"])
+
+    embed = discord.Embed(title="🪙 Ajax Coins Balance", color=0xF5C400)
+    embed.set_author(name=target.display_name, icon_url=target.display_avatar.url)
+    embed.add_field(name="Current Balance",       value=f"**{econ['coins']:,} Ajax Coins**", inline=False)
+    embed.add_field(name="Total Ever Earned",     value=f"{econ['total_earned']:,}",         inline=True)
+    embed.add_field(name="Messages That Counted", value=f"{econ['messages_counted']:,}",     inline=True)
+    embed.add_field(name="Rank",                  value=rank,                                inline=False)
+
+    if econ["last_message_ts"]:
+        last     = datetime.fromisoformat(econ["last_message_ts"])
+        next_ts  = last + timedelta(seconds=MSG_COOLDOWN)
+        now      = datetime.now(timezone.utc)
+        # make timezone-aware if needed
+        if last.tzinfo is None:
+            last    = last.replace(tzinfo=timezone.utc)
+            next_ts = last + timedelta(seconds=MSG_COOLDOWN)
+        if next_ts > now:
+            remaining = int((next_ts - now).total_seconds())
+            embed.set_footer(text=f"⏳ Next coin in ~{remaining}s — keep chatting!")
+        else:
+            embed.set_footer(text="✅ Your next message can earn a coin!")
+    else:
+        embed.set_footer(text="💬 Send a message to start earning Ajax Coins!")
+
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="leaderboard", aliases=["lb", "top"])
+async def cmd_leaderboard(ctx):
+    if not economy:
+        await ctx.send("No coins have been earned yet!")
+        return
+
+    sorted_users = sorted(economy.items(), key=lambda x: x[1].get("coins", 0), reverse=True)[:10]
+    medals       = ["🥇", "🥈", "🥉"] + ["🔹"] * 7
+    lines        = []
+
+    for i, (uid, udata) in enumerate(sorted_users):
+        member = ctx.guild.get_member(int(uid)) if ctx.guild else None
+        name   = member.display_name if member else f"Unknown ({uid})"
+        coins  = udata.get("coins", 0)
+        lines.append(f"{medals[i]} **{name}** — {coins:,} coins  {get_rank(coins)}")
+
+    embed = discord.Embed(title="🏆 Ajax Coins Leaderboard", color=0xF5C400)
+    embed.description = "\n".join(lines) or "No entries yet."
+    embed.set_footer(text="Earn 1 coin per minute of active chatting")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="pay")
+async def cmd_pay(ctx, member: discord.Member = None, amount: int = 0):
+    if not member:
+        await ctx.reply("❌ Mention a user to pay.", mention_author=False)
+        return
+    if member.bot:
+        await ctx.reply("❌ You can't pay bots.", mention_author=False)
+        return
+    if member == ctx.author:
+        await ctx.reply("❌ You can't pay yourself.", mention_author=False)
+        return
+    if amount <= 0:
+        await ctx.reply("❌ Amount must be positive.", mention_author=False)
+        return
+
+    sender = get_econ(ctx.author.id)
+    if sender["coins"] < amount:
+        await ctx.reply(f"❌ You only have **{sender['coins']:,} Ajax Coins**.", mention_author=False)
+        return
+
+    receiver = get_econ(member.id)
+    sender["coins"]   -= amount
+    receiver["coins"] += amount
+    save_econ(ctx.author.id)
+    save_econ(member.id)
+
+    await ctx.reply(
+        f"💸 {ctx.author.mention} sent **{amount:,} Ajax Coins** to {member.mention}!",
+        mention_author=False
+    )
+
+
+@bot.command(name="give")
+async def cmd_give(ctx, member: discord.Member = None, amount: int = 0):
+    if ctx.author.id != OWNER_ID and get_trust(ctx.author.id) < 4:
+        await ctx.reply("❌ You need trust level 4+ to give coins.", mention_author=False)
+        return
+    if not member:
+        await ctx.reply("❌ Mention a user.", mention_author=False)
+        return
+    if amount <= 0:
+        await ctx.reply("❌ Amount must be positive.", mention_author=False)
+        return
+
+    econ = get_econ(member.id)
+    econ["coins"]        += amount
+    econ["total_earned"] += amount
+    save_econ(member.id)
+    log_mod("give_coins", member.id, ctx.author.id, str(amount))
+    await ctx.reply(f"✅ Gave **{amount:,} Ajax Coins** to {member.mention}.", mention_author=False)
+
+
+@bot.command(name="take")
+async def cmd_take(ctx, member: discord.Member = None, amount: int = 0):
+    if ctx.author.id != OWNER_ID and get_trust(ctx.author.id) < 4:
+        await ctx.reply("❌ You need trust level 4+ to take coins.", mention_author=False)
+        return
+    if not member:
+        await ctx.reply("❌ Mention a user.", mention_author=False)
+        return
+    if amount <= 0:
+        await ctx.reply("❌ Amount must be positive.", mention_author=False)
+        return
+
+    econ = get_econ(member.id)
+    econ["coins"] = max(0, econ["coins"] - amount)
+    save_econ(member.id)
+    log_mod("take_coins", member.id, ctx.author.id, str(amount))
+    await ctx.reply(f"✅ Removed **{amount:,} Ajax Coins** from {member.mention}.", mention_author=False)
+
+
+@bot.command(name="coinreset")
+async def cmd_coinreset(ctx, member: discord.Member = None):
+    if ctx.author.id != OWNER_ID:
+        return
+    if not member:
+        await ctx.reply("❌ Mention a user.", mention_author=False)
+        return
+    key = str(member.id)
+    economy[key] = {"coins": 0, "total_earned": 0, "last_message_ts": None, "messages_counted": 0}
+    save_econ(member.id)
+    await ctx.reply(f"✅ Reset **{member.display_name}**'s Ajax Coins.", mention_author=False)
+
+
+@bot.command(name="ping")
+async def cmd_ping(ctx):
+    await ctx.reply(f"🏓 Pong! `{round(bot.latency * 1000)}ms`", mention_author=False)
+
+# ─── CORE PROCESS (AI) ─────────────────────────────────────────────────────────
 
 async def process(msg: discord.Message, is_dm: bool = False):
     author  = msg.author
@@ -942,7 +1117,6 @@ async def process(msg: discord.Message, is_dm: bool = False):
     if trust == 0:
         return
 
-    # Rate limiting
     if uid != OWNER_ID:
         cooldown = 1.5 if trust >= 4 else 4.0
         now      = time.time()
@@ -955,7 +1129,6 @@ async def process(msg: discord.Message, is_dm: bool = False):
         track_activity(uid, msg.channel.id)
     register_user(author)
 
-    # Enrich message with metadata for the AI
     ctx_line = build_context(msg, trust)
     full_msg = f"{ctx_line}\n\nMessage: {content}"
 
@@ -971,10 +1144,8 @@ async def process(msg: discord.Message, is_dm: bool = False):
 
     histories[hist_key].append({"role": "assistant", "content": raw})
 
-    # Parse and execute
     parsed = parse_ai_json(raw)
     if parsed:
-        # Only allow server actions from trusted users
         action = parsed.get("action", "chat")
         if action != "chat" and trust < 4:
             await msg.reply("❌ You don't have permission to do that (requires trust level 4+).", mention_author=False)
@@ -983,10 +1154,8 @@ async def process(msg: discord.Message, is_dm: bool = False):
         if reply:
             await msg.reply(reply, mention_author=False)
     else:
-        # Fallback: raw text reply (shouldn't happen often)
         await msg.reply(raw[:1990], mention_author=False)
 
-    # DM logging — persisted to MongoDB, capped at 15 per user
     if is_dm and uid != OWNER_ID:
         logs = dm_logs.setdefault(str(uid), [])
         logs.append({
@@ -1003,29 +1172,51 @@ async def process(msg: discord.Message, is_dm: bool = False):
 async def on_ready():
     await db_init()
     await db_load()
-    log.info(f"✅ Ready as {bot.user} (ID: {bot.user.id})")
+    log.info(f"✅ AJ's Assistant ready as {bot.user} (ID: {bot.user.id})")
     await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.watching, name="the server")
+        activity=discord.Activity(type=discord.ActivityType.watching, name="the server 👁️")
     )
+
 
 @bot.event
 async def on_message(msg: discord.Message):
     if msg.author.bot:
         return
 
-    # Always process prefix commands first
     await bot.process_commands(msg)
 
     is_dm    = isinstance(msg.channel, discord.DMChannel)
     content  = msg.content.strip()
-    is_owner = msg.author.id == OWNER_ID
 
-    # Passive tracking
-    if not is_dm and bot.user not in msg.mentions:
+    # ── Economy coin earning ────────────────────────────────────────────────────
+    if not is_dm and not msg.author.bot and not content.startswith(CMD_PREFIX) and len(content) >= 5:
+        uid  = msg.author.id
+        econ = get_econ(uid)
+        now  = datetime.now(timezone.utc)
+
+        # Cooldown check
+        can_earn = True
+        if econ["last_message_ts"]:
+            last = datetime.fromisoformat(econ["last_message_ts"])
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            if (now - last).total_seconds() < MSG_COOLDOWN:
+                can_earn = False
+
+        if can_earn:
+            if MSG_RARITY <= 1 or random.randint(1, MSG_RARITY) == 1:
+                econ["coins"]            += 1
+                econ["total_earned"]     += 1
+                econ["messages_counted"] += 1
+                econ["last_message_ts"]   = now.isoformat()
+                save_econ(uid)
+
+    # ── Passive tracking ────────────────────────────────────────────────────────
+    if not is_dm and bot.user not in (msg.mentions or []):
         track_activity(msg.author.id, msg.channel.id)
         register_user(msg.author)
 
-    # Decide if AI should respond
+    # ── AI response logic ───────────────────────────────────────────────────────
     mentioned    = bot.user in (msg.mentions or [])
     reply_to_bot = (
         msg.reference and
@@ -1033,11 +1224,9 @@ async def on_message(msg: discord.Message):
         msg.reference.resolved and
         getattr(msg.reference.resolved, "author", None) == bot.user
     )
-    # Skip if it's a prefix command (already handled above)
     is_prefix_cmd = content.startswith(CMD_PREFIX) and len(content) > 1
 
-    should_respond = is_dm or mentioned or reply_to_bot
-    if not should_respond or is_prefix_cmd:
+    if not (is_dm or mentioned or reply_to_bot) or is_prefix_cmd:
         return
 
     try:
@@ -1052,6 +1241,20 @@ async def on_message(msg: discord.Message):
             await msg.reply(f"❌ Error — {type(e).__name__}: {e}", mention_author=False)
         except Exception:
             pass
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MemberNotFound):
+        await ctx.reply("❌ Couldn't find that member.", mention_author=False)
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.reply(f"❌ Missing argument. Try `{CMD_PREFIX}help`.", mention_author=False)
+    elif isinstance(error, commands.BadArgument):
+        await ctx.reply("❌ Invalid argument (make sure amounts are numbers).", mention_author=False)
+    elif isinstance(error, commands.CommandNotFound):
+        pass  # Silently ignore unknown commands
+    else:
+        log.error(f"Command error: {error}")
 
 # ─── RUN ───────────────────────────────────────────────────────────────────────
 
