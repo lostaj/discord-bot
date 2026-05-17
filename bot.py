@@ -1,4 +1,4 @@
-import os
+#import os
 import re
 import io
 import json
@@ -9,6 +9,7 @@ import random
 import signal
 import psutil
 import platform
+import itertools
 from urllib.parse import quote_plus
 from aiohttp import web as aiohttp_web
 from collections import defaultdict, deque
@@ -34,7 +35,7 @@ GROQ_KEYS   = [k for k in [os.getenv(f"GROQ_KEY_{i}") for i in range(1, 11)] if 
 MONGO_URI   = os.getenv("MONGO_URI", "")
 HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8080"))
 
-VERSION = "2.2.1"
+VERSION = "2.3.0"
 
 # ─── ECONOMY CONFIG ────────────────────────────────────────────────────────────
 
@@ -44,6 +45,11 @@ MAX_HIST      = 20
 MAX_PURGE     = 200
 SNIPE_EXPIRY  = 300    # 5 minutes
 TEMP_MSG_TTL  = 25
+
+# ─── RATE LIMIT CONFIG ────────────────────────────────────────────────────────
+
+AI_COOLDOWN  = 5.0   # seconds between AI messages per user
+CMD_COOLDOWN = 5.0   # seconds between prefix commands per user
 
 RANKS = [
     (0,     "💀 Penniless"),
@@ -150,6 +156,7 @@ bot     = commands.Bot(command_prefix=CMD_PREFIX, intents=intents, help_command=
 # ─── GROQ CLIENT POOL ──────────────────────────────────────────────────────────
 
 groq_clients: dict = {}
+_key_cycle         = None   # itertools.cycle — initialised in on_ready (thread-safe rotation)
 
 # ─── SHARED HTTP SESSION ───────────────────────────────────────────────────────
 
@@ -164,7 +171,7 @@ async def get_http_session() -> aiohttp.ClientSession:
 # ─── MONGODB ───────────────────────────────────────────────────────────────────
 
 _mongo_client = None
-_db           = None  # AsyncIOMotorDatabase or None
+_db           = None
 
 async def db_init():
     global _mongo_client, _db
@@ -181,40 +188,37 @@ async def db_init():
         _db = None
 
 def _col(name: str):
-    # Guard: only return collection if _db is actually set
     if _db is None:
         return None
     return _db[name]
 
 def _db_ok() -> bool:
-    """Single safe truthiness check for the DB connection."""
     return _db is not None
 
 # ─── IN-MEMORY STATE ───────────────────────────────────────────────────────────
 
-memory:      dict  = {}
-registry:    dict  = {}
-mod_logs:    deque = deque(maxlen=300)
-dm_logs:     dict  = {}
-economy:     dict  = {}
-activity:    dict  = {}
-afk_users:   dict  = {}
-snipe_cache: dict  = {}
+memory:          dict  = {}
+registry:        dict  = {}
+mod_logs:        deque = deque(maxlen=300)
+dm_logs:         dict  = {}
+economy:         dict  = {}
+activity:        dict  = {}
+afk_users:       dict  = {}
+snipe_cache:     dict  = {}
 
-custom_prompt:  str | None  = None
-prev_prompt:    str | None  = None
-prompt_history: list        = []
+custom_prompt:   str | None = None
+prev_prompt:     str | None = None
+prompt_history:  list       = []
 
-histories:   dict  = defaultdict(list)
-rate_limits: dict  = defaultdict(float)
-error_log:   deque = deque(maxlen=50)
+histories:       dict  = defaultdict(list)
+rate_limits:     dict  = defaultdict(float)   # AI rate limits
+cmd_rate_limits: dict  = defaultdict(float)   # Command rate limits
+error_log:       deque = deque(maxlen=50)
 
-key_index      = 0
 start_time     = time.time()
 msgs_processed = 0
 _ready_fired   = False
 
-import weakref
 _econ_locks_store: dict = {}
 
 def _get_econ_lock(uid: int) -> asyncio.Lock:
@@ -659,13 +663,16 @@ def is_suspicious(content: str) -> bool:
     cleaned = _ZERO_WIDTH.sub('', content).casefold()
     return bool(_injection_re.search(cleaned))
 
-# ─── GROQ ──────────────────────────────────────────────────────────────────────
+# ─── GROQ — thread-safe key rotation via itertools.cycle ──────────────────────
 
 async def call_ai(history: list, system: str | None = None) -> str:
-    global key_index, msgs_processed
+    global msgs_processed
 
     if not GROQ_KEYS:
         return '{"action":"chat","message":"No Groq API keys configured."}'
+
+    if _key_cycle is None:
+        return '{"action":"chat","message":"Bot is still starting up. Try again in a moment."}'
 
     clean_history = [
         m for m in history
@@ -677,10 +684,9 @@ async def call_ai(history: list, system: str | None = None) -> str:
     sys_content = system if system else active_prompt()
 
     for _ in range(len(GROQ_KEYS)):
-        key    = GROQ_KEYS[key_index % len(GROQ_KEYS)]
+        key    = next(_key_cycle)
         client = groq_clients.get(key)
         if not client:
-            key_index = (key_index + 1) % len(GROQ_KEYS)
             continue
         try:
             resp = await asyncio.wait_for(
@@ -695,12 +701,11 @@ async def call_ai(history: list, system: str | None = None) -> str:
             msgs_processed += 1
             return resp.choices[0].message.content.strip()
         except asyncio.TimeoutError:
-            err = f"Key {key_index + 1} timed out"
+            err = f"Key timed out"
         except Exception as e:
-            err = f"Key {key_index + 1} error: {e}"
+            err = f"Key error: {e}"
         log.error(err)
         error_log.append({"ts": datetime.now(timezone.utc).isoformat(), "err": err})
-        key_index = (key_index + 1) % len(GROQ_KEYS)
         await asyncio.sleep(0.3 + random.uniform(0, 0.5))
 
     return '{"action":"chat","message":"All API keys are rate limited. Try again in a moment."}'
@@ -1141,12 +1146,12 @@ async def process(msg: discord.Message, content_override: str | None = None, is_
     content = (content_override or msg.content).strip()
     owner   = is_owner(uid)
 
-    now_ts = time.time()
+    # ── 5s AI rate limit (non-owners only) ───────────────────────────────────
     if not owner:
-        cooldown = 4.0
-        last     = rate_limits[uid]
-        if now_ts - last < cooldown:
-            remaining = int(cooldown - (now_ts - last)) + 1
+        now_ts    = time.time()
+        last      = rate_limits[uid]
+        if now_ts - last < AI_COOLDOWN:
+            remaining = int(AI_COOLDOWN - (now_ts - last)) + 1
             embed = discord.Embed(
                 description=f"⏱️ Slow down! Please wait **{remaining}s** before messaging again.",
                 color=0xFFA500,
@@ -1494,18 +1499,18 @@ async def cmd_debug(ctx):
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="Uptime",          value=f"{h}h {m}m {s}s",                                    inline=True)
-    embed.add_field(name="Online Since",    value=discord_ts(started_at, "R"),                           inline=True)
-    embed.add_field(name="Msgs Processed",  value=str(msgs_processed),                                   inline=True)
-    embed.add_field(name="Active Groq Key", value=f"#{(key_index % max(len(GROQ_KEYS),1))+1}/{len(GROQ_KEYS)}", inline=True)
-    embed.add_field(name="Tracked Members", value=str(len(activity)),                                    inline=True)
-    embed.add_field(name="Registered",      value=str(len(registry)),                                    inline=True)
-    embed.add_field(name="Economy Entries", value=str(len(economy)),                                     inline=True)
-    embed.add_field(name="Mod Log Entries", value=str(len(mod_logs)),                                    inline=True)
-    embed.add_field(name="Prompt History",  value=str(len(prompt_history)),                              inline=True)
-    embed.add_field(name="Log Channel",     value="✅ Set" if BOT_LOG_CHANNEL_ID else "❌ Not set",       inline=True)
-    embed.add_field(name="DB",              value="✅ Connected" if _db_ok() else "❌ Offline",            inline=True)
-    embed.add_field(name="Last 5 Errors",   value=f"```{errs}```",                                       inline=False)
+    embed.add_field(name="Uptime",          value=f"{h}h {m}m {s}s",           inline=True)
+    embed.add_field(name="Online Since",    value=discord_ts(started_at, "R"),  inline=True)
+    embed.add_field(name="Msgs Processed",  value=str(msgs_processed),          inline=True)
+    embed.add_field(name="Groq Keys",       value=str(len(GROQ_KEYS)),          inline=True)
+    embed.add_field(name="Tracked Members", value=str(len(activity)),           inline=True)
+    embed.add_field(name="Registered",      value=str(len(registry)),           inline=True)
+    embed.add_field(name="Economy Entries", value=str(len(economy)),            inline=True)
+    embed.add_field(name="Mod Log Entries", value=str(len(mod_logs)),           inline=True)
+    embed.add_field(name="Prompt History",  value=str(len(prompt_history)),     inline=True)
+    embed.add_field(name="Log Channel",     value="✅ Set" if BOT_LOG_CHANNEL_ID else "❌ Not set", inline=True)
+    embed.add_field(name="DB",              value="✅ Connected" if _db_ok() else "❌ Offline",     inline=True)
+    embed.add_field(name="Last 5 Errors",   value=f"```{errs}```",              inline=False)
     await ctx.reply(embed=embed, mention_author=False)
 
 
@@ -1993,6 +1998,10 @@ async def snipe_cleanup():
     for uid in stale_rates:
         del rate_limits[uid]
 
+    stale_cmd_rates = [uid for uid, ts in list(cmd_rate_limits.items()) if ts < cutoff]
+    for uid in stale_cmd_rates:
+        del cmd_rate_limits[uid]
+
     _cleanup_econ_locks()
     await db_save_error_log()
 
@@ -2004,12 +2013,13 @@ async def snipe_cleanup():
 
 @bot.event
 async def on_ready():
-    global _ready_fired, groq_clients
+    global _ready_fired, groq_clients, _key_cycle
     if _ready_fired:
         return
     _ready_fired = True
 
     groq_clients = {key: AsyncGroq(api_key=key) for key in GROQ_KEYS}
+    _key_cycle   = itertools.cycle(GROQ_KEYS)   # thread-safe infinite rotation
     log.info(f"Groq client pool built: {len(groq_clients)} client(s).")
 
     await db_init()
@@ -2041,6 +2051,17 @@ async def on_ready():
 
 
 @bot.event
+async def on_disconnect():
+    log.warning("⚠️ Bot disconnected from Discord — will attempt to reconnect automatically.")
+
+
+@bot.event
+async def on_resumed():
+    log.info("✅ Bot session resumed successfully.")
+    asyncio.create_task(bot_log("🔄 Session Resumed", "Bot reconnected after disconnect.", level="warn"))
+
+
+@bot.event
 async def on_message_delete(msg: discord.Message):
     if msg.author.bot: return
     if not isinstance(msg.channel, discord.TextChannel): return
@@ -2058,11 +2079,26 @@ async def on_message(msg: discord.Message):
     if msg.author.bot:
         return
 
-    await bot.process_commands(msg)
-
     is_dm   = isinstance(msg.channel, discord.DMChannel)
     content = msg.content.strip()
     uid     = msg.author.id
+
+    # ── 5s command rate limit (non-owners only) ───────────────────────────────
+    if content.startswith(CMD_PREFIX) and not is_owner(uid):
+        now_ts   = time.time()
+        last_cmd = cmd_rate_limits[uid]
+        if now_ts - last_cmd < CMD_COOLDOWN:
+            remaining = int(CMD_COOLDOWN - (now_ts - last_cmd)) + 1
+            embed = discord.Embed(
+                description=f"⏱️ Slow down! Wait **{remaining}s** before using another command.",
+                color=0xFFA500,
+                timestamp=datetime.now(timezone.utc),
+            )
+            await msg.reply(embed=embed, mention_author=False)
+            return
+        cmd_rate_limits[uid] = now_ts
+
+    await bot.process_commands(msg)
 
     # ── AFK: remove sender's AFK if they send a non-command ──────────────────
     if uid in afk_users and not content.startswith(CMD_PREFIX):
@@ -2265,7 +2301,38 @@ def _handle_signal(sig, loop):
     log.info(f"Received {name}, shutting down…")
     loop.create_task(shutdown(name))
 
-# ─── RUN ──────────────────────────────────────────────────────────────────────
+# ─── RUN WITH RECONNECT LOOP (handles HF Spaces sleep/wake) ──────────────────
+
+async def run_bot():
+    """
+    Reconnect loop — if the bot crashes or Discord drops the connection
+    (e.g. after Hugging Face Spaces wakes from sleep), it automatically
+    waits and reconnects rather than dying.
+    """
+    global _ready_fired
+    backoff = 5   # seconds to wait before first retry
+
+    while True:
+        try:
+            _ready_fired = False   # allow on_ready to fire again on reconnect
+            log.info("🔌 Connecting to Discord…")
+            await bot.start(DISCORD_TOKEN)
+        except discord.LoginFailure:
+            log.critical("❌ Invalid DISCORD_TOKEN — cannot reconnect. Exiting.")
+            break
+        except (discord.ConnectionClosed, discord.GatewayNotFound, OSError) as e:
+            log.warning(f"⚠️ Connection lost: {e}. Retrying in {backoff}s…")
+            error_log.append({"ts": datetime.now(timezone.utc).isoformat(), "err": f"Reconnect: {e}"})
+        except Exception as e:
+            log.error(f"❌ Unexpected error: {e}. Retrying in {backoff}s…")
+            error_log.append({"ts": datetime.now(timezone.utc).isoformat(), "err": f"Unexpected: {e}"})
+        finally:
+            if not bot.is_closed():
+                await bot.close()
+
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 60)   # exponential back-off, max 60s
+
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
@@ -2287,7 +2354,7 @@ if __name__ == "__main__":
     loop.run_until_complete(start_health_server())
 
     try:
-        loop.run_until_complete(bot.start(DISCORD_TOKEN))
+        loop.run_until_complete(run_bot())
     except (KeyboardInterrupt, SystemExit):
         loop.run_until_complete(shutdown("KeyboardInterrupt"))
     finally:
