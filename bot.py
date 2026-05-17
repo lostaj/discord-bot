@@ -1,4 +1,4 @@
-#import os
+import os
 import re
 import io
 import json
@@ -33,9 +33,10 @@ BOT_LOG_CHANNEL_ID = int(os.getenv("BOT_LOG_CHANNEL_ID", "0"))
 
 GROQ_KEYS   = [k for k in [os.getenv(f"GROQ_KEY_{i}") for i in range(1, 11)] if k]
 MONGO_URI   = os.getenv("MONGO_URI", "")
-HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8080"))
+# FIX: HuggingFace Spaces requires port 7860
+HEALTH_PORT = int(os.getenv("HEALTH_PORT", "7860"))
 
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 
 # ─── ECONOMY CONFIG ────────────────────────────────────────────────────────────
 
@@ -48,8 +49,8 @@ TEMP_MSG_TTL  = 25
 
 # ─── RATE LIMIT CONFIG ────────────────────────────────────────────────────────
 
-AI_COOLDOWN  = 5.0   # seconds between AI messages per user
-CMD_COOLDOWN = 5.0   # seconds between prefix commands per user
+AI_COOLDOWN  = 5.0
+CMD_COOLDOWN = 5.0
 
 RANKS = [
     (0,     "💀 Penniless"),
@@ -156,7 +157,7 @@ bot     = commands.Bot(command_prefix=CMD_PREFIX, intents=intents, help_command=
 # ─── GROQ CLIENT POOL ──────────────────────────────────────────────────────────
 
 groq_clients: dict = {}
-_key_cycle         = None   # itertools.cycle — initialised in on_ready (thread-safe rotation)
+_key_cycle         = None   # itertools.cycle — initialised in on_ready
 
 # ─── SHARED HTTP SESSION ───────────────────────────────────────────────────────
 
@@ -211,8 +212,8 @@ prev_prompt:     str | None = None
 prompt_history:  list       = []
 
 histories:       dict  = defaultdict(list)
-rate_limits:     dict  = defaultdict(float)   # AI rate limits
-cmd_rate_limits: dict  = defaultdict(float)   # Command rate limits
+rate_limits:     dict  = defaultdict(float)
+cmd_rate_limits: dict  = defaultdict(float)
 error_log:       deque = deque(maxlen=50)
 
 start_time     = time.time()
@@ -701,7 +702,7 @@ async def call_ai(history: list, system: str | None = None) -> str:
             msgs_processed += 1
             return resp.choices[0].message.content.strip()
         except asyncio.TimeoutError:
-            err = f"Key timed out"
+            err = "Key timed out"
         except Exception as e:
             err = f"Key error: {e}"
         log.error(err)
@@ -1146,10 +1147,9 @@ async def process(msg: discord.Message, content_override: str | None = None, is_
     content = (content_override or msg.content).strip()
     owner   = is_owner(uid)
 
-    # ── 5s AI rate limit (non-owners only) ───────────────────────────────────
     if not owner:
-        now_ts    = time.time()
-        last      = rate_limits[uid]
+        now_ts = time.time()
+        last   = rate_limits[uid]
         if now_ts - last < AI_COOLDOWN:
             remaining = int(AI_COOLDOWN - (now_ts - last)) + 1
             embed = discord.Embed(
@@ -1258,7 +1258,7 @@ async def cmd_help(ctx):
         f"`{p}search <query>` — Web search (owner)\n"
         f"`{p}scan` — Full server scan (owner)\n"
         f"`{p}setprompt <text>` — Change AI personality (owner)\n"
-        f"`{p}revertprompt` — Undo last prompt change (owner, unlimited undo)\n"
+        f"`{p}revertprompt` — Undo last prompt change (owner)\n"
         f"`{p}clearmem @user` — Clear user memory (owner)"
     ), inline=False)
     embed.add_field(name="🛠️ Moderation (owner only)", value=(
@@ -1293,7 +1293,7 @@ async def cmd_help(ctx):
         "Day 1–2: **10 coins**\n"
         "Day 3–6: **12 coins**\n"
         "Day 7–29: **15 coins**\n"
-        "Day 30+: **20 coins** (streak keeps counting!)"
+        "Day 30+: **20 coins**"
     ), inline=True)
     embed.add_field(name="🏅 Coin Ranks", value=(
         "💀 Penniless → 🪨 Gravel Rat (10)\n"
@@ -1348,19 +1348,19 @@ async def cmd_botinfo(ctx):
         timestamp=datetime.now(timezone.utc),
     )
     embed.set_thumbnail(url=bot.user.display_avatar.url)
-    embed.add_field(name="Version",        value=f"`{VERSION}`",                               inline=True)
-    embed.add_field(name="Library",        value=f"`discord.py {discord.__version__}`",        inline=True)
-    embed.add_field(name="Python",         value=f"`{platform.python_version()}`",             inline=True)
-    embed.add_field(name="Ping",           value=f"`{round(bot.latency * 1000)}ms`",           inline=True)
-    embed.add_field(name="Memory",         value=f"`{mem_mb:.1f} MB`",                         inline=True)
-    embed.add_field(name="CPU",            value=f"`{cpu_p:.1f}%`",                            inline=True)
-    embed.add_field(name="Uptime",         value=f"`{d}d {h}h {m}m {s}s`",                   inline=True)
-    embed.add_field(name="Online Since",   value=discord_ts(started_at, "R"),                  inline=True)
-    embed.add_field(name="Servers",        value=f"`{len(bot.guilds)}`",                       inline=True)
-    embed.add_field(name="AI Model",       value="`LLaMA 3.3 70B`",                            inline=True)
-    embed.add_field(name="Msgs Processed", value=f"`{msgs_processed:,}`",                      inline=True)
+    embed.add_field(name="Version",        value=f"`{VERSION}`",                                  inline=True)
+    embed.add_field(name="Library",        value=f"`discord.py {discord.__version__}`",           inline=True)
+    embed.add_field(name="Python",         value=f"`{platform.python_version()}`",                inline=True)
+    embed.add_field(name="Ping",           value=f"`{round(bot.latency * 1000)}ms`",              inline=True)
+    embed.add_field(name="Memory",         value=f"`{mem_mb:.1f} MB`",                            inline=True)
+    embed.add_field(name="CPU",            value=f"`{cpu_p:.1f}%`",                               inline=True)
+    embed.add_field(name="Uptime",         value=f"`{d}d {h}h {m}m {s}s`",                      inline=True)
+    embed.add_field(name="Online Since",   value=discord_ts(started_at, "R"),                     inline=True)
+    embed.add_field(name="Servers",        value=f"`{len(bot.guilds)}`",                          inline=True)
+    embed.add_field(name="AI Model",       value="`LLaMA 3.3 70B`",                               inline=True)
+    embed.add_field(name="Msgs Processed", value=f"`{msgs_processed:,}`",                         inline=True)
     embed.add_field(name="DB",             value="`✅ Connected`" if _db_ok() else "`❌ Offline`", inline=True)
-    embed.add_field(name="Groq Keys",      value=f"`{len(GROQ_KEYS)}`",                        inline=True)
+    embed.add_field(name="Groq Keys",      value=f"`{len(GROQ_KEYS)}`",                           inline=True)
     embed.set_footer(text="AJ's Assistant")
     await ctx.reply(embed=embed, mention_author=False)
 
@@ -1385,13 +1385,13 @@ async def cmd_membercount(ctx):
     )
     if guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
-    embed.add_field(name="Total",      value=f"**{total:,}**",   inline=True)
-    embed.add_field(name="Humans",     value=f"**{humans:,}**",  inline=True)
-    embed.add_field(name="Bots",       value=f"**{bots:,}**",    inline=True)
-    embed.add_field(name="🟢 Online",  value=f"**{online:,}**",  inline=True)
-    embed.add_field(name="🌙 Idle",    value=f"**{idle:,}**",    inline=True)
-    embed.add_field(name="🔴 DND",     value=f"**{dnd:,}**",     inline=True)
-    embed.add_field(name="⚫ Offline", value=f"**{offline:,}**", inline=True)
+    embed.add_field(name="Total",       value=f"**{total:,}**",   inline=True)
+    embed.add_field(name="Humans",      value=f"**{humans:,}**",  inline=True)
+    embed.add_field(name="Bots",        value=f"**{bots:,}**",    inline=True)
+    embed.add_field(name="🟢 Online",   value=f"**{online:,}**",  inline=True)
+    embed.add_field(name="🌙 Idle",     value=f"**{idle:,}**",    inline=True)
+    embed.add_field(name="🔴 DND",      value=f"**{dnd:,}**",     inline=True)
+    embed.add_field(name="⚫ Offline",  value=f"**{offline:,}**", inline=True)
     embed.add_field(name="Boost Level", value=f"Level {guild.premium_tier} ({guild.premium_subscription_count} boosts)", inline=True)
     await ctx.reply(embed=embed, mention_author=False)
 
@@ -1399,10 +1399,7 @@ async def cmd_membercount(ctx):
 @bot.command(name="afk")
 async def cmd_afk(ctx, *, reason: str = "AFK"):
     uid = ctx.author.id
-    afk_users[uid] = {
-        "reason": reason,
-        "ts":     datetime.now(timezone.utc),
-    }
+    afk_users[uid] = {"reason": reason, "ts": datetime.now(timezone.utc)}
     embed = discord.Embed(
         description=f"💤 **{ctx.author.display_name}** is now AFK: *{reason}*",
         color=0x99AAB5,
@@ -1490,15 +1487,11 @@ async def cmd_scan(ctx):
 async def cmd_debug(ctx):
     if not is_owner(ctx.author.id):
         await deny(ctx); return
-    up   = int(time.time() - start_time)
+    up      = int(time.time() - start_time)
     h, m, s = up // 3600, (up % 3600) // 60, up % 60
-    errs = "\n".join(f"  [{e['ts'][11:19]}] {e['err'][:80]}" for e in list(error_log)[-5:]) or "  None"
+    errs    = "\n".join(f"  [{e['ts'][11:19]}] {e['err'][:80]}" for e in list(error_log)[-5:]) or "  None"
     started_at = datetime.fromtimestamp(start_time, tz=timezone.utc)
-    embed = discord.Embed(
-        title="🛠️ Debug Info",
-        color=0x5865F2,
-        timestamp=datetime.now(timezone.utc),
-    )
+    embed = discord.Embed(title="🛠️ Debug Info", color=0x5865F2, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Uptime",          value=f"{h}h {m}m {s}s",           inline=True)
     embed.add_field(name="Online Since",    value=discord_ts(started_at, "R"),  inline=True)
     embed.add_field(name="Msgs Processed",  value=str(msgs_processed),          inline=True)
@@ -1593,12 +1586,7 @@ async def cmd_whois(ctx, member: discord.Member = None):
             await ctx.reply(embed=embed, mention_author=False)
             return
     result = await execute_action(ctx.message, {"action": "whois", "user_id": str(member.id)})
-    embed  = discord.Embed(
-        title="👤 User Info",
-        description=result,
-        color=0x5865F2,
-        timestamp=datetime.now(timezone.utc),
-    )
+    embed  = discord.Embed(title="👤 User Info", description=result, color=0x5865F2, timestamp=datetime.now(timezone.utc))
     embed.set_thumbnail(url=member.display_avatar.url)
     await ctx.reply(embed=embed, mention_author=False)
 
@@ -1608,11 +1596,7 @@ async def cmd_report(ctx):
     if not is_owner(ctx.author.id):
         await deny(ctx); return
     result = await execute_action(ctx.message, {"action": "report"})
-    embed  = discord.Embed(
-        description=result,
-        color=0x5865F2,
-        timestamp=datetime.now(timezone.utc),
-    )
+    embed  = discord.Embed(description=result, color=0x5865F2, timestamp=datetime.now(timezone.utc))
     if ctx.guild and ctx.guild.icon:
         embed.set_thumbnail(url=ctx.guild.icon.url)
     await ctx.reply(embed=embed, mention_author=False)
@@ -1665,7 +1649,7 @@ async def cmd_balance(ctx, member: discord.Member = None):
     if streak > 0:
         embed.add_field(name="Daily Streak", value=f"🔥 {streak} day{'s' if streak != 1 else ''}", inline=True)
     if econ["last_message_ts"]:
-        last     = datetime.fromisoformat(econ["last_message_ts"])
+        last = datetime.fromisoformat(econ["last_message_ts"])
         if last.tzinfo is None:
             last = last.replace(tzinfo=timezone.utc)
         next_coin = last + timedelta(seconds=MSG_COOLDOWN)
@@ -1855,16 +1839,12 @@ async def cmd_daily(ctx):
     streak_bar = "🟨" * bar_filled + "⬜" * (7 - bar_filled)
     next_daily = now + timedelta(hours=24)
 
-    embed = discord.Embed(
-        title="🪙 Daily Reward Claimed!",
-        color=0xF5C400,
-        timestamp=now,
-    )
+    embed = discord.Embed(title="🪙 Daily Reward Claimed!", color=0xF5C400, timestamp=now)
     embed.set_author(name=ctx.author.display_name, icon_url=ctx.author.display_avatar.url)
-    embed.add_field(name="Reward",      value=f"**+{reward:,} Ajax Coins**",       inline=True)
-    embed.add_field(name="New Balance", value=f"**{econ['coins']:,} Ajax Coins**",  inline=True)
-    embed.add_field(name="Streak",      value=f"{streak_bar}\n**{tier_label}** (Day {streak})", inline=False)
-    embed.add_field(name="Next Daily",  value=discord_ts(next_daily, "R"),          inline=False)
+    embed.add_field(name="Reward",      value=f"**+{reward:,} Ajax Coins**",                      inline=True)
+    embed.add_field(name="New Balance", value=f"**{econ['coins']:,} Ajax Coins**",                 inline=True)
+    embed.add_field(name="Streak",      value=f"{streak_bar}\n**{tier_label}** (Day {streak})",   inline=False)
+    embed.add_field(name="Next Daily",  value=discord_ts(next_daily, "R"),                         inline=False)
     embed.set_footer(text="Miss a day and your streak resets!")
     await ctx.reply(embed=embed, mention_author=False)
 
@@ -1987,7 +1967,6 @@ async def midnight_backup():
 @tasks.loop(minutes=5)
 async def snipe_cleanup():
     now = datetime.now(timezone.utc)
-
     expired = [cid for cid, entry in snipe_cache.items()
                if (now - entry["cached_at"]).total_seconds() > SNIPE_EXPIRY]
     for cid in expired:
@@ -2019,14 +1998,14 @@ async def on_ready():
     _ready_fired = True
 
     groq_clients = {key: AsyncGroq(api_key=key) for key in GROQ_KEYS}
-    _key_cycle   = itertools.cycle(GROQ_KEYS)   # thread-safe infinite rotation
+    _key_cycle   = itertools.cycle(GROQ_KEYS)
     log.info(f"Groq client pool built: {len(groq_clients)} client(s).")
 
     await db_init()
     await db_load()
     midnight_backup.start()
     snipe_cleanup.start()
-    log.info(f"✅ AJ's Assistant ready as {bot.user} (ID: {bot.user.id})")
+    log.info(f"✅ AJ's Assistant v{VERSION} ready as {bot.user} (ID: {bot.user.id})")
     await bot.change_presence(
         activity=discord.Activity(type=discord.ActivityType.watching, name="the server 👁️")
     )
@@ -2083,7 +2062,7 @@ async def on_message(msg: discord.Message):
     content = msg.content.strip()
     uid     = msg.author.id
 
-    # ── 5s command rate limit (non-owners only) ───────────────────────────────
+    # 5s command rate limit (non-owners only)
     if content.startswith(CMD_PREFIX) and not is_owner(uid):
         now_ts   = time.time()
         last_cmd = cmd_rate_limits[uid]
@@ -2100,7 +2079,7 @@ async def on_message(msg: discord.Message):
 
     await bot.process_commands(msg)
 
-    # ── AFK: remove sender's AFK if they send a non-command ──────────────────
+    # AFK: remove sender's AFK if they send a non-command
     if uid in afk_users and not content.startswith(CMD_PREFIX):
         data = afk_users.pop(uid)
         ago  = datetime.now(timezone.utc) - data["ts"]
@@ -2112,7 +2091,7 @@ async def on_message(msg: discord.Message):
         )
         await msg.channel.send(embed=embed, delete_after=TEMP_MSG_TTL)
 
-    # ── AFK: notify if someone pings an AFK user ──────────────────────────────
+    # AFK: notify if someone pings an AFK user
     for mentioned in msg.mentions:
         if mentioned.id in afk_users and mentioned.id != uid:
             data  = afk_users[mentioned.id]
@@ -2125,7 +2104,7 @@ async def on_message(msg: discord.Message):
             )
             await msg.channel.send(embed=embed, delete_after=TEMP_MSG_TTL)
 
-    # ── Economy: earn 1 coin per MSG_COOLDOWN seconds of active chat ──────────
+    # Economy: earn 1 coin per MSG_COOLDOWN seconds of active chat
     if not is_dm and not content.startswith(CMD_PREFIX) and len(content) >= 5:
         async with _get_econ_lock(uid):
             econ = get_econ(uid)
@@ -2149,7 +2128,7 @@ async def on_message(msg: discord.Message):
         track_activity(uid, msg.channel.id)
         register_user(msg.author)
 
-    # ── AI: only respond when mentioned, replied to, or in DMs ──────────────
+    # AI: only respond when mentioned, replied to, or in DMs
     mentioned    = bot.user in (msg.mentions or [])
     reply_to_bot = (
         msg.reference and
@@ -2301,20 +2280,15 @@ def _handle_signal(sig, loop):
     log.info(f"Received {name}, shutting down…")
     loop.create_task(shutdown(name))
 
-# ─── RUN WITH RECONNECT LOOP (handles HF Spaces sleep/wake) ──────────────────
+# ─── RECONNECT LOOP ───────────────────────────────────────────────────────────
 
 async def run_bot():
-    """
-    Reconnect loop — if the bot crashes or Discord drops the connection
-    (e.g. after Hugging Face Spaces wakes from sleep), it automatically
-    waits and reconnects rather than dying.
-    """
     global _ready_fired
-    backoff = 5   # seconds to wait before first retry
+    backoff = 5
 
     while True:
         try:
-            _ready_fired = False   # allow on_ready to fire again on reconnect
+            _ready_fired = False
             log.info("🔌 Connecting to Discord…")
             await bot.start(DISCORD_TOKEN)
         except discord.LoginFailure:
@@ -2331,24 +2305,28 @@ async def run_bot():
                 await bot.close()
 
         await asyncio.sleep(backoff)
-        backoff = min(backoff * 2, 60)   # exponential back-off, max 60s
+        backoff = min(backoff * 2, 60)
 
+
+# ─── ENTRY POINT ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        raise ValueError("DISCORD_TOKEN not set in .env")
+        raise ValueError("DISCORD_TOKEN not set in environment variables")
     if not GROQ_KEYS:
-        log.warning("⚠️  No GROQ keys found! Add GROQ_KEY_1 through GROQ_KEY_10 in .env")
+        log.warning("⚠️  No GROQ keys found! Add GROQ_KEY_1 through GROQ_KEY_10 in your Space secrets.")
     if not BOT_LOG_CHANNEL_ID:
         log.warning("⚠️  BOT_LOG_CHANNEL_ID not set — bot logs won't post to Discord.")
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    # FIX: signal handlers are not supported on all platforms (Windows/HF),
+    # wrapped safely so the bot still starts even if they can't be registered
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, _handle_signal, sig, loop)
-        except NotImplementedError:
+        except (NotImplementedError, RuntimeError):
             pass
 
     loop.run_until_complete(start_health_server())
