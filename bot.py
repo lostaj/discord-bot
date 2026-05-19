@@ -7,7 +7,7 @@ import asyncio
 import logging
 import random
 import signal
-import psutile
+import psutil
 import platform
 import itertools
 from urllib.parse import quote_plus
