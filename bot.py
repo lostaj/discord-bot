@@ -1,6 +1,6 @@
 """
 AJ's Assistant — Discord Bot v6.0.0
-Full-featured: AI, AutoMod, Staff System, Economy, Raid Detection, Server Scan
+Full-featured: AI, AutoMod, Staff System, Economy, Raid Detection, Server Scan!
 """
 
 import os, re, io, json, time, asyncio, logging, random, signal, psutil, platform, itertools
