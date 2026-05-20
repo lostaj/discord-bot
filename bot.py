@@ -1,9 +1,3 @@
-"""
-AJ's Assistant — Discord Bot
-Full-featured: AI (LLaMA 3.3-70b-versatile), AutoMod, Staff System, Economy,
-Raid Detection, Audit Logs, Deep Research, Invite Logs, Mod Logs, Ghost Ping Detection
-"""
-
 import os, re, io, json, time, asyncio, logging, random, psutil, platform, itertools, hashlib
 from urllib.parse import quote_plus
 from collections import defaultdict, deque
@@ -3847,5 +3841,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-PYEOF
-echo "Done. Lines: $(wc -l < /mnt/user-data/outputs/bot.py)"
