@@ -60,7 +60,8 @@ WARN_MUTE_AT          = 3
 AI_MEMORY_LIMIT       = 20
 AI_MEMORY_EXPIRY      = 90
 GROQ_KEY_COOLDOWN     = 5.0
-DEAD_CHAT_THRESHOLD   = 1800
+# Dead chat: 2 hours of silence triggers a convo starter
+DEAD_CHAT_THRESHOLD   = 7200
 MSG_COINS_COOLDOWN    = 60
 WORK_COOLDOWN         = 3600
 
@@ -90,6 +91,9 @@ CONVO_STARTERS = [
     "Rate your BedWars skills out of 10 honestly 💀",
     "Yo what server y'all been playing on? Drop recs 🔥",
     "Best bed defense strat go — I'll start: obsidian + wood layers 🧱",
+    "What kit are you running this season and why? 🎯",
+    "Who's the most underrated BedWars player in this server? 👀",
+    "Describe your playstyle in 3 words 💬",
 ]
 
 def get_rank(coins: int) -> str:
@@ -116,6 +120,7 @@ C_SECURITY = 0xFF6B00
 C_NEUTRAL  = 0x95A5A6
 C_STARTUP  = 0x2ECC71
 C_STAFF    = 0x9B59B6
+C_SHUTDOWN = 0x7F8C8D
 
 COLOR_MAP = {
     "red": discord.Color.red(),       "blue": discord.Color.blue(),
@@ -265,15 +270,13 @@ bot = commands.Bot(command_prefix=CMD_PREFIX, intents=intents, help_command=None
 # ─── GROQ KEY POOL ───────────────────────────────────────────────────────────
 
 groq_clients:     dict = {}
-_key_last_used:   dict = {}   # key -> last used timestamp (for 5s cooldown)
-_key_ratelimited: set  = set()  # keys currently rate-limited
+_key_last_used:   dict = {}
+_key_ratelimited: set  = set()
 
 def _pick_groq_key() -> str | None:
-    """Pick the best available Groq key (not rate-limited, cooldown respected)."""
     available = [k for k in GROQ_KEYS if k not in _key_ratelimited]
     if not available:
         return None
-    # Sort by last used (oldest first = most ready)
     return min(available, key=lambda k: _key_last_used.get(k, 0))
 
 # ─── HTTP SESSION ────────────────────────────────────────────────────────────
@@ -330,7 +333,7 @@ notes:          dict  = {}
 staff_logs:     deque = deque(maxlen=1000)
 staff_actions:  dict  = defaultdict(list)
 daily_greeted:  dict  = {}
-invite_cache:   dict  = {}   # guild_id -> {code: uses}
+invite_cache:   dict  = {}
 tempbans:       dict  = {}
 temproles:      dict  = {}
 bot_knowledge:  list  = []
@@ -343,6 +346,7 @@ raid_joins:          dict = defaultdict(list)
 raid_mode:           dict = {}
 ghostping_cache:     dict = {}
 last_activity:       dict = {}   # guild_id -> float timestamp
+dead_chat_sent:      dict = {}   # guild_id -> float timestamp of last convo starter
 
 ai_memory:   dict  = {}
 histories:   dict  = defaultdict(list)
@@ -439,7 +443,6 @@ async def send_log(guild: discord.Guild, log_type: str, embed: discord.Embed):
         except Exception: pass
 
 async def send_alerts(guild: discord.Guild | None, embed: discord.Embed):
-    """Send to guild-configured alerts channel only."""
     if guild:
         gid = str(guild.id)
         cid = log_channels.get(gid, {}).get("alerts")
@@ -659,7 +662,6 @@ async def record_staff_action(guild: discord.Guild, staff_member: discord.Member
             level="security", guild=guild,
         ))
 
-        # Auto-strip if extreme
         if total_recent >= ABUSE_ACTION_LIMIT * 2 or max_target >= 6:
             stripped = []
             for role_id in [TRIAL_MOD_ID, MOD_ID, SENIOR_MOD_ID]:
@@ -720,22 +722,22 @@ async def run_automod(msg: discord.Message) -> bool:
         asyncio.create_task(send_log(msg.guild, "automod", embed))
         asyncio.create_task(send_log(msg.guild, "mod", embed))
 
-    # 1. Slurs (including zero-width bypass)
+    # 1. Slurs
     if SLUR_RE.search(content) or SLUR_RE.search(clean):
         await delete_and_warn("slurs are not tolerated here.", "AutoMod: Slur Detected", mute=True)
         return True
 
-    # 2. NSFW content
+    # 2. NSFW
     if NSFW_RE.search(content):
         await delete_and_warn("NSFW content is not allowed.", "AutoMod: NSFW Content", mute=True)
         return True
 
-    # 3. Scam content
+    # 3. Scam
     if SCAM_RE.search(content):
         await delete_and_warn("scam/phishing content detected.", "AutoMod: Scam Detected", mute=True)
         return True
 
-    # 4. Discord invite links
+    # 4. Invite links
     if INVITE_RE.search(content):
         await delete_and_warn("posting invite links is not allowed.", "AutoMod: Invite Link")
         return True
@@ -751,7 +753,7 @@ async def run_automod(msg: discord.Message) -> bool:
         await delete_and_warn(f"mass-pinging is not allowed ({unique_mentions} mentions).", "AutoMod: Mass Mentions", mute=True)
         return True
 
-    # 7. Spam (same user too fast)
+    # 7. Spam
     spam_tracker[gid][uid] = [t for t in spam_tracker[gid][uid] if now_ts - t < SPAM_WINDOW]
     spam_tracker[gid][uid].append(now_ts)
     if len(spam_tracker[gid][uid]) >= SPAM_THRESHOLD:
@@ -786,7 +788,7 @@ async def run_automod(msg: discord.Message) -> bool:
             asyncio.create_task(send_alerts(msg.guild, embed))
             asyncio.create_task(send_log(msg.guild, "automod", embed))
 
-    # 9. Character spam detection
+    # 9. Character spam
     stripped = content.strip()
     if len(stripped) > 10:
         ratio = max(stripped.count(c) for c in set(stripped)) / len(stripped)
@@ -803,7 +805,7 @@ async def run_automod(msg: discord.Message) -> bool:
             except Exception: pass
             return True
 
-    # 10. Cache potential ghost-pings
+    # 10. Cache for ghost-ping detection
     if msg.mentions:
         ghostping_cache[msg.id] = {
             "author":   msg.author,
@@ -944,7 +946,6 @@ async def web_search(query: str, deep: bool = False) -> str:
     session = await get_http()
     encoded = quote_plus(query)
 
-    # DuckDuckGo Instant Answer
     try:
         url = f"https://api.duckduckgo.com/?q={encoded}&format=json&no_html=1&skip_disambig=1"
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
@@ -956,7 +957,6 @@ async def web_search(query: str, deep: bool = False) -> str:
                 results.append(f"• {t['Text'][:200]}")
     except Exception: pass
 
-    # Wikipedia
     try:
         wiki_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{encoded}"
         async with session.get(wiki_url, timeout=aiohttp.ClientTimeout(total=7)) as r:
@@ -966,7 +966,6 @@ async def web_search(query: str, deep: bool = False) -> str:
                     results.append(f"📚 **Wikipedia:** {data['extract'][:600]}")
     except Exception: pass
 
-    # Roblox BedWars Fandom Wiki
     if any(w in query.lower() for w in ["bedwars", "roblox", "kit", "bed wars", "ajax"]):
         try:
             bw_url = (
@@ -997,7 +996,6 @@ async def web_search(query: str, deep: bool = False) -> str:
                                             results.append(f"📄 **BedWars Detail:** {clean_extract}")
         except Exception: pass
 
-    # Roblox main wiki/fandom fallback
     if not any(r.startswith("🎮") for r in results):
         try:
             roblox_url = (
@@ -1013,7 +1011,6 @@ async def web_search(query: str, deep: bool = False) -> str:
                         results.append(f"🟥 **Roblox Wiki:** {', '.join(titles)}")
         except Exception: pass
 
-    # Deep mode: DuckDuckGo HTML snippet scrape
     if deep and len(results) < 3:
         try:
             ddg_html = f"https://html.duckduckgo.com/html/?q={encoded}"
@@ -1040,10 +1037,8 @@ async def call_ai(history: list, system: str | None = None) -> str:
     sys_content = system or (custom_prompt or BASE_PROMPT)
     now_ts      = time.time()
 
-    # Shuffle for load distribution
     keys_to_try = [k for k in GROQ_KEYS if k not in _key_ratelimited]
     if not keys_to_try:
-        # All keys rate-limited — wait for the one that's been cooling longest
         keys_to_try = sorted(GROQ_KEYS, key=lambda k: _key_last_used.get(k, 0))
         log.warning("All Groq keys rate-limited, trying least-recently-used key.")
 
@@ -1054,13 +1049,11 @@ async def call_ai(history: list, system: str | None = None) -> str:
         if not client:
             continue
 
-        # Non-blocking cooldown: skip key if it's too fresh and others are available
         last_used = _key_last_used.get(key, 0)
         elapsed   = now_ts - last_used
         if elapsed < GROQ_KEY_COOLDOWN and len(keys_to_try) > 1:
-            continue  # Try another key first
+            continue
 
-        # If we must use this key and it needs cooldown, do a brief await
         if elapsed < GROQ_KEY_COOLDOWN:
             wait = GROQ_KEY_COOLDOWN - elapsed
             if wait > 0:
@@ -1082,7 +1075,6 @@ async def call_ai(history: list, system: str | None = None) -> str:
             content = resp.choices[0].message.content
             if content:
                 return content.strip()
-            # Empty response fallback
             return '{"action":"chat","message":"I got an empty response. Please try again."}'
 
         except asyncio.TimeoutError:
@@ -1098,7 +1090,6 @@ async def call_ai(history: list, system: str | None = None) -> str:
                 asyncio.create_task(_alert_ratelimit(key))
                 continue
             if "json_object" in err_str.lower() or "response_format" in err_str.lower():
-                # Model doesn't support json_object — retry without it
                 try:
                     _key_last_used[key] = time.time()
                     resp = await asyncio.wait_for(
@@ -1134,7 +1125,6 @@ async def _alert_ratelimit(key: str):
         color=C_WARN, timestamp=datetime.now(timezone.utc),
     )
     embed.set_footer(text=BOT_NAME)
-    # Send to all guild alert channels
     for guild in bot.guilds:
         asyncio.create_task(send_alerts(guild, embed))
 
@@ -1192,7 +1182,6 @@ async def extract_memory(uid: int, message: str):
         if not content:
             return
         raw_facts = content.strip()
-        # Strip json fences if any
         raw_facts = re.sub(r"```(?:json)?", "", raw_facts).strip().rstrip("`")
         facts = json.loads(raw_facts)
         if isinstance(facts, list):
@@ -1200,7 +1189,7 @@ async def extract_memory(uid: int, message: str):
                 if isinstance(f, str) and len(f) > 3:
                     add_ai_memory(uid, f)
     except Exception:
-        pass  # Memory extraction is best-effort, never raise
+        pass
 
 # ─── CONTEXT MESSAGE HISTORY ─────────────────────────────────────────────────
 
@@ -1269,37 +1258,12 @@ async def process(msg: discord.Message, content_override: str | None = None, is_
         track_activity(uid, msg.channel.id)
     register_user(author)
 
-    # Daily greeting (server only, not DM)
-    if not is_dm:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if daily_greeted.get(str(uid)) != today:
-            daily_greeted[str(uid)] = today
-            hour  = datetime.now(timezone.utc).hour
-            greet = "Good morning" if 5 <= hour < 12 else ("Good afternoon" if 12 <= hour < 18 else "Good evening")
-            tips  = [
-                "Hope your BedWars sessions are going well today! 🛏️",
-                "May your beds be protected and your opponents' beds destroyed! ⚔️",
-                "Go get those wins today! 🏆",
-                "Don't forget to upgrade your armor early! 💎",
-                "Rush smart, not hard. Best of luck today! 🎯",
-            ]
-            try:
-                await msg.channel.send(
-                    embed=discord.Embed(
-                        description=f"👋 {greet}, **{author.display_name}**! {random.choice(tips)}",
-                        color=C_MOD,
-                    ),
-                    delete_after=20,
-                )
-            except Exception: pass
-
     ctx_line   = build_context(msg, msg.guild)
     ch_context = await _get_context_msgs(msg) if not is_dm else ""
     system     = f"{active_prompt()}\n\n{ctx_line}{ch_context}"
 
     hist_key = f"dm_{uid}" if is_dm else f"ch_{msg.channel.id}_u_{uid}"
 
-    # Keep history bounded
     if hist_key not in histories:
         histories[hist_key] = []
     histories[hist_key].append({"role": "user", "content": content})
@@ -1312,21 +1276,19 @@ async def process(msg: discord.Message, content_override: str | None = None, is_
         for k in oldest_keys:
             del histories[k]
 
-    # Background memory extraction (fire and forget)
+    # Background memory extraction
     if len(content) >= 20:
         asyncio.create_task(extract_memory(uid, content))
 
     async with msg.channel.typing():
         raw = await call_ai(histories[hist_key], system=system)
 
-    # Append assistant response to history
     histories[hist_key].append({"role": "assistant", "content": raw})
     if len(histories[hist_key]) > MAX_HIST:
         histories[hist_key] = histories[hist_key][-MAX_HIST:]
 
     parsed = parse_json(raw)
     if not parsed:
-        # Fallback: display raw text if not valid JSON
         embed = discord.Embed(
             description=discord.utils.escape_mentions(raw[:1990]),
             color=C_INFO,
@@ -1337,7 +1299,7 @@ async def process(msg: discord.Message, content_override: str | None = None, is_
 
     action = parsed.get("action", "chat")
 
-    # Web search action — fetch results then re-query
+    # Web search action
     if action == "web_search_query":
         query = parsed.get("query", "").strip()
         if query:
@@ -1392,7 +1354,6 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
     if action == "chat":
         return data.get("message", "...")
 
-    # ── Log channel setup ──────────────────────────────────────────────────────
     if action == "set_log_channel":
         if not guild: return "Server only."
         log_type = data.get("log_type", "").lower()
@@ -1415,7 +1376,6 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
         asyncio.create_task(db_save_log_channels(gid))
         return f"✅ Alerts channel set to {ch.mention}"
 
-    # ── Moderation ─────────────────────────────────────────────────────────────
     if action == "warn":
         if not guild: return "Server only."
         uid_val = safe_int(data.get("user_id", 0))
@@ -1599,7 +1559,6 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
         log_mod_entry("unlock_all", guild.id, author.id, f"{unlocked} channels", guild.id)
         return f"🔓 {unlocked} channels unlocked."
 
-    # ── Roles ──────────────────────────────────────────────────────────────────
     if action == "create_role":
         if not guild: return "Server only."
         try:
@@ -1681,7 +1640,6 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
             return f"🎖️ Gave **{role_name}** to {member.mention} for **{hours}h**."
         except discord.Forbidden: return "❌ Missing permissions."
 
-    # ── Channels ───────────────────────────────────────────────────────────────
     if action == "create_channel":
         if not guild: return "Server only."
         name     = data.get("name", "new-channel").lower().replace(" ", "-")
@@ -1727,7 +1685,6 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
             return f"✅ Category **{cat.name}** created!"
         except discord.Forbidden: return "❌ Missing permissions."
 
-    # ── Utility ────────────────────────────────────────────────────────────────
     if action == "whois":
         if not guild: return "Server only."
         uid_val = safe_int(data.get("user_id", 0))
@@ -1914,30 +1871,54 @@ async def _schedule_role_remove(guild: discord.Guild, user_id: int, role_id: int
 
 # ─── BACKGROUND TASKS ────────────────────────────────────────────────────────
 
-@tasks.loop(minutes=5)
+@tasks.loop(minutes=15)
 async def dead_chat_monitor():
+    """
+    Checks every 15 minutes if any guild's general channel has been silent
+    for DEAD_CHAT_THRESHOLD seconds (2 hours). If so, sends a convo starter.
+    Also enforces a minimum 2-hour gap between starters so it never spams.
+    """
     now_ts = time.time()
     for guild in bot.guilds:
-        gid     = str(guild.id)
-        last_ts = last_activity.get(gid, 0)
-        if last_ts and (now_ts - last_ts) >= DEAD_CHAT_THRESHOLD:
-            general = discord.utils.find(
-                lambda c: any(w in c.name.lower() for w in ["general", "chat", "lounge", "main"]),
-                guild.text_channels,
+        gid = str(guild.id)
+
+        last_msg_ts   = last_activity.get(gid, 0)
+        last_sent_ts  = dead_chat_sent.get(gid, 0)
+
+        # Skip if chat was recently active
+        if now_ts - last_msg_ts < DEAD_CHAT_THRESHOLD:
+            continue
+
+        # Skip if we already sent a starter recently (don't repeat within threshold)
+        if now_ts - last_sent_ts < DEAD_CHAT_THRESHOLD:
+            continue
+
+        # Only fire if chat has been set (last_msg_ts > 0) to avoid spamming on startup
+        if last_msg_ts == 0:
+            continue
+
+        general = discord.utils.find(
+            lambda c: any(w in c.name.lower() for w in ["general", "chat", "lounge", "main"]),
+            guild.text_channels,
+        )
+        if not general:
+            continue
+
+        # Update sent timestamp before sending so a failure doesn't cause double-send
+        dead_chat_sent[gid] = now_ts
+
+        starter = random.choice(CONVO_STARTERS)
+        try:
+            embed = discord.Embed(
+                description=f"💬 {starter}",
+                color=C_MOD, timestamp=datetime.now(timezone.utc),
             )
-            if not general:
-                continue
-            last_activity[gid] = now_ts  # Reset so we don't fire again immediately
-            starter = random.choice(CONVO_STARTERS)
-            try:
-                embed = discord.Embed(
-                    description=f"💬 {starter}",
-                    color=C_MOD, timestamp=datetime.now(timezone.utc),
-                )
-                embed.set_footer(text=f"{BOT_NAME} · Chat Reviver")
-                await general.send(embed=embed)
-            except Exception:
-                pass
+            embed.set_footer(text=f"{BOT_NAME} · Chat Reviver")
+            await general.send(embed=embed)
+            log.info(f"Dead chat starter sent in {guild.name} #{general.name}")
+        except Exception as e:
+            log.warning(f"Failed to send dead chat starter in {guild.name}: {e}")
+
 
 @tasks.loop(hours=24)
 async def cleanup_old_data():
@@ -1946,11 +1927,11 @@ async def cleanup_old_data():
                   if (now - v["ts"]).total_seconds() > 60]
     for k in expired_gp:
         ghostping_cache.pop(k, None)
-    # Clean old rate_limits entries
     old_ts = time.time() - 300
     for uid in list(rate_limits.keys()):
         if rate_limits[uid] < old_ts:
             del rate_limits[uid]
+
 
 @tasks.loop(minutes=30)
 async def restore_temproles():
@@ -1982,7 +1963,6 @@ async def on_ready():
     await db_init()
     await db_load()
 
-    # Init Groq clients
     for key in GROQ_KEYS:
         groq_clients[key] = AsyncGroq(api_key=key)
 
@@ -1991,7 +1971,6 @@ async def on_ready():
     else:
         log.info(f"✅ {len(GROQ_KEYS)} Groq key(s) loaded.")
 
-    # Cache invite data
     for guild in bot.guilds:
         try:
             invites = await guild.invites()
@@ -2017,7 +1996,6 @@ async def on_ready():
     )
     embed.set_footer(text=BOT_NAME)
 
-    # Send startup notice — try global log channel first, then each guild's bot/mod log channel
     sent_ids: set = set()
     if BOT_LOG_CHANNEL_ID:
         ch = bot.get_channel(BOT_LOG_CHANNEL_ID)
@@ -2028,7 +2006,6 @@ async def on_ready():
             except Exception:
                 pass
 
-    # Also send to every guild's configured bot log channel (so it shows up even without BOT_LOG_CHANNEL_ID)
     for guild in bot.guilds:
         for lt in ("bot", "mod"):
             gid = str(guild.id)
@@ -2041,14 +2018,13 @@ async def on_ready():
                         sent_ids.add(ch.id)
                     except Exception:
                         pass
-                    break  # only one channel per guild
+                    break
 
     log.info(f"✅ {BOT_NAME} ready — {len(GROQ_KEYS)} Groq key(s) loaded.")
 
 
 @bot.event
 async def on_close():
-    """Send a shutdown notice to all configured log channels before the bot closes."""
     embed = discord.Embed(
         title=f"🔴 {BOT_NAME} Offline",
         description="The bot is shutting down. It will be back shortly.",
@@ -2084,9 +2060,8 @@ async def on_close():
 
 @bot.event
 async def on_command_error(ctx, error):
-    """Surface prefix command errors instead of silently swallowing them."""
     if isinstance(error, commands.CommandNotFound):
-        return  # Don't reply for unknown commands — user may just be chatting
+        return
     if isinstance(error, commands.MissingRequiredArgument):
         embed = discord.Embed(
             description=f"❌ Missing argument: `{error.param.name}`\nUse `{CMD_PREFIX}help` to see usage.",
@@ -2100,9 +2075,8 @@ async def on_command_error(ctx, error):
         embed = discord.Embed(description=f"❌ Member not found: {error}", color=C_ERROR)
         await ctx.reply(embed=embed, mention_author=False)
     elif isinstance(error, commands.CheckFailure):
-        pass  # deny() already handles this
+        pass
     else:
-        # Log unexpected errors
         log.error(f"Command error in {ctx.command}: {error}")
         error_log.append({"ts": datetime.now(timezone.utc).isoformat(), "err": f"{ctx.command}: {error}"})
         embed = discord.Embed(
@@ -2114,11 +2088,11 @@ async def on_command_error(ctx, error):
 
 @bot.event
 async def on_message(msg: discord.Message):
+    # Ignore all bot messages
     if msg.author.bot:
         return
 
-    try:
-        # ── DM handling ────────────────────────────────────────────────────────────
+    # ── DM handling ────────────────────────────────────────────────────────────
     if isinstance(msg.channel, discord.DMChannel):
         await process(msg, is_dm=True)
         return
@@ -2176,12 +2150,13 @@ async def on_message(msg: discord.Message):
         except Exception:
             pass
 
-    # AutoMod
+    # AutoMod — skip for owner
     if not is_owner(msg.author.id):
         caught = await run_automod(msg)
         if caught:
             return
 
+    # Process prefix commands first
     await bot.process_commands(msg)
 
     # AI trigger: bot mention or reply to bot
@@ -2201,7 +2176,6 @@ async def on_message_delete(msg: discord.Message):
     if msg.author.bot or not msg.guild:
         return
 
-    # Snipe cache
     snipe_cache[msg.channel.id] = {
         "content":       msg.content or "*[no text]*",
         "author":        str(msg.author),
@@ -2210,7 +2184,6 @@ async def on_message_delete(msg: discord.Message):
         "cached_at":     datetime.now(timezone.utc),
     }
 
-    # Ghost ping detection
     cached = ghostping_cache.pop(msg.id, None)
     if cached and cached["mentions"]:
         delta = (datetime.now(timezone.utc) - cached["ts"]).total_seconds()
@@ -2239,7 +2212,6 @@ async def on_message_delete(msg: discord.Message):
             except Exception:
                 pass
 
-    # Message delete log
     embed = discord.Embed(
         title="🗑️ Message Deleted",
         description=msg.content[:1000] or "*[no text content]*",
@@ -2259,7 +2231,6 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
     if before.content == after.content:
         return
 
-    # Edit snipe
     edit_snipe[before.channel.id] = {
         "before":        before.content or "*[empty]*",
         "after":         after.content  or "*[empty]*",
@@ -2268,7 +2239,6 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
         "ts":            datetime.now(timezone.utc),
     }
 
-    # Automod on edited content
     if not is_owner(before.author.id):
         await run_automod(after)
 
@@ -2301,7 +2271,6 @@ async def on_member_join(member: discord.Member):
     embed.set_footer(text=BOT_NAME)
     asyncio.create_task(send_log(member.guild, "join_leave", embed))
 
-    # Invite tracking
     try:
         new_invites = await member.guild.invites()
         gid = str(member.guild.id)
@@ -2687,8 +2656,8 @@ async def cmd_help(ctx, section: str = ""):
         cmds = [
             (f"{p}raidmode on/off/status", "Manually toggle raid mode."),
             (f"{p}forceraidscan",          "Manually trigger a raid indicator scan."),
-            (f"{p}panic",                  "Emergency lockdown — instantly locks all channels."),
-            (f"{p}lockdown",               "Lock all channels. Use {p}unlockall to undo."),
+            (f"{p}panic",                  f"Emergency lockdown — instantly locks all channels."),
+            (f"{p}lockdown",               f"Lock all channels. Use {p}unlockall to undo."),
             (f"{p}unlockall",              "Unlock all channels."),
             (f"{p}alerts #channel",        "Set the channel to receive security alerts."),
             (f"{p}stafflogs",              "View recent staff action logs (abuse detection)."),
