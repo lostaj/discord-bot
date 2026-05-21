@@ -2016,13 +2016,100 @@ async def on_ready():
         color=C_STARTUP, timestamp=datetime.now(timezone.utc),
     )
     embed.set_footer(text=BOT_NAME)
+
+    # Send startup notice — try global log channel first, then each guild's bot/mod log channel
+    sent_ids: set = set()
     if BOT_LOG_CHANNEL_ID:
         ch = bot.get_channel(BOT_LOG_CHANNEL_ID)
         if ch:
-            try: await ch.send(embed=embed)
-            except Exception: pass
+            try:
+                await ch.send(embed=embed)
+                sent_ids.add(ch.id)
+            except Exception:
+                pass
+
+    # Also send to every guild's configured bot log channel (so it shows up even without BOT_LOG_CHANNEL_ID)
+    for guild in bot.guilds:
+        for lt in ("bot", "mod"):
+            gid = str(guild.id)
+            cid = log_channels.get(gid, {}).get(lt)
+            if cid:
+                ch = guild.get_channel(int(cid))
+                if ch and ch.id not in sent_ids:
+                    try:
+                        await ch.send(embed=embed)
+                        sent_ids.add(ch.id)
+                    except Exception:
+                        pass
+                    break  # only one channel per guild
 
     log.info(f"✅ {BOT_NAME} ready — {len(GROQ_KEYS)} Groq key(s) loaded.")
+
+
+@bot.event
+async def on_close():
+    """Send a shutdown notice to all configured log channels before the bot closes."""
+    embed = discord.Embed(
+        title=f"🔴 {BOT_NAME} Offline",
+        description="The bot is shutting down. It will be back shortly.",
+        color=C_SHUTDOWN,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text=BOT_NAME)
+
+    sent_ids: set = set()
+    if BOT_LOG_CHANNEL_ID:
+        ch = bot.get_channel(BOT_LOG_CHANNEL_ID)
+        if ch:
+            try:
+                await ch.send(embed=embed)
+                sent_ids.add(ch.id)
+            except Exception:
+                pass
+
+    for guild in bot.guilds:
+        for lt in ("bot", "mod"):
+            gid = str(guild.id)
+            cid = log_channels.get(gid, {}).get(lt)
+            if cid:
+                ch = guild.get_channel(int(cid))
+                if ch and ch.id not in sent_ids:
+                    try:
+                        await ch.send(embed=embed)
+                        sent_ids.add(ch.id)
+                    except Exception:
+                        pass
+                    break
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Surface prefix command errors instead of silently swallowing them."""
+    if isinstance(error, commands.CommandNotFound):
+        return  # Don't reply for unknown commands — user may just be chatting
+    if isinstance(error, commands.MissingRequiredArgument):
+        embed = discord.Embed(
+            description=f"❌ Missing argument: `{error.param.name}`\nUse `{CMD_PREFIX}help` to see usage.",
+            color=C_ERROR,
+        )
+        await ctx.reply(embed=embed, mention_author=False)
+    elif isinstance(error, commands.BadArgument):
+        embed = discord.Embed(description=f"❌ Bad argument: {error}", color=C_ERROR)
+        await ctx.reply(embed=embed, mention_author=False)
+    elif isinstance(error, commands.MemberNotFound):
+        embed = discord.Embed(description=f"❌ Member not found: {error}", color=C_ERROR)
+        await ctx.reply(embed=embed, mention_author=False)
+    elif isinstance(error, commands.CheckFailure):
+        pass  # deny() already handles this
+    else:
+        # Log unexpected errors
+        log.error(f"Command error in {ctx.command}: {error}")
+        error_log.append({"ts": datetime.now(timezone.utc).isoformat(), "err": f"{ctx.command}: {error}"})
+        embed = discord.Embed(
+            description=f"❌ An error occurred running `{CMD_PREFIX}{ctx.command}`: {error}",
+            color=C_ERROR,
+        )
+        await ctx.reply(embed=embed, mention_author=False)
 
 
 @bot.event
@@ -2030,7 +2117,8 @@ async def on_message(msg: discord.Message):
     if msg.author.bot:
         return
 
-    # ── DM handling ────────────────────────────────────────────────────────────
+    try:
+        # ── DM handling ────────────────────────────────────────────────────────────
     if isinstance(msg.channel, discord.DMChannel):
         await process(msg, is_dm=True)
         return
