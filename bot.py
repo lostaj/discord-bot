@@ -18,7 +18,6 @@ DISCORD_TOKEN      = os.getenv("DISCORD_TOKEN")
 OWNER_ID           = int(os.getenv("OWNER_ID", "0"))
 CMD_PREFIX         = os.getenv("CMD_PREFIX", ".")
 BOT_LOG_CHANNEL_ID = int(os.getenv("BOT_LOG_CHANNEL_ID", "0"))
-ALERTS_CHANNEL_ID  = int(os.getenv("ALERTS_CHANNEL_ID", "0"))
 GROQ_KEYS          = [k for k in [os.getenv(f"GROQ_KEY_{i}") for i in range(1, 11)] if k]
 MONGO_URI          = os.getenv("MONGO_URI", "")
 HEALTH_PORT        = int(os.getenv("HEALTH_PORT", "7860"))
@@ -265,10 +264,17 @@ bot = commands.Bot(command_prefix=CMD_PREFIX, intents=intents, help_command=None
 
 # ─── GROQ KEY POOL ───────────────────────────────────────────────────────────
 
-groq_clients:   dict = {}
-_key_cycle           = None
-_key_last_used: dict = {}   # key -> last used timestamp (for 5s cooldown)
-_key_ratelimited: set = set()  # keys currently rate-limited
+groq_clients:     dict = {}
+_key_last_used:   dict = {}   # key -> last used timestamp (for 5s cooldown)
+_key_ratelimited: set  = set()  # keys currently rate-limited
+
+def _pick_groq_key() -> str | None:
+    """Pick the best available Groq key (not rate-limited, cooldown respected)."""
+    available = [k for k in GROQ_KEYS if k not in _key_ratelimited]
+    if not available:
+        return None
+    # Sort by last used (oldest first = most ready)
+    return min(available, key=lambda k: _key_last_used.get(k, 0))
 
 # ─── HTTP SESSION ────────────────────────────────────────────────────────────
 
@@ -407,14 +413,14 @@ async def db_load():
         for meta_id in ["mod_logs", "dm_logs", "prompt", "bot_knowledge", "tempbans", "temproles"]:
             doc = await _col("meta").find_one({"_id": meta_id})
             if not doc: continue
-            if meta_id == "mod_logs":      mod_logs.extend(doc.get("logs", []))
-            elif meta_id == "dm_logs":     dm_logs.update(doc.get("data", {}))
+            if meta_id == "mod_logs":        mod_logs.extend(doc.get("logs", []))
+            elif meta_id == "dm_logs":       dm_logs.update(doc.get("data", {}))
             elif meta_id == "prompt":
                 custom_prompt  = doc.get("text")
                 prompt_history = doc.get("history", [])
             elif meta_id == "bot_knowledge": bot_knowledge.extend(doc.get("facts", []))
-            elif meta_id == "tempbans":    tempbans.update(doc.get("data", {}))
-            elif meta_id == "temproles":   temproles.update(doc.get("data", {}))
+            elif meta_id == "tempbans":      tempbans.update(doc.get("data", {}))
+            elif meta_id == "temproles":     temproles.update(doc.get("data", {}))
         log.info(f"Loaded {len(registry)} users, {len(warns)} warn records, {len(economy)} economy entries.")
     except Exception as e:
         log.error(f"db_load error: {e}")
@@ -433,11 +439,7 @@ async def send_log(guild: discord.Guild, log_type: str, embed: discord.Embed):
         except Exception: pass
 
 async def send_alerts(guild: discord.Guild | None, embed: discord.Embed):
-    if ALERTS_CHANNEL_ID:
-        ch = bot.get_channel(ALERTS_CHANNEL_ID)
-        if ch:
-            try: await ch.send(embed=embed)
-            except Exception: pass
+    """Send to guild-configured alerts channel only."""
     if guild:
         gid = str(guild.id)
         cid = log_channels.get(gid, {}).get("alerts")
@@ -529,7 +531,6 @@ def discord_ts(dt: datetime | None, style: str = "f") -> str:
     return f"<t:{ts_unix(dt)}:{style}>"
 
 def fmt_ts(dt: datetime | None) -> str:
-    """Return both human and Discord timestamp."""
     if dt is None: return "N/A"
     human = dt.strftime("%d %b %Y, %H:%M UTC")
     return f"{human} ({discord_ts(dt, 'R')})"
@@ -646,10 +647,10 @@ async def record_staff_action(guild: discord.Guild, staff_member: discord.Member
             description=f"**{staff_member}** (`{staff_member.id}`) may be abusing their position.",
             color=C_ERROR, timestamp=datetime.now(timezone.utc),
         )
-        embed.add_field(name="Role",               value=get_staff_level(staff_member) or "Unknown", inline=True)
-        embed.add_field(name="Actions (5 min)",    value=str(total_recent),  inline=True)
-        embed.add_field(name="Max vs 1 User",      value=str(max_target),    inline=True)
-        embed.add_field(name="Last Action",        value=action,             inline=True)
+        embed.add_field(name="Role",            value=get_staff_level(staff_member) or "Unknown", inline=True)
+        embed.add_field(name="Actions (5 min)", value=str(total_recent),  inline=True)
+        embed.add_field(name="Max vs 1 User",   value=str(max_target),    inline=True)
+        embed.add_field(name="Last Action",     value=action,             inline=True)
         embed.set_footer(text=BOT_NAME)
         asyncio.create_task(send_alerts(guild, embed))
         asyncio.create_task(bot_log(
@@ -763,7 +764,7 @@ async def run_automod(msg: discord.Message) -> bool:
         await delete_and_warn("spamming messages too quickly.", "AutoMod: Spam", mute=True)
         return True
 
-    # 8. Coordinated spam (same content from multiple users = raid indicator)
+    # 8. Coordinated spam / raid indicator
     content_hash = hashlib.md5(content.strip().lower()[:150].encode()).hexdigest()
     if len(content.strip()) > 5:
         similar_msg_tracker[gid][content_hash] = [
@@ -996,7 +997,7 @@ async def web_search(query: str, deep: bool = False) -> str:
                                             results.append(f"📄 **BedWars Detail:** {clean_extract}")
         except Exception: pass
 
-    # Roblox main wiki/fandom
+    # Roblox main wiki/fandom fallback
     if not any(r.startswith("🎮") for r in results):
         try:
             roblox_url = (
@@ -1012,7 +1013,7 @@ async def web_search(query: str, deep: bool = False) -> str:
                         results.append(f"🟥 **Roblox Wiki:** {', '.join(titles)}")
         except Exception: pass
 
-    # Deep mode: try to get a live web snippet via DuckDuckGo HTML scrape
+    # Deep mode: DuckDuckGo HTML snippet scrape
     if deep and len(results) < 3:
         try:
             ddg_html = f"https://html.duckduckgo.com/html/?q={encoded}"
@@ -1032,27 +1033,38 @@ async def web_search(query: str, deep: bool = False) -> str:
 
 async def call_ai(history: list, system: str | None = None) -> str:
     global msgs_processed
-    if not GROQ_KEYS or _key_cycle is None:
-        return '{"action":"chat","message":"Bot AI is not ready yet — check GROQ_KEY config."}'
+    if not GROQ_KEYS:
+        return '{"action":"chat","message":"Bot AI is not configured — no GROQ_KEY set."}'
 
-    clean     = [m for m in history if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
+    clean       = [m for m in history if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
     sys_content = system or (custom_prompt or BASE_PROMPT)
-    now_ts    = time.time()
+    now_ts      = time.time()
 
-    keys_to_try = list(GROQ_KEYS)
-    random.shuffle(keys_to_try)   # distribute load
+    # Shuffle for load distribution
+    keys_to_try = [k for k in GROQ_KEYS if k not in _key_ratelimited]
+    if not keys_to_try:
+        # All keys rate-limited — wait for the one that's been cooling longest
+        keys_to_try = sorted(GROQ_KEYS, key=lambda k: _key_last_used.get(k, 0))
+        log.warning("All Groq keys rate-limited, trying least-recently-used key.")
+
+    random.shuffle(keys_to_try)
 
     for key in keys_to_try:
-        if key in _key_ratelimited:
-            continue
-        # Enforce 5s cooldown per key
-        last_used = _key_last_used.get(key, 0)
-        wait = GROQ_KEY_COOLDOWN - (now_ts - last_used)
-        if wait > 0:
-            await asyncio.sleep(wait)
-
         client = groq_clients.get(key)
-        if not client: continue
+        if not client:
+            continue
+
+        # Non-blocking cooldown: skip key if it's too fresh and others are available
+        last_used = _key_last_used.get(key, 0)
+        elapsed   = now_ts - last_used
+        if elapsed < GROQ_KEY_COOLDOWN and len(keys_to_try) > 1:
+            continue  # Try another key first
+
+        # If we must use this key and it needs cooldown, do a brief await
+        if elapsed < GROQ_KEY_COOLDOWN:
+            wait = GROQ_KEY_COOLDOWN - elapsed
+            if wait > 0:
+                await asyncio.sleep(wait)
 
         try:
             _key_last_used[key] = time.time()
@@ -1060,34 +1072,59 @@ async def call_ai(history: list, system: str | None = None) -> str:
                 client.chat.completions.create(
                     model=AI_MODEL,
                     messages=[{"role": "system", "content": sys_content}] + clean[-MAX_HIST:],
-                    max_tokens=700, temperature=0.35,
+                    max_tokens=700,
+                    temperature=0.35,
                     response_format={"type": "json_object"},
                 ),
                 timeout=18.0,
             )
             msgs_processed += 1
-            return resp.choices[0].message.content.strip()
+            content = resp.choices[0].message.content
+            if content:
+                return content.strip()
+            # Empty response fallback
+            return '{"action":"chat","message":"I got an empty response. Please try again."}'
 
         except asyncio.TimeoutError:
-            log.warning(f"Groq key timeout")
+            log.warning(f"Groq key timed out, trying next...")
             continue
+
         except Exception as e:
             err_str = str(e)
             if "rate_limit" in err_str.lower() or "429" in err_str:
-                log.warning(f"Groq key rate-limited, cooling down...")
+                log.warning(f"Groq key rate-limited (429), cooling for 60s...")
                 _key_ratelimited.add(key)
                 asyncio.create_task(_unblock_key_after(key, 60))
-                # Alert owner
                 asyncio.create_task(_alert_ratelimit(key))
                 continue
+            if "json_object" in err_str.lower() or "response_format" in err_str.lower():
+                # Model doesn't support json_object — retry without it
+                try:
+                    _key_last_used[key] = time.time()
+                    resp = await asyncio.wait_for(
+                        client.chat.completions.create(
+                            model=AI_MODEL,
+                            messages=[{"role": "system", "content": sys_content}] + clean[-MAX_HIST:],
+                            max_tokens=700,
+                            temperature=0.35,
+                        ),
+                        timeout=18.0,
+                    )
+                    msgs_processed += 1
+                    content = resp.choices[0].message.content
+                    return content.strip() if content else '{"action":"chat","message":"Empty response."}'
+                except Exception:
+                    pass
             log.error(f"Groq error: {e}")
+            error_log.append({"ts": datetime.now(timezone.utc).isoformat(), "err": str(e)[:200]})
             continue
 
-    return '{"action":"chat","message":"All AI keys are busy or cooling down. Try again in a moment."}'
+    return '{"action":"chat","message":"All AI keys are busy or cooling down. Please try again in a moment! 🔄"}'
 
 async def _unblock_key_after(key: str, seconds: int):
     await asyncio.sleep(seconds)
     _key_ratelimited.discard(key)
+    log.info(f"Groq key unblocked after {seconds}s cooldown.")
 
 async def _alert_ratelimit(key: str):
     short = key[:8] + "..."
@@ -1097,13 +1134,13 @@ async def _alert_ratelimit(key: str):
         color=C_WARN, timestamp=datetime.now(timezone.utc),
     )
     embed.set_footer(text=BOT_NAME)
-    if ALERTS_CHANNEL_ID:
-        ch = bot.get_channel(ALERTS_CHANNEL_ID)
-        if ch:
-            try: await ch.send(embed=embed)
-            except Exception: pass
+    # Send to all guild alert channels
+    for guild in bot.guilds:
+        asyncio.create_task(send_alerts(guild, embed))
 
 def parse_json(raw: str) -> dict | None:
+    if not raw:
+        return None
     cleaned = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`")
     try:
         r = json.loads(cleaned)
@@ -1129,11 +1166,16 @@ _MEM_PROMPT = (
 )
 
 async def extract_memory(uid: int, message: str):
-    if len(message) < 20 or not GROQ_KEYS or _key_cycle is None: return
+    if len(message) < 20 or not GROQ_KEYS:
+        return
+    key = _pick_groq_key()
+    if not key:
+        return
+    client = groq_clients.get(key)
+    if not client:
+        return
     try:
-        key    = next(_key_cycle)
-        client = groq_clients.get(key)
-        if not client: return
+        _key_last_used[key] = time.time()
         resp = await asyncio.wait_for(
             client.chat.completions.create(
                 model=AI_MODEL,
@@ -1141,16 +1183,24 @@ async def extract_memory(uid: int, message: str):
                     {"role": "system", "content": _MEM_PROMPT},
                     {"role": "user",   "content": message[:400]},
                 ],
-                max_tokens=120, temperature=0.2,
+                max_tokens=120,
+                temperature=0.2,
             ),
             timeout=8.0,
         )
-        facts = json.loads(resp.choices[0].message.content.strip())
+        content = resp.choices[0].message.content
+        if not content:
+            return
+        raw_facts = content.strip()
+        # Strip json fences if any
+        raw_facts = re.sub(r"```(?:json)?", "", raw_facts).strip().rstrip("`")
+        facts = json.loads(raw_facts)
         if isinstance(facts, list):
             for f in facts[:3]:
                 if isinstance(f, str) and len(f) > 3:
                     add_ai_memory(uid, f)
-    except Exception: pass
+    except Exception:
+        pass  # Memory extraction is best-effort, never raise
 
 # ─── CONTEXT MESSAGE HISTORY ─────────────────────────────────────────────────
 
@@ -1183,6 +1233,9 @@ async def process(msg: discord.Message, content_override: str | None = None, is_
     content = (content_override or msg.content).strip()
     owner   = is_owner(uid)
 
+    if not content:
+        return
+
     # Bypass / injection check
     if not owner:
         lower = content.lower()
@@ -1199,8 +1252,8 @@ async def process(msg: discord.Message, content_override: str | None = None, is_
             ))
             return
 
-    # Rate limit
-    if not owner:
+    # Rate limit (non-owner, non-DM)
+    if not owner and not is_dm:
         now_ts = time.time()
         last   = rate_limits[uid]
         if now_ts - last < AI_COOLDOWN:
@@ -1216,7 +1269,7 @@ async def process(msg: discord.Message, content_override: str | None = None, is_
         track_activity(uid, msg.channel.id)
     register_user(author)
 
-    # Daily greeting
+    # Daily greeting (server only, not DM)
     if not is_dm:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if daily_greeted.get(str(uid)) != today:
@@ -1245,27 +1298,35 @@ async def process(msg: discord.Message, content_override: str | None = None, is_
     system     = f"{active_prompt()}\n\n{ctx_line}{ch_context}"
 
     hist_key = f"dm_{uid}" if is_dm else f"ch_{msg.channel.id}_u_{uid}"
-    hist     = histories[hist_key]
-    hist.append({"role": "user", "content": content})
-    if len(hist) > MAX_HIST:
-        histories[hist_key] = hist[-MAX_HIST:]
 
+    # Keep history bounded
+    if hist_key not in histories:
+        histories[hist_key] = []
+    histories[hist_key].append({"role": "user", "content": content})
+    if len(histories[hist_key]) > MAX_HIST:
+        histories[hist_key] = histories[hist_key][-MAX_HIST:]
+
+    # Evict old history keys to prevent memory bloat
     if len(histories) > 500:
-        for k in list(histories.keys())[:100]:
+        oldest_keys = list(histories.keys())[:100]
+        for k in oldest_keys:
             del histories[k]
 
+    # Background memory extraction (fire and forget)
     if len(content) >= 20:
         asyncio.create_task(extract_memory(uid, content))
 
     async with msg.channel.typing():
         raw = await call_ai(histories[hist_key], system=system)
 
+    # Append assistant response to history
     histories[hist_key].append({"role": "assistant", "content": raw})
     if len(histories[hist_key]) > MAX_HIST:
         histories[hist_key] = histories[hist_key][-MAX_HIST:]
 
     parsed = parse_json(raw)
     if not parsed:
+        # Fallback: display raw text if not valid JSON
         embed = discord.Embed(
             description=discord.utils.escape_mentions(raw[:1990]),
             color=C_INFO,
@@ -1276,9 +1337,9 @@ async def process(msg: discord.Message, content_override: str | None = None, is_
 
     action = parsed.get("action", "chat")
 
-    # Web search
+    # Web search action — fetch results then re-query
     if action == "web_search_query":
-        query = parsed.get("query", "")
+        query = parsed.get("query", "").strip()
         if query:
             async with msg.channel.typing():
                 results = await web_search(query, deep=True)
@@ -1314,6 +1375,7 @@ async def process(msg: discord.Message, content_override: str | None = None, is_
         embed.set_footer(text=BOT_NAME)
         await msg.reply(embed=embed, mention_author=False)
 
+    # Log DM conversations
     if is_dm and uid != OWNER_ID:
         logs = dm_logs.setdefault(str(uid), [])
         logs.append({"ts": datetime.now(timezone.utc).isoformat()[:19], "msg": content[:200], "rep": raw[:200]})
@@ -1733,7 +1795,7 @@ def _build_report(guild: discord.Guild) -> str:
     week_ago  = (now - timedelta(days=7)).isoformat()
     month_ago = (now - timedelta(days=30)).isoformat()
 
-    top   = sorted(
+    top = sorted(
         [(k, v) for k, v in activity.items() if (v.get("last") or "") >= week_ago],
         key=lambda x: x[1]["count"], reverse=True,
     )[:5]
@@ -1741,10 +1803,10 @@ def _build_report(guild: discord.Guild) -> str:
         f"{guild.get_member(int(k)).display_name if guild.get_member(int(k)) else k} ({v['count']})"
         for k, v in top
     ]
-    inactive   = sum(1 for v in activity.values() if (v.get("last") or "") < month_ago)
-    recent_mod = len([e for e in mod_logs if e.get("ts", "") >= week_ago])
-    richest    = sorted(economy.items(), key=lambda x: x[1].get("coins", 0), reverse=True)[:3]
-    rich_names = [
+    inactive    = sum(1 for v in activity.values() if (v.get("last") or "") < month_ago)
+    recent_mod  = len([e for e in mod_logs if e.get("ts", "") >= week_ago])
+    richest     = sorted(economy.items(), key=lambda x: x[1].get("coins", 0), reverse=True)[:3]
+    rich_names  = [
         f"{guild.get_member(int(k)).display_name if guild.get_member(int(k)) else k} — {v.get('coins', 0):,} 🪙"
         for k, v in richest
     ]
@@ -1779,45 +1841,38 @@ async def _deep_scan(guild: discord.Guild) -> str:
     issues = []
     suggestions = []
 
-    # New accounts (< 7 days old)
     new_accounts = [m for m in guild.members if not m.bot and (now - m.created_at.replace(tzinfo=timezone.utc)).days < 7]
     if new_accounts:
         issues.append(f"⚠️ **{len(new_accounts)}** members with accounts < 7 days old (raid risk)")
 
-    # Accounts with no roles (besides @everyone)
     no_roles = [m for m in guild.members if not m.bot and len(m.roles) <= 1]
     if len(no_roles) > guild.member_count * 0.4:
         suggestions.append(f"💡 **{len(no_roles)}** members have no roles — consider an auto-role or verification system")
 
-    # Missing channels
     ch_names = [c.name.lower() for c in guild.text_channels]
     for recommended in ["rules", "announcements", "general", "mod-log", "welcome"]:
         if not any(recommended in name for name in ch_names):
             suggestions.append(f"💡 Missing **#{recommended}** channel — recommended to add one")
 
-    # Missing log channels
     lc = log_channels.get(gid, {})
     missing_logs = [lt for lt in ["mod", "automod", "join_leave", "message"] if lt not in lc]
     if missing_logs:
         suggestions.append(f"📋 Log channels not configured: `{', '.join(missing_logs)}` — use `.setlog <type> #channel`")
 
-    # Bans / warns summary
     total_warns = sum(len([w for w in wl if w.get("guild_id") == gid]) for wl in warns.values())
     if total_warns > 50:
         issues.append(f"⚠️ **{total_warns}** total warnings on record — review with `.modlogs`")
 
-    # Channels with no permissions set
     unprotected = [c for c in guild.text_channels if not c.overwrites]
     if len(unprotected) > 5:
         suggestions.append(f"🔓 **{len(unprotected)}** channels have no permission overwrites — consider restricting sensitive channels")
 
-    # Verification level
     if guild.verification_level == discord.VerificationLevel.none:
         suggestions.append("🛡️ Server verification level is **None** — recommend setting at least **Low** or **Medium**")
 
-    humans  = sum(1 for m in guild.members if not m.bot)
-    bots_c  = sum(1 for m in guild.members if m.bot)
-    online  = sum(1 for m in guild.members if m.status != discord.Status.offline)
+    humans = sum(1 for m in guild.members if not m.bot)
+    bots_c = sum(1 for m in guild.members if m.bot)
+    online = sum(1 for m in guild.members if m.status != discord.Status.offline)
 
     lines = [
         f"**🔍 Deep Server Scan — {guild.name}**",
@@ -1861,20 +1916,18 @@ async def _schedule_role_remove(guild: discord.Guild, user_id: int, role_id: int
 
 @tasks.loop(minutes=5)
 async def dead_chat_monitor():
-    """Detect dead chat and send a conversation starter."""
     now_ts = time.time()
     for guild in bot.guilds:
-        gid = str(guild.id)
+        gid     = str(guild.id)
         last_ts = last_activity.get(gid, 0)
         if last_ts and (now_ts - last_ts) >= DEAD_CHAT_THRESHOLD:
-            # Find general channel
             general = discord.utils.find(
                 lambda c: any(w in c.name.lower() for w in ["general", "chat", "lounge", "main"]),
                 guild.text_channels,
             )
-            if not general: continue
-            # Don't spam
-            last_activity[gid] = now_ts
+            if not general:
+                continue
+            last_activity[gid] = now_ts  # Reset so we don't fire again immediately
             starter = random.choice(CONVO_STARTERS)
             try:
                 embed = discord.Embed(
@@ -1883,21 +1936,24 @@ async def dead_chat_monitor():
                 )
                 embed.set_footer(text=f"{BOT_NAME} · Chat Reviver")
                 await general.send(embed=embed)
-            except Exception: pass
+            except Exception:
+                pass
 
 @tasks.loop(hours=24)
 async def cleanup_old_data():
-    """Daily cleanup of stale in-memory data."""
-    now_str = datetime.now(timezone.utc).isoformat()
-    # Remove expired ghost ping entries
+    now = datetime.now(timezone.utc)
     expired_gp = [k for k, v in ghostping_cache.items()
-                  if (datetime.now(timezone.utc) - v["ts"]).total_seconds() > 60]
+                  if (now - v["ts"]).total_seconds() > 60]
     for k in expired_gp:
         ghostping_cache.pop(k, None)
+    # Clean old rate_limits entries
+    old_ts = time.time() - 300
+    for uid in list(rate_limits.keys()):
+        if rate_limits[uid] < old_ts:
+            del rate_limits[uid]
 
 @tasks.loop(minutes=30)
 async def restore_temproles():
-    """On restart, restore any pending temprole removals."""
     now = datetime.now(timezone.utc)
     for uid, entries in list(temproles.items()):
         for entry in entries:
@@ -1912,13 +1968,14 @@ async def restore_temproles():
                         role   = guild.get_role(int(entry["role_id"]))
                         if member and role and role in member.roles:
                             await member.remove_roles(role, reason="Temp role expired (restored)")
-            except Exception: pass
+            except Exception:
+                pass
 
 # ─── EVENTS ──────────────────────────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
-    global _ready_fired, _key_cycle
+    global _ready_fired
     if _ready_fired: return
     _ready_fired = True
 
@@ -1928,17 +1985,20 @@ async def on_ready():
     # Init Groq clients
     for key in GROQ_KEYS:
         groq_clients[key] = AsyncGroq(api_key=key)
-    if GROQ_KEYS:
-        _key_cycle = itertools.cycle(GROQ_KEYS)
+
+    if not GROQ_KEYS:
+        log.warning("⚠️  No GROQ_KEY_x found — AI features will not work!")
+    else:
+        log.info(f"✅ {len(GROQ_KEYS)} Groq key(s) loaded.")
 
     # Cache invite data
     for guild in bot.guilds:
         try:
             invites = await guild.invites()
             invite_cache[str(guild.id)] = {inv.code: inv.uses for inv in invites}
-        except Exception: pass
+        except Exception:
+            pass
 
-    # Start background tasks
     dead_chat_monitor.start()
     cleanup_old_data.start()
     restore_temproles.start()
@@ -1967,28 +2027,34 @@ async def on_ready():
 
 @bot.event
 async def on_message(msg: discord.Message):
-    if msg.author.bot: return
+    if msg.author.bot:
+        return
+
+    # ── DM handling ────────────────────────────────────────────────────────────
+    if isinstance(msg.channel, discord.DMChannel):
+        await process(msg, is_dm=True)
+        return
+
+    # ── Guild message handling ─────────────────────────────────────────────────
 
     # Track last activity for dead chat detection
-    if msg.guild:
-        last_activity[str(msg.guild.id)] = time.time()
+    last_activity[str(msg.guild.id)] = time.time()
 
     # Economy: message coins
-    if msg.guild:
-        uid = msg.author.id
-        e   = get_econ(uid)
-        now_ts = time.time()
-        last_ts = e.get("last_message_ts") or 0
-        if now_ts - (last_ts or 0) >= MSG_COINS_COOLDOWN:
-            earned = random.randint(1, 3)
-            e["coins"]        += earned
-            e["total_earned"] += earned
-            e["messages_counted"] = e.get("messages_counted", 0) + 1
-            e["last_message_ts"]  = now_ts
-            asyncio.create_task(save_econ(uid))
+    uid    = msg.author.id
+    e      = get_econ(uid)
+    now_ts = time.time()
+    last_ts = e.get("last_message_ts") or 0
+    if now_ts - last_ts >= MSG_COINS_COOLDOWN:
+        earned = random.randint(1, 3)
+        e["coins"]            += earned
+        e["total_earned"]     += earned
+        e["messages_counted"]  = e.get("messages_counted", 0) + 1
+        e["last_message_ts"]   = now_ts
+        asyncio.create_task(save_econ(uid))
 
-    # AFK check — mention someone AFK
-    if msg.guild and msg.mentions:
+    # AFK check — mention someone who is AFK
+    if msg.mentions:
         for mentioned in msg.mentions:
             afk_data = afk_users.get(mentioned.id)
             if afk_data:
@@ -2003,7 +2069,8 @@ async def on_message(msg: discord.Message):
                 )
                 try:
                     await msg.channel.send(embed=embed, delete_after=10)
-                except Exception: pass
+                except Exception:
+                    pass
 
     # AFK — user returns
     if msg.author.id in afk_users and not msg.content.startswith(CMD_PREFIX + "afk"):
@@ -2018,21 +2085,23 @@ async def on_message(msg: discord.Message):
                 ),
                 delete_after=10,
             )
-        except Exception: pass
+        except Exception:
+            pass
 
     # AutoMod
-    if msg.guild and not is_owner(msg.author.id):
+    if not is_owner(msg.author.id):
         caught = await run_automod(msg)
         if caught:
             return
 
     await bot.process_commands(msg)
 
-    # AI trigger: mention or reply
+    # AI trigger: bot mention or reply to bot
     if bot.user in msg.mentions or (
-        msg.reference and msg.reference.resolved and
-        isinstance(msg.reference.resolved, discord.Message) and
-        msg.reference.resolved.author == bot.user
+        msg.reference
+        and msg.reference.resolved
+        and isinstance(msg.reference.resolved, discord.Message)
+        and msg.reference.resolved.author == bot.user
     ):
         content = re.sub(r"<@!?" + str(bot.user.id) + r">", "", msg.content).strip()
         if content:
@@ -2041,16 +2110,16 @@ async def on_message(msg: discord.Message):
 
 @bot.event
 async def on_message_delete(msg: discord.Message):
-    if msg.author.bot: return
-    if not msg.guild: return
+    if msg.author.bot or not msg.guild:
+        return
 
     # Snipe cache
     snipe_cache[msg.channel.id] = {
-        "content":    msg.content or "*[no text]*",
-        "author":     str(msg.author),
+        "content":       msg.content or "*[no text]*",
+        "author":        str(msg.author),
         "author_avatar": str(msg.author.display_avatar.url),
-        "created_at": msg.created_at,
-        "cached_at":  datetime.now(timezone.utc),
+        "created_at":    msg.created_at,
+        "cached_at":     datetime.now(timezone.utc),
     }
 
     # Ghost ping detection
@@ -2067,8 +2136,8 @@ async def on_message_delete(msg: discord.Message):
                 ),
                 color=C_SECURITY, timestamp=datetime.now(timezone.utc),
             )
-            embed.add_field(name="Channel", value=cached["channel"].mention, inline=True)
-            embed.add_field(name="Deleted after", value=f"{delta:.1f}s", inline=True)
+            embed.add_field(name="Channel",      value=cached["channel"].mention, inline=True)
+            embed.add_field(name="Deleted after", value=f"{delta:.1f}s",          inline=True)
             embed.set_footer(text=BOT_NAME)
             asyncio.create_task(send_log(msg.guild, "automod", embed))
             try:
@@ -2079,7 +2148,8 @@ async def on_message_delete(msg: discord.Message):
                     ),
                     delete_after=15,
                 )
-            except Exception: pass
+            except Exception:
+                pass
 
     # Message delete log
     embed = discord.Embed(
@@ -2089,38 +2159,36 @@ async def on_message_delete(msg: discord.Message):
     )
     embed.set_author(name=str(msg.author), icon_url=msg.author.display_avatar.url)
     embed.add_field(name="Channel", value=msg.channel.mention, inline=True)
-    embed.add_field(name="User ID", value=str(msg.author.id), inline=True)
+    embed.add_field(name="User ID", value=str(msg.author.id),  inline=True)
     embed.set_footer(text=BOT_NAME)
     asyncio.create_task(send_log(msg.guild, "message", embed))
 
 
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message):
-    if before.author.bot: return
-    if not before.guild: return
-    if before.content == after.content: return
+    if before.author.bot or not before.guild:
+        return
+    if before.content == after.content:
+        return
 
     # Edit snipe
     edit_snipe[before.channel.id] = {
-        "before":     before.content or "*[empty]*",
-        "after":      after.content  or "*[empty]*",
-        "author":     str(before.author),
+        "before":        before.content or "*[empty]*",
+        "after":         after.content  or "*[empty]*",
+        "author":        str(before.author),
         "author_avatar": str(before.author.display_avatar.url),
-        "ts":         datetime.now(timezone.utc),
+        "ts":            datetime.now(timezone.utc),
     }
 
     # Automod on edited content
     if not is_owner(before.author.id):
         await run_automod(after)
 
-    embed = discord.Embed(
-        title="✏️ Message Edited",
-        color=C_INFO, timestamp=datetime.now(timezone.utc),
-    )
+    embed = discord.Embed(title="✏️ Message Edited", color=C_INFO, timestamp=datetime.now(timezone.utc))
     embed.set_author(name=str(before.author), icon_url=before.author.display_avatar.url)
-    embed.add_field(name="Before", value=before.content[:500] or "*empty*", inline=False)
-    embed.add_field(name="After",  value=after.content[:500]  or "*empty*", inline=False)
-    embed.add_field(name="Channel", value=before.channel.mention, inline=True)
+    embed.add_field(name="Before",  value=before.content[:500] or "*empty*", inline=False)
+    embed.add_field(name="After",   value=after.content[:500]  or "*empty*", inline=False)
+    embed.add_field(name="Channel", value=before.channel.mention,            inline=True)
     embed.add_field(name="Jump",    value=f"[Jump to message]({after.jump_url})", inline=True)
     embed.set_footer(text=BOT_NAME)
     asyncio.create_task(send_log(before.guild, "message", embed))
@@ -2137,8 +2205,8 @@ async def on_member_join(member: discord.Member):
     )
     embed.set_thumbnail(url=member.display_avatar.url)
     created_ago = (datetime.now(timezone.utc) - member.created_at.replace(tzinfo=timezone.utc)).days
-    embed.add_field(name="Account Created", value=fmt_ts(member.created_at), inline=True)
-    embed.add_field(name="Account Age",     value=f"**{created_ago}** days", inline=True)
+    embed.add_field(name="Account Created", value=fmt_ts(member.created_at),    inline=True)
+    embed.add_field(name="Account Age",     value=f"**{created_ago}** days",    inline=True)
     if created_ago < 7:
         embed.add_field(name="⚠️ Warning", value="New account — possible raid member", inline=False)
     embed.add_field(name="Total Members",   value=str(member.guild.member_count), inline=True)
@@ -2157,13 +2225,14 @@ async def on_member_join(member: discord.Member):
                     description=f"**{member}** joined using invite `{inv.code}`",
                     color=C_INFO, timestamp=datetime.now(timezone.utc),
                 )
-                inv_embed.add_field(name="Inviter",     value=str(inv.inviter) if inv.inviter else "Unknown", inline=True)
-                inv_embed.add_field(name="Total Uses",  value=str(inv.uses), inline=True)
+                inv_embed.add_field(name="Inviter",    value=str(inv.inviter) if inv.inviter else "Unknown", inline=True)
+                inv_embed.add_field(name="Total Uses", value=str(inv.uses),                                  inline=True)
                 inv_embed.set_footer(text=BOT_NAME)
                 asyncio.create_task(send_log(member.guild, "invite", inv_embed))
                 break
         invite_cache[gid] = {inv.code: inv.uses for inv in new_invites}
-    except Exception: pass
+    except Exception:
+        pass
 
 
 @bot.event
@@ -2177,9 +2246,13 @@ async def on_member_remove(member: discord.Member):
     joined = member.joined_at
     if joined:
         stayed = (datetime.now(timezone.utc) - joined.replace(tzinfo=timezone.utc)).days
-        embed.add_field(name="Joined",    value=fmt_ts(joined), inline=True)
+        embed.add_field(name="Joined",     value=fmt_ts(joined),       inline=True)
         embed.add_field(name="Stayed for", value=f"**{stayed}** days", inline=True)
-    embed.add_field(name="Roles", value=", ".join(r.name for r in member.roles if r.name != "@everyone")[:500] or "None", inline=False)
+    embed.add_field(
+        name="Roles",
+        value=", ".join(r.name for r in member.roles if r.name != "@everyone")[:500] or "None",
+        inline=False,
+    )
     embed.set_footer(text=BOT_NAME)
     asyncio.create_task(send_log(member.guild, "join_leave", embed))
 
@@ -2188,7 +2261,6 @@ async def on_member_remove(member: discord.Member):
 async def on_member_update(before: discord.Member, after: discord.Member):
     guild = after.guild
 
-    # Role changes
     added_roles   = [r for r in after.roles  if r not in before.roles]
     removed_roles = [r for r in before.roles if r not in after.roles]
 
@@ -2205,7 +2277,6 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         embed.set_footer(text=BOT_NAME)
         asyncio.create_task(send_log(guild, "member", embed))
 
-    # Nickname change
     if before.nick != after.nick:
         embed = discord.Embed(
             title="✏️ Nickname Changed",
@@ -2217,7 +2288,6 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         embed.set_footer(text=BOT_NAME)
         asyncio.create_task(send_log(guild, "member", embed))
 
-    # Timeout
     if before.timed_out_until != after.timed_out_until:
         if after.timed_out_until:
             embed = discord.Embed(
@@ -2304,11 +2374,14 @@ async def on_guild_role_delete(role: discord.Role):
 @bot.event
 async def on_guild_update(before: discord.Guild, after: discord.Guild):
     changes = []
-    if before.name != after.name:           changes.append(f"Name: **{before.name}** → **{after.name}**")
+    if before.name != after.name:
+        changes.append(f"Name: **{before.name}** → **{after.name}**")
     if before.verification_level != after.verification_level:
         changes.append(f"Verification: **{before.verification_level}** → **{after.verification_level}**")
-    if before.icon != after.icon:           changes.append("Server icon changed")
-    if not changes: return
+    if before.icon != after.icon:
+        changes.append("Server icon changed")
+    if not changes:
+        return
     embed = discord.Embed(
         title="⚙️ Server Updated",
         description="\n".join(changes),
@@ -2370,14 +2443,7 @@ async def on_member_unban(guild: discord.Guild, user: discord.User):
     asyncio.create_task(send_log(guild, "mod", embed))
 
 
-@bot.event
-async def on_dm_message(msg: discord.Message):
-    if msg.author.bot: return
-    await process(msg, is_dm=True)
-
-
 # ─── COMMANDS ────────────────────────────────────────────────────────────────
-# ── .help ──────────────────────────────────────────────────────────────────
 
 @bot.command(name="help")
 async def cmd_help(ctx, section: str = ""):
@@ -2395,11 +2461,11 @@ async def cmd_help(ctx, section: str = ""):
             (f"{p}unban <user_id>",              "Unban a user by their ID."),
             (f"{p}purge [count]",                "Delete up to 500 messages (default: 10)."),
             (f"{p}slowmode [secs]",              "Set channel slowmode (0 = off)."),
-            (f"{p}lock",                         "Lock the current channel (no one can send messages)."),
+            (f"{p}lock",                         "Lock the current channel."),
             (f"{p}unlock",                       "Unlock the current channel."),
             (f"{p}lockdown",                     "Lock ALL channels in the server (emergency)."),
             (f"{p}unlockall",                    "Unlock ALL channels in the server."),
-            (f"{p}panic",                        "Emergency: instant lockdown + alerts owner."),
+            (f"{p}panic",                        "Emergency: instant lockdown + alerts."),
             (f"{p}nickname @user <name>",        "Change a member's nickname."),
             (f"{p}role add/remove @user <role>", "Add or remove a role from a user."),
             (f"{p}temprole @user <role> [hours]","Give a user a role for X hours (default: 24)."),
@@ -2407,7 +2473,8 @@ async def cmd_help(ctx, section: str = ""):
         for cmd, desc in cmds:
             embed.add_field(name=f"`{cmd}`", value=desc, inline=False)
         embed.set_footer(text=f"{BOT_NAME}  ·  Use {p}help for all categories")
-        await ctx.reply(embed=embed, mention_author=False); return
+        await ctx.reply(embed=embed, mention_author=False)
+        return
 
     if section in ("warn", "warns", "cases"):
         embed = discord.Embed(title="📋 Warn & Case Commands", color=C_WARN, timestamp=datetime.now(timezone.utc))
@@ -2418,33 +2485,36 @@ async def cmd_help(ctx, section: str = ""):
             (f"{p}clearwarn @user <case_id>","Remove a specific warning by case ID."),
             (f"{p}clearwarns @user",         "Clear ALL warnings for a user."),
             (f"{p}case <case_id>",           "Look up a specific case by ID."),
-            (f"{p}cases @user",              "View all cases (warns, mutes, kicks) for a user."),
+            (f"{p}cases @user",              "View all cases for a user."),
             (f"{p}reason <case_id> <text>",  "Edit the reason for an existing case."),
             (f"{p}appeal <case_id>",         "Submit an appeal for a punishment."),
         ]
         for cmd, desc in cmds:
             embed.add_field(name=f"`{cmd}`", value=desc, inline=False)
         embed.set_footer(text=f"{BOT_NAME}  ·  Use {p}help for all categories")
-        await ctx.reply(embed=embed, mention_author=False); return
+        await ctx.reply(embed=embed, mention_author=False)
+        return
 
     if section in ("ai", "ask"):
         embed = discord.Embed(title="🤖 AI Commands", color=C_INFO, timestamp=datetime.now(timezone.utc))
         cmds = [
-            (f"{p}ask <question>",          "Ask the AI anything (supports BedWars, moderation, research)."),
-            (f"{p}research <topic>",        "Deep research a topic (scrapes Wikipedia, BedWars wiki, DuckDuckGo)."),
+            (f"{p}ask <question>",          "Ask the AI anything (BedWars, moderation, research)."),
+            (f"{p}research <topic>",        "Deep research a topic with web sources."),
             (f"@{BOT_NAME} <message>",      "Mention or reply to the bot to chat with AI naturally."),
+            (f"DM the bot",                 "Chat privately with the AI in DMs."),
             (f"{p}mymemory",                "See what the bot remembers about you."),
             (f"{p}forgetme",                "Clear your AI memory."),
             (f"{p}setprompt <text>",        "Override the AI system prompt (owner only)."),
             (f"{p}revertprompt",            "Revert to the default AI system prompt (owner only)."),
-            (f"{p}teach <fact>",            "Teach the bot a fact to use as knowledge (owner only)."),
+            (f"{p}teach <fact>",            "Teach the bot a fact (owner only)."),
             (f"{p}knowledge",               "View all taught bot knowledge (owner only)."),
-            (f"{p}summarize [count]",       "Summarize the last N messages in chat (owner only)."),
+            (f"{p}summarize [count]",       "Summarize the last N messages (owner only)."),
         ]
         for cmd, desc in cmds:
             embed.add_field(name=f"`{cmd}`", value=desc, inline=False)
         embed.set_footer(text=f"{BOT_NAME}  ·  Use {p}help for all categories")
-        await ctx.reply(embed=embed, mention_author=False); return
+        await ctx.reply(embed=embed, mention_author=False)
+        return
 
     if section in ("eco", "economy"):
         embed = discord.Embed(title="🪙 Economy Commands", color=C_ECONOMY, timestamp=datetime.now(timezone.utc))
@@ -2461,7 +2531,8 @@ async def cmd_help(ctx, section: str = ""):
         for cmd, desc in cmds:
             embed.add_field(name=f"`{cmd}`", value=desc, inline=False)
         embed.set_footer(text=f"{BOT_NAME}  ·  Use {p}help for all categories")
-        await ctx.reply(embed=embed, mention_author=False); return
+        await ctx.reply(embed=embed, mention_author=False)
+        return
 
     if section in ("info", "util", "utility"):
         embed = discord.Embed(title="🔧 Utility Commands", color=C_INFO, timestamp=datetime.now(timezone.utc))
@@ -2477,7 +2548,7 @@ async def cmd_help(ctx, section: str = ""):
             (f"{p}lookup <id>",         "Look up any user by Discord ID."),
             (f"{p}report",              "Generate a full server analytics report."),
             (f"{p}scan",                "Deep server scan for issues and suggestions."),
-            (f"{p}afk [reason]",        "Set yourself as AFK (auto-notifies if mentioned)."),
+            (f"{p}afk [reason]",        "Set yourself as AFK."),
             (f"{p}snipe",               "Show the last deleted message in this channel."),
             (f"{p}esnipe",              "Show the last edited message in this channel."),
             (f"{p}membercount",         "Show member statistics."),
@@ -2490,7 +2561,8 @@ async def cmd_help(ctx, section: str = ""):
         for cmd, desc in cmds:
             embed.add_field(name=f"`{cmd}`", value=desc, inline=False)
         embed.set_footer(text=f"{BOT_NAME}  ·  Use {p}help for all categories")
-        await ctx.reply(embed=embed, mention_author=False); return
+        await ctx.reply(embed=embed, mention_author=False)
+        return
 
     if section in ("log", "logs", "logging"):
         embed = discord.Embed(title="📋 Logging Commands", color=C_INFO, timestamp=datetime.now(timezone.utc))
@@ -2502,7 +2574,7 @@ async def cmd_help(ctx, section: str = ""):
             "join_leave": "Member joins and leaves",
             "member":     "Role changes, nickname changes, timeouts",
             "server":     "Channel/role created/deleted, server settings changes",
-            "invite":     "Invite created, deleted, and used (who joined with which invite)",
+            "invite":     "Invite created, deleted, and used",
             "bot":        "General bot activity and status logs",
             "alerts":     "Security alerts (raids, abuse, rate limits)",
         }
@@ -2519,14 +2591,15 @@ async def cmd_help(ctx, section: str = ""):
             inline=False,
         )
         embed.set_footer(text=f"{BOT_NAME}  ·  Use {p}help for all categories")
-        await ctx.reply(embed=embed, mention_author=False); return
+        await ctx.reply(embed=embed, mention_author=False)
+        return
 
     if section in ("raid", "security"):
         embed = discord.Embed(title="🚨 Raid & Security Commands", color=C_SECURITY, timestamp=datetime.now(timezone.utc))
         cmds = [
             (f"{p}raidmode on/off/status", "Manually toggle raid mode."),
             (f"{p}forceraidscan",          "Manually trigger a raid indicator scan."),
-            (f"{p}panic",                  "Emergency lockdown — instantly locks all channels + alerts."),
+            (f"{p}panic",                  "Emergency lockdown — instantly locks all channels."),
             (f"{p}lockdown",               "Lock all channels. Use {p}unlockall to undo."),
             (f"{p}unlockall",              "Unlock all channels."),
             (f"{p}alerts #channel",        "Set the channel to receive security alerts."),
@@ -2541,19 +2614,20 @@ async def cmd_help(ctx, section: str = ""):
                 "• **Raid Detection** — Auto-lockdown if 8+ joins in 10s\n"
                 "• **Coordinated Spam** — Alerts if 4+ users send same message\n"
                 "• **Staff Abuse** — Alerts + role-strip if staff takes 8+ actions in 5min\n"
-                "• **Ghost Ping** — Detected when pings are deleted within 30s\n"
-                "• **Rate Limit Alerts** — Sent to alerts channel automatically"
+                "• **Ghost Ping** — Detected when pings are deleted within 30s"
             ),
             inline=False,
         )
         embed.set_footer(text=f"{BOT_NAME}  ·  Use {p}help for all categories")
-        await ctx.reply(embed=embed, mention_author=False); return
+        await ctx.reply(embed=embed, mention_author=False)
+        return
 
     # Main help index
     embed = discord.Embed(
         title=f"📖 {BOT_NAME} — Command Guide",
         description=(
             f"Mention or reply to me to chat with AI — I know everything about **Roblox BedWars**!\n"
+            f"You can also **DM me** directly to chat privately.\n"
             f"Use `{p}ask <question>` or `{p}research <topic>` for quick queries.\n\n"
             f"**Prefix:** `{p}` · **AI:** LLaMA 3.3 70B"
         ),
@@ -2574,6 +2648,7 @@ async def cmd_help(ctx, section: str = ""):
         name="🌟 Quick Tips",
         value=(
             f"• Mention me or reply to chat naturally\n"
+            f"• DM me for private AI conversations\n"
             f"• `{p}staffset` — configure staff roles and permissions\n"
             f"• `{p}setlog mod #channel` — set up mod logging\n"
             f"• `{p}scan` — run a full server health check\n"
@@ -2621,6 +2696,7 @@ async def cmd_botinfo(ctx):
     mem_mb = psutil.Process().memory_info().rss / 1024 / 1024
     embed  = discord.Embed(title=f"🤖 {BOT_NAME}", color=C_INFO, timestamp=datetime.now(timezone.utc))
     embed.set_thumbnail(url=bot.user.display_avatar.url)
+    active_keys = len(GROQ_KEYS) - len(_key_ratelimited)
     fields = [
         ("Library",         f"`discord.py {discord.__version__}`", True),
         ("Python",          f"`{platform.python_version()}`",       True),
@@ -2630,7 +2706,7 @@ async def cmd_botinfo(ctx):
         ("Uptime",          f"`{d}d {h}h {m}m {s}s`",              True),
         ("Servers",         f"`{len(bot.guilds)}`",                 True),
         ("Msgs Processed",  f"`{msgs_processed:,}`",                True),
-        ("Groq Keys",       f"`{len(GROQ_KEYS)} ({len(GROQ_KEYS) - len(_key_ratelimited)} active)`", True),
+        ("Groq Keys",       f"`{len(GROQ_KEYS)} ({active_keys} active)`", True),
         ("DB",              "``✅``" if _db_ok() else "``❌``",    True),
         ("AI Memories",     f"`{sum(len(v) for v in ai_memory.values())}`", True),
         ("Knowledge Facts", f"`{len(bot_knowledge)}`",             True),
@@ -2674,15 +2750,15 @@ async def cmd_serverinfo(ctx):
     owner = g.owner
     embed = discord.Embed(title=g.name, description=g.description or "", color=C_INFO, timestamp=datetime.now(timezone.utc))
     if g.icon: embed.set_thumbnail(url=g.icon.url)
-    embed.add_field(name="Owner",       value=f"{owner.mention if owner else 'Unknown'}", inline=True)
-    embed.add_field(name="ID",          value=f"`{g.id}`",                    inline=True)
-    embed.add_field(name="Created",     value=fmt_ts(g.created_at),           inline=True)
-    embed.add_field(name="Members",     value=f"**{g.member_count:,}**",       inline=True)
-    embed.add_field(name="Channels",    value=f"**{len(g.channels)}**",        inline=True)
-    embed.add_field(name="Roles",       value=f"**{len(g.roles)}**",           inline=True)
-    embed.add_field(name="Boost Level", value=f"**Level {g.premium_tier}**",   inline=True)
-    embed.add_field(name="Verification",value=f"**{g.verification_level}**",   inline=True)
-    embed.add_field(name="MFA Required",value=f"**{'Yes' if g.mfa_level else 'No'}**", inline=True)
+    embed.add_field(name="Owner",        value=f"{owner.mention if owner else 'Unknown'}", inline=True)
+    embed.add_field(name="ID",           value=f"`{g.id}`",                    inline=True)
+    embed.add_field(name="Created",      value=fmt_ts(g.created_at),           inline=True)
+    embed.add_field(name="Members",      value=f"**{g.member_count:,}**",       inline=True)
+    embed.add_field(name="Channels",     value=f"**{len(g.channels)}**",        inline=True)
+    embed.add_field(name="Roles",        value=f"**{len(g.roles)}**",           inline=True)
+    embed.add_field(name="Boost Level",  value=f"**Level {g.premium_tier}**",   inline=True)
+    embed.add_field(name="Verification", value=f"**{g.verification_level}**",   inline=True)
+    embed.add_field(name="MFA Required", value=f"**{'Yes' if g.mfa_level else 'No'}**", inline=True)
     embed.set_footer(text=BOT_NAME)
     await ctx.reply(embed=embed, mention_author=False)
 
@@ -2692,15 +2768,15 @@ async def cmd_userinfo(ctx, member: discord.Member = None):
     member = member or ctx.author
     embed  = discord.Embed(title=str(member), color=member.color or C_INFO, timestamp=datetime.now(timezone.utc))
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="ID",          value=f"`{member.id}`",           inline=True)
-    embed.add_field(name="Display Name",value=member.display_name,        inline=True)
-    embed.add_field(name="Bot",         value=str(member.bot),            inline=True)
-    embed.add_field(name="Created",     value=fmt_ts(member.created_at),  inline=True)
-    embed.add_field(name="Joined",      value=fmt_ts(member.joined_at),   inline=True)
-    embed.add_field(name="Boosting",    value=fmt_ts(member.premium_since) if member.premium_since else "No", inline=True)
+    embed.add_field(name="ID",           value=f"`{member.id}`",          inline=True)
+    embed.add_field(name="Display Name", value=member.display_name,       inline=True)
+    embed.add_field(name="Bot",          value=str(member.bot),           inline=True)
+    embed.add_field(name="Created",      value=fmt_ts(member.created_at), inline=True)
+    embed.add_field(name="Joined",       value=fmt_ts(member.joined_at),  inline=True)
+    embed.add_field(name="Boosting",     value=fmt_ts(member.premium_since) if member.premium_since else "No", inline=True)
     roles = [r.mention for r in member.roles if r.name != "@everyone"]
     embed.add_field(name=f"Roles ({len(roles)})", value=" ".join(roles[:8]) or "None", inline=False)
-    embed.add_field(name="Staff Level", value=get_staff_level(member) or "None", inline=True)
+    embed.add_field(name="Staff Level",  value=get_staff_level(member) or "None", inline=True)
     embed.set_footer(text=BOT_NAME)
     await ctx.reply(embed=embed, mention_author=False)
 
@@ -2758,10 +2834,10 @@ async def cmd_warn(ctx, member: discord.Member = None, *, reason: str = "No reas
     if is_staff(ctx.author): asyncio.create_task(record_staff_action(ctx.guild, ctx.author, "warn", member.id))
     embed = discord.Embed(title="⚠️ Warning Issued", color=C_WARN, timestamp=datetime.now(timezone.utc))
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="👤 User",   value=member.mention,          inline=True)
-    embed.add_field(name="📊 Total",  value=f"**{total}** warn(s)",   inline=True)
-    embed.add_field(name="🔖 Case",   value=f"`{entry['case_id']}`",  inline=True)
-    embed.add_field(name="📝 Reason", value=reason,                   inline=False)
+    embed.add_field(name="👤 User",   value=member.mention,         inline=True)
+    embed.add_field(name="📊 Total",  value=f"**{total}** warn(s)",  inline=True)
+    embed.add_field(name="🔖 Case",   value=f"`{entry['case_id']}`", inline=True)
+    embed.add_field(name="📝 Reason", value=reason,                  inline=False)
     embed.set_footer(text=f"{WARN_MUTE_AT} warns = auto-mute  ·  {BOT_NAME}")
     await ctx.reply(embed=embed, mention_author=False)
 
@@ -3045,8 +3121,8 @@ async def cmd_appeal(ctx, case_id: str = "", *, reason: str = ""):
         description=f"**{ctx.author.display_name}** is appealing case `{case_id}`.",
         color=C_INFO, timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(name="User",   value=ctx.author.mention,  inline=True)
-    embed.add_field(name="Case",   value=f"`{case_id}`",       inline=True)
+    embed.add_field(name="User",   value=ctx.author.mention,        inline=True)
+    embed.add_field(name="Case",   value=f"`{case_id}`",             inline=True)
     embed.add_field(name="Reason", value=reason or "No reason given", inline=False)
     embed.set_footer(text=BOT_NAME)
     asyncio.create_task(send_alerts(ctx.guild, embed))
@@ -3083,10 +3159,10 @@ async def cmd_lookup(ctx, user_id: int = 0):
     embed.add_field(name="Created", value=fmt_ts(user.created_at), inline=True)
     member = ctx.guild.get_member(user_id)
     if member:
-        embed.add_field(name="In Server", value="✅ Yes", inline=True)
+        embed.add_field(name="In Server", value="✅ Yes",          inline=True)
         embed.add_field(name="Joined",    value=fmt_ts(member.joined_at), inline=True)
     else:
-        embed.add_field(name="In Server", value="❌ No", inline=True)
+        embed.add_field(name="In Server", value="❌ No",           inline=True)
     embed.set_footer(text=BOT_NAME)
     await ctx.reply(embed=embed, mention_author=False)
 
@@ -3273,24 +3349,23 @@ async def cmd_staffset(ctx):
         title="👮 Staff Role Configuration",
         description=(
             "Below are the currently configured staff roles and their permissions.\n"
-            "To change role IDs, update your `.env` file and restart the bot.\n\n"
-            "**Current staff can use commands by having the relevant role.**"
+            "To change role IDs, update your `.env` file and restart the bot."
         ),
         color=C_STAFF, timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(
         name=f"🔰 Trial Mod — {trial_role.mention if trial_role else f'`{TRIAL_MOD_ID}`'}",
-        value="Permissions: `warn`, `mute`\nNote: Can use basic moderation only.",
+        value="Permissions: `warn`, `mute`",
         inline=False,
     )
     embed.add_field(
         name=f"⚔️ Mod — {mod_role.mention if mod_role else f'`{MOD_ID}`'}",
-        value="Permissions: `warn`, `mute`, `unmute`, `kick`, `ban`, `timeout`, `purge`, `slowmode`\nNote: Full moderation, cannot run server scans.",
+        value="Permissions: `warn`, `mute`, `unmute`, `kick`, `ban`, `timeout`, `purge`, `slowmode`",
         inline=False,
     )
     embed.add_field(
         name=f"🌟 Senior Mod — {senior_role.mention if senior_role else f'`{SENIOR_MOD_ID}`'}",
-        value="Permissions: All mod perms + `scan`, `report`, `lock`, `unlock`\nNote: Full access except owner-only commands.",
+        value="Permissions: All mod perms + `scan`, `report`, `lock`, `unlock`",
         inline=False,
     )
     embed.add_field(
@@ -3312,7 +3387,7 @@ async def cmd_staffset(ctx):
         ),
         inline=False,
     )
-    # Show current staff members
+
     trial_members  = [m.display_name for m in guild.members if trial_role  and trial_role  in m.roles]
     mod_members    = [m.display_name for m in guild.members if mod_role    and mod_role    in m.roles]
     senior_members = [m.display_name for m in guild.members if senior_role and senior_role in m.roles]
@@ -3375,7 +3450,7 @@ async def cmd_logstatus(ctx):
 
 @bot.command(name="daily")
 async def cmd_daily(ctx):
-    uid    = ctx.author.id
+    uid = ctx.author.id
     async with _get_econ_lock(uid):
         e      = get_econ(uid)
         now    = datetime.now(timezone.utc)
@@ -3409,10 +3484,10 @@ async def cmd_daily(ctx):
 
     embed = discord.Embed(title="🎁 Daily Reward", color=C_ECONOMY, timestamp=now)
     embed.set_author(name=ctx.author.display_name, icon_url=ctx.author.display_avatar.url)
-    embed.add_field(name="Reward",   value=f"**+{reward}** 🪙",                inline=True)
-    embed.add_field(name="Balance",  value=f"**{e['coins']:,}** 🪙",            inline=True)
-    embed.add_field(name="Streak",   value=f"🔥 **{streak}** day(s)",           inline=True)
-    embed.add_field(name="Rank",     value=get_rank(e["coins"]),                 inline=True)
+    embed.add_field(name="Reward",   value=f"**+{reward}** 🪙",             inline=True)
+    embed.add_field(name="Balance",  value=f"**{e['coins']:,}** 🪙",         inline=True)
+    embed.add_field(name="Streak",   value=f"🔥 **{streak}** day(s)",        inline=True)
+    embed.add_field(name="Rank",     value=get_rank(e["coins"]),              inline=True)
     embed.set_footer(text=f"Streak bonus at 3, 7, 30 days  ·  {BOT_NAME}")
     await ctx.reply(embed=embed, mention_author=False)
 
@@ -3455,10 +3530,10 @@ async def cmd_balance(ctx, member: discord.Member = None):
     e      = get_econ(member.id)
     embed  = discord.Embed(title=f"🪙 {member.display_name}'s Balance", color=C_ECONOMY, timestamp=datetime.now(timezone.utc))
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Coins",        value=f"**{e['coins']:,}** 🪙",           inline=True)
-    embed.add_field(name="Total Earned", value=f"**{e.get('total_earned',0):,}** 🪙", inline=True)
-    embed.add_field(name="Rank",         value=get_rank(e["coins"]),                 inline=True)
-    embed.add_field(name="Daily Streak", value=f"🔥 **{e.get('daily_streak', 0)}d**", inline=True)
+    embed.add_field(name="Coins",        value=f"**{e['coins']:,}** 🪙",              inline=True)
+    embed.add_field(name="Total Earned", value=f"**{e.get('total_earned',0):,}** 🪙",  inline=True)
+    embed.add_field(name="Rank",         value=get_rank(e["coins"]),                   inline=True)
+    embed.add_field(name="Daily Streak", value=f"🔥 **{e.get('daily_streak', 0)}d**",  inline=True)
     embed.set_footer(text=BOT_NAME)
     await ctx.reply(embed=embed, mention_author=False)
 
@@ -3468,7 +3543,7 @@ async def cmd_leaderboard(ctx):
     top = sorted(economy.items(), key=lambda x: x[1].get("coins", 0), reverse=True)[:10]
     if not top:
         await ctx.reply(embed=discord.Embed(description="No economy data yet.", color=C_NEUTRAL), mention_author=False); return
-    embed = discord.Embed(title="🏆 Coin Leaderboard", color=C_ECONOMY, timestamp=datetime.now(timezone.utc))
+    embed  = discord.Embed(title="🏆 Coin Leaderboard", color=C_ECONOMY, timestamp=datetime.now(timezone.utc))
     medals = ["🥇", "🥈", "🥉"] + ["🏅"] * 7
     for i, (uid, data) in enumerate(top):
         member = ctx.guild.get_member(int(uid))
@@ -3488,7 +3563,7 @@ async def cmd_pay(ctx, member: discord.Member = None, amount: int = 0):
         await ctx.reply(embed=discord.Embed(description=f"❌ Usage: `{CMD_PREFIX}pay @user <amount>`", color=C_ERROR), mention_author=False); return
     if member.id == ctx.author.id:
         await ctx.reply(embed=discord.Embed(description="❌ Can't pay yourself.", color=C_ERROR), mention_author=False); return
-    uid  = ctx.author.id
+    uid = ctx.author.id
     async with _get_econ_lock(uid):
         sender = get_econ(uid)
         if sender["coins"] < amount:
@@ -3673,17 +3748,18 @@ async def cmd_debug(ctx):
     if not is_owner(ctx.author.id): await deny(ctx); return
     mem_mb = psutil.Process().memory_info().rss / 1024 / 1024
     embed  = discord.Embed(title="🛠️ Debug Info", color=C_INFO, timestamp=datetime.now(timezone.utc))
-    embed.add_field(name="Memory Usage",    value=f"`{mem_mb:.1f} MB`",                                    inline=True)
-    embed.add_field(name="Histories",       value=f"`{len(histories)} channels`",                          inline=True)
-    embed.add_field(name="Rate Limits",     value=f"`{len(rate_limits)} users`",                           inline=True)
+    embed.add_field(name="Memory Usage",    value=f"`{mem_mb:.1f} MB`",                                              inline=True)
+    embed.add_field(name="Histories",       value=f"`{len(histories)} sessions`",                                    inline=True)
+    embed.add_field(name="Rate Limits",     value=f"`{len(rate_limits)} users`",                                     inline=True)
     embed.add_field(name="Groq Keys",       value=f"`{len(GROQ_KEYS)} total, {len(_key_ratelimited)} rate-limited`", inline=True)
-    embed.add_field(name="Economy Entries", value=f"`{len(economy)}`",                                     inline=True)
-    embed.add_field(name="Warn Records",    value=f"`{len(warns)}`",                                       inline=True)
-    embed.add_field(name="Mod Logs",        value=f"`{len(mod_logs)}`",                                    inline=True)
-    embed.add_field(name="AI Memories",     value=f"`{sum(len(v) for v in ai_memory.values())} facts`",    inline=True)
-    embed.add_field(name="Knowledge Base",  value=f"`{len(bot_knowledge)} facts`",                         inline=True)
-    embed.add_field(name="Raid Modes On",   value=f"`{sum(1 for v in raid_mode.values() if v)}`",          inline=True)
-    embed.add_field(name="Invite Cache",    value=f"`{sum(len(v) for v in invite_cache.values())} invites`", inline=True)
+    embed.add_field(name="Economy Entries", value=f"`{len(economy)}`",                                               inline=True)
+    embed.add_field(name="Warn Records",    value=f"`{len(warns)}`",                                                 inline=True)
+    embed.add_field(name="Mod Logs",        value=f"`{len(mod_logs)}`",                                              inline=True)
+    embed.add_field(name="AI Memories",     value=f"`{sum(len(v) for v in ai_memory.values())} facts`",              inline=True)
+    embed.add_field(name="Knowledge Base",  value=f"`{len(bot_knowledge)} facts`",                                   inline=True)
+    embed.add_field(name="Raid Modes On",   value=f"`{sum(1 for v in raid_mode.values() if v)}`",                    inline=True)
+    embed.add_field(name="Invite Cache",    value=f"`{sum(len(v) for v in invite_cache.values())} invites`",         inline=True)
+    embed.add_field(name="AFK Users",       value=f"`{len(afk_users)}`",                                            inline=True)
     if error_log:
         recent_err = list(error_log)[-3:]
         embed.add_field(name="Recent Errors", value="\n".join(f"`{e['ts'][:16]}` {e['err'][:60]}" for e in recent_err), inline=False)
@@ -3696,18 +3772,18 @@ async def cmd_backup(ctx):
     if not is_owner(ctx.author.id): await deny(ctx); return
 
     data = {
-        "timestamp":   datetime.now(timezone.utc).isoformat(),
-        "registry":    registry,
-        "economy":     economy,
-        "warns":       warns,
-        "log_channels": log_channels,
-        "notes":       notes,
+        "timestamp":     datetime.now(timezone.utc).isoformat(),
+        "registry":      registry,
+        "economy":       economy,
+        "warns":         warns,
+        "log_channels":  log_channels,
+        "notes":         notes,
         "bot_knowledge": bot_knowledge,
-        "mod_logs":    list(mod_logs)[-500:],
-        "ai_memory":   {k: v for k, v in list(ai_memory.items())[:100]},
+        "mod_logs":      list(mod_logs)[-500:],
+        "ai_memory":     {k: v for k, v in list(ai_memory.items())[:100]},
     }
     full_json  = json.dumps(data, indent=2, ensure_ascii=False)
-    chunk_size = 7_000_000  # 7MB per file (Discord limit = 8MB)
+    chunk_size = 7_000_000
     chunks     = [full_json[i:i+chunk_size] for i in range(0, len(full_json), chunk_size)]
 
     await ctx.reply(embed=discord.Embed(
@@ -3726,7 +3802,7 @@ async def cmd_backup(ctx):
             await ctx.send(f"❌ Failed to send part {i}: {e}")
 
 
-# ─── NEW USER GUIDE ──────────────────────────────────────────────────────────
+# ─── USER GUIDE ──────────────────────────────────────────────────────────────
 
 @bot.command(name="guide")
 async def cmd_guide(ctx):
@@ -3743,7 +3819,8 @@ async def cmd_guide(ctx):
     embed.add_field(
         name="🤖 Chatting with AI",
         value=(
-            f"Just **mention me** (`@{BOT_NAME}`) or **reply** to one of my messages to chat!\n"
+            f"**Mention me** (`@{BOT_NAME}`) or **reply** to one of my messages to chat!\n"
+            f"You can also **DM me** directly for private AI conversations.\n"
             f"I know everything about Roblox BedWars — ask me about kits, strategies, meta, and more.\n"
             f"Or use `{p}ask <question>` for a quick query."
         ),
@@ -3809,14 +3886,21 @@ async def cmd_guide(ctx):
 
 async def health_server():
     from aiohttp import web as aiohttp_web
+
     async def handle(_):
         return aiohttp_web.Response(
             text=json.dumps({
-                "status": "ok", "uptime": int(time.time() - start_time),
-                "guilds": len(bot.guilds), "msgs_processed": msgs_processed,
+                "status":         "ok",
+                "uptime":         int(time.time() - start_time),
+                "guilds":         len(bot.guilds),
+                "msgs_processed": msgs_processed,
+                "groq_keys":      len(GROQ_KEYS),
+                "groq_active":    len(GROQ_KEYS) - len(_key_ratelimited),
+                "db_connected":   _db_ok(),
             }),
             content_type="application/json",
         )
+
     app = aiohttp_web.Application()
     app.router.add_get("/", handle)
     app.router.add_get("/health", handle)
