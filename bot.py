@@ -1,8 +1,3 @@
-"""
-AJ's Assistant — Ajax Clan Discord Bot
-NexusHost-ready | Python 3.11+ | discord.py 2.x
-"""
-
 import asyncio
 import hashlib
 import io
@@ -30,16 +25,20 @@ load_dotenv()
 # CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-DISCORD_TOKEN      = os.getenv("DISCORD_TOKEN", "")
-OWNER_ID           = int(os.getenv("OWNER_ID", "0"))
-CMD_PREFIX         = os.getenv("CMD_PREFIX", ".")
-BOT_LOG_CHANNEL_ID = int(os.getenv("BOT_LOG_CHANNEL_ID", "0"))
-MONGO_URI          = os.getenv("MONGO_URI", "")
-GROQ_KEYS          = [k for k in (os.getenv(f"GROQ_KEY_{i}") for i in range(1, 11)) if k]
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
+OWNER_ID      = int(os.getenv("OWNER_ID", "0"))
+CMD_PREFIX    = os.getenv("CMD_PREFIX", ".")
+MONGO_URI     = os.getenv("MONGO_URI", "")
+
+# Load all GROQ keys from a single comma-separated env var
+GROQ_KEYS: list[str] = [k.strip() for k in os.getenv("GROQ_KEYS", "").split(",") if k.strip()]
+
+# BOT_LOG_CHANNEL_ID is set at runtime via command — starts as None
+BOT_LOG_CHANNEL_ID: int | None = None
 
 BOT_NAME  = "AJ's Assistant"
 AI_MODEL  = "llama-3.3-70b-versatile"
-BOT_COLOR = 0x5865F2  # Discord blurple as fallback
+BOT_COLOR = 0x5865F2
 
 # ── Staff Role IDs ─────────────────────────────────────────────────────────────
 TRIAL_MOD_ID  = int(os.getenv("TRIAL_MOD_ROLE_ID",  "1498712325329518803"))
@@ -57,10 +56,10 @@ ROLE_PERMS: dict[int, set[str]] = {
 # ── Thresholds ────────────────────────────────────────────────────────────────
 MAX_HIST              = 20
 MAX_PURGE             = 500
-SNIPE_EXPIRY          = 300          # seconds
-AI_COOLDOWN           = 3.0          # seconds between AI calls per user
-SPAM_THRESHOLD        = 5            # messages
-SPAM_WINDOW           = 4.0          # seconds
+SNIPE_EXPIRY          = 300
+AI_COOLDOWN           = 3.0
+SPAM_THRESHOLD        = 5
+SPAM_WINDOW           = 4.0
 AUTOMOD_MUTE_SECS     = 300
 MASS_MENTION_LIMIT    = 4
 RAID_JOIN_THRESHOLD   = 8
@@ -74,20 +73,20 @@ WARN_MUTE_AT          = 3
 AI_MEMORY_LIMIT       = 20
 AI_MEMORY_EXPIRY_DAYS = 90
 GROQ_KEY_COOLDOWN     = 5.0
-DEAD_CHAT_THRESHOLD   = 7200         # 2 hours silence → convo starter
+DEAD_CHAT_THRESHOLD   = 7200
 MSG_COINS_COOLDOWN    = 60
 WORK_COOLDOWN         = 3600
 
 # ── Economy ───────────────────────────────────────────────────────────────────
 RANKS: list[tuple[int, str]] = [
-    (0,     "💀 Penniless"),
-    (10,    "🪨 Gravel Rat"),
-    (50,    "🥉 Bronze Hoarder"),
-    (150,   "🥈 Silver Stacker"),
-    (500,   "🥇 Gold Grinder"),
-    (1_000, "💎 Diamond Hands"),
-    (5_000, "👑 Ajax Royalty"),
-    (10_000,"🌟 Ajax Legend"),
+    (0,      "💀 Penniless"),
+    (10,     "🪨 Gravel Rat"),
+    (50,     "🥉 Bronze Hoarder"),
+    (150,    "🥈 Silver Stacker"),
+    (500,    "🥇 Gold Grinder"),
+    (1_000,  "💎 Diamond Hands"),
+    (5_000,  "👑 Ajax Royalty"),
+    (10_000, "🌟 Ajax Legend"),
 ]
 WORK_LINES = [
     "served boba with a twirl and collected",
@@ -227,6 +226,7 @@ Report:         {"action":"report"}
 Scan:           {"action":"scan"}
 Web search:     {"action":"web_search_query","query":"search term"}
 Set log:        {"action":"set_log_channel","log_type":"mod","channel_name":"channel"}
+Set bot log:    {"action":"set_log_channel","log_type":"botlog","channel_name":"channel"}
 Set alerts:     {"action":"set_alerts_channel","channel_name":"channel"}
 
 RULES:
@@ -254,8 +254,8 @@ SCAM_RE = re.compile(
     r"airdrop|crypto\s*giveaway)\b",
     re.IGNORECASE,
 )
-NSFW_RE   = re.compile(r"\b(porn|nude|naked|onlyfans|xxx|hentai|nsfw)\b", re.IGNORECASE)
-SLUR_RE   = re.compile(
+NSFW_RE  = re.compile(r"\b(porn|nude|naked|onlyfans|xxx|hentai|nsfw)\b", re.IGNORECASE)
+SLUR_RE  = re.compile(
     r"\b(n[i1!|]+gg[e3]r[s]?|f[4@]gg[o0]t[s]?|r[e3]t[4@]rd[s]?|"
     r"k[i1]+ke[s]?|sp[i1]+c[s]?|ch[i1]+nk[s]?)\b"
     r"|n[\W_]*[i1!|][\W_]*g[\W_]*g",
@@ -375,8 +375,8 @@ similar_msg_tracker: dict = defaultdict(lambda: defaultdict(list))
 raid_joins:          dict = defaultdict(list)
 raid_mode:           dict = {}
 ghostping_cache:     dict = {}
-last_activity:       dict = {}   # guild_id → float timestamp
-dead_chat_sent:      dict = {}   # guild_id → float timestamp
+last_activity:       dict = {}
+dead_chat_sent:      dict = {}
 
 ai_memory:   dict  = {}
 histories:   dict  = defaultdict(list)
@@ -405,12 +405,12 @@ async def _upsert(collection: str, key: dict, data: dict) -> None:
     except Exception as exc:
         log.error(f"DB upsert [{collection}]: {exc}")
 
-async def db_save_user(uid: str)         -> None: await _upsert("registry",    {"uid": uid},             registry.get(uid, {}))
-async def db_save_economy(uid: str)      -> None: await _upsert("economy",     {"uid": uid},             {"uid": uid, **(economy.get(uid, {}))})
-async def db_save_warns(uid: str)        -> None: await _upsert("warns",       {"uid": uid},             {"uid": uid, "warns": warns.get(uid, [])})
-async def db_save_log_channels(gid: str) -> None: await _upsert("log_channels",{"guild_id": gid},        {"guild_id": gid, "channels": log_channels.get(gid, {})})
-async def db_save_ai_memory(uid: str)    -> None: await _upsert("ai_memory",   {"uid": uid},             {"uid": uid, "facts": ai_memory.get(uid, [])})
-async def db_save_notes(uid: str)        -> None: await _upsert("notes",       {"uid": uid},             {"uid": uid, "notes": notes.get(uid, [])})
+async def db_save_user(uid: str)         -> None: await _upsert("registry",     {"uid": uid},      registry.get(uid, {}))
+async def db_save_economy(uid: str)      -> None: await _upsert("economy",      {"uid": uid},      {"uid": uid, **(economy.get(uid, {}))})
+async def db_save_warns(uid: str)        -> None: await _upsert("warns",        {"uid": uid},      {"uid": uid, "warns": warns.get(uid, [])})
+async def db_save_log_channels(gid: str) -> None: await _upsert("log_channels", {"guild_id": gid}, {"guild_id": gid, "channels": log_channels.get(gid, {})})
+async def db_save_ai_memory(uid: str)    -> None: await _upsert("ai_memory",    {"uid": uid},      {"uid": uid, "facts": ai_memory.get(uid, [])})
+async def db_save_notes(uid: str)        -> None: await _upsert("notes",        {"uid": uid},      {"uid": uid, "notes": notes.get(uid, [])})
 
 async def db_save_meta(key: str, data: dict) -> None:
     if not _db_ok():
@@ -421,7 +421,7 @@ async def db_save_meta(key: str, data: dict) -> None:
         log.error(f"DB meta [{key}]: {exc}")
 
 async def db_load() -> None:
-    global custom_prompt, prompt_history
+    global custom_prompt, prompt_history, BOT_LOG_CHANNEL_ID
     if not _db_ok():
         return
     try:
@@ -438,7 +438,7 @@ async def db_load() -> None:
         async for doc in _col("notes").find({}, {"_id": 0}):
             notes[doc["uid"]] = doc.get("notes", [])
 
-        for meta_id in ("mod_logs", "dm_logs", "prompt", "bot_knowledge", "tempbans", "temproles"):
+        for meta_id in ("mod_logs", "dm_logs", "prompt", "bot_knowledge", "tempbans", "temproles", "botlog_channel"):
             doc = await _col("meta").find_one({"_id": meta_id})
             if not doc:
                 continue
@@ -455,6 +455,10 @@ async def db_load() -> None:
                 tempbans.update(doc.get("data", {}))
             elif meta_id == "temproles":
                 temproles.update(doc.get("data", {}))
+            elif meta_id == "botlog_channel":
+                saved = doc.get("channel_id")
+                if saved:
+                    BOT_LOG_CHANNEL_ID = int(saved)
 
         log.info(f"Loaded {len(registry)} users | {len(warns)} warn records | {len(economy)} economy entries.")
     except Exception as exc:
@@ -493,9 +497,15 @@ async def send_alerts(guild: discord.Guild | None, embed: discord.Embed) -> None
 # ══════════════════════════════════════════════════════════════════════════════
 
 _LOG_COLORS = {
-    "info": C_INFO, "warn": C_WARN, "error": C_ERROR, "mod": C_MOD,
-    "security": C_SECURITY, "shutdown": C_SHUTDOWN, "startup": C_STARTUP,
-    "automod": C_SECURITY, "staff": C_STAFF,
+    "info":     C_INFO,
+    "warn":     C_WARN,
+    "error":    C_ERROR,
+    "mod":      C_MOD,
+    "security": C_SECURITY,
+    "shutdown": C_SHUTDOWN,
+    "startup":  C_STARTUP,
+    "automod":  C_SECURITY,
+    "staff":    C_STAFF,
 }
 
 async def bot_log(
@@ -674,11 +684,11 @@ async def add_warn(
     uid     = str(member.id)
     case_id = f"W{int(time.time())}{random.randint(10, 99)}"
     entry   = {
-        "case_id": case_id,
-        "reason":  reason,
-        "by":      str(getattr(by, "id", by)),
-        "by_name": getattr(by, "name", str(by)),
-        "ts":      datetime.now(timezone.utc).isoformat(),
+        "case_id":  case_id,
+        "reason":   reason,
+        "by":       str(getattr(by, "id", by)),
+        "by_name":  getattr(by, "name", str(by)),
+        "ts":       datetime.now(timezone.utc).isoformat(),
         "guild_id": str(guild.id),
     }
     warns.setdefault(uid, []).append(entry)
@@ -740,9 +750,9 @@ async def record_staff_action(
             timestamp=datetime.now(timezone.utc),
         )
         embed.add_field(name="Role",            value=get_staff_level(staff_member) or "Unknown", inline=True)
-        embed.add_field(name="Actions (5 min)", value=str(total_recent), inline=True)
-        embed.add_field(name="Max vs 1 User",   value=str(max_target),   inline=True)
-        embed.add_field(name="Last Action",     value=action,            inline=True)
+        embed.add_field(name="Actions (5 min)", value=str(total_recent),                          inline=True)
+        embed.add_field(name="Max vs 1 User",   value=str(max_target),                            inline=True)
+        embed.add_field(name="Last Action",     value=action,                                     inline=True)
         embed.set_footer(text=BOT_NAME)
         asyncio.create_task(send_alerts(guild, embed))
         asyncio.create_task(bot_log(
@@ -783,11 +793,11 @@ async def run_automod(msg: discord.Message) -> bool:
     if member.guild_permissions.administrator:
         return False
 
-    content  = msg.content
-    clean    = _ZERO_WIDTH.sub("", content)
-    uid      = msg.author.id
-    gid      = str(msg.guild.id)
-    now_ts   = time.time()
+    content = msg.content
+    clean   = _ZERO_WIDTH.sub("", content)
+    uid     = msg.author.id
+    gid     = str(msg.guild.id)
+    now_ts  = time.time()
 
     async def _punish(reason: str, log_title: str, mute: bool = False) -> None:
         try:
@@ -816,10 +826,10 @@ async def run_automod(msg: discord.Message) -> bool:
                 pass
         log_embed = discord.Embed(title=f"🤖 {log_title}", color=C_SECURITY, timestamp=datetime.now(timezone.utc))
         log_embed.set_author(name=str(msg.author), icon_url=msg.author.display_avatar.url)
-        log_embed.add_field(name="📍 Channel", value=msg.channel.mention,       inline=True)
-        log_embed.add_field(name="⚡ Action",  value="Muted" if mute else "Warned", inline=True)
-        log_embed.add_field(name="📋 Reason",  value=reason,                    inline=False)
-        log_embed.add_field(name="💬 Content", value=(content[:400] or "*empty*"), inline=False)
+        log_embed.add_field(name="📍 Channel", value=msg.channel.mention,            inline=True)
+        log_embed.add_field(name="⚡ Action",  value="Muted" if mute else "Warned",  inline=True)
+        log_embed.add_field(name="📋 Reason",  value=reason,                         inline=False)
+        log_embed.add_field(name="💬 Content", value=(content[:400] or "*empty*"),   inline=False)
         log_embed.set_footer(text=BOT_NAME)
         asyncio.create_task(send_log(msg.guild, "automod", log_embed))
         asyncio.create_task(send_log(msg.guild, "mod",     log_embed))
@@ -1119,13 +1129,13 @@ async def web_search(query: str, deep: bool = False) -> str:
             )
             async with session.get(bw_url, timeout=aiohttp.ClientTimeout(total=7)) as r:
                 if r.status == 200:
-                    data  = await r.json(content_type=None)
-                    hits  = data.get("query", {}).get("search", [])
+                    data = await r.json(content_type=None)
+                    hits = data.get("query", {}).get("search", [])
                     if hits:
                         titles = [h["title"] for h in hits[:4]]
                         results.append(f"🎮 **BedWars Wiki:** {', '.join(titles)}")
                         if deep and hits:
-                            page = quote_plus(hits[0]["title"])
+                            page     = quote_plus(hits[0]["title"])
                             page_url = (
                                 f"https://roblox-bedwars.fandom.com/api.php"
                                 f"?action=query&prop=extracts&exintro=true&titles={page}&format=json"
@@ -1149,7 +1159,7 @@ async def web_search(query: str, deep: bool = False) -> str:
 async def call_ai(history: list, system: str | None = None) -> str:
     global msgs_processed
     if not GROQ_KEYS:
-        return '{"action":"chat","message":"AI is not configured — no GROQ keys set."}'
+        return '{"action":"chat","message":"AI is not configured — no GROQ keys found. Set the GROQ_KEYS environment variable."}'
 
     clean       = [m for m in history if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
     sys_content = system or (custom_prompt or BASE_PROMPT)
@@ -1190,7 +1200,7 @@ async def call_ai(history: list, system: str | None = None) -> str:
         except Exception as exc:
             err = str(exc)
             if "rate_limit" in err.lower() or "429" in err:
-                log.warning("Groq key rate-limited (429), cooling 60s.")
+                log.warning(f"Groq key rate-limited (429), cooling 60s.")
                 _key_ratelimited.add(key)
                 asyncio.create_task(_unblock_key_after(key, 60))
                 continue
@@ -1216,7 +1226,7 @@ async def call_ai(history: list, system: str | None = None) -> str:
             error_log.append({"ts": datetime.now(timezone.utc).isoformat(), "err": str(exc)[:200]})
             continue
 
-    return '{"action":"chat","message":"All AI keys are busy. Please try again in a moment! 🔄"}'
+    return '{"action":"chat","message":"All AI keys are busy or rate-limited. Please try again in a moment! 🔄"}'
 
 async def _unblock_key_after(key: str, seconds: int) -> None:
     await asyncio.sleep(seconds)
@@ -1457,6 +1467,8 @@ async def process(
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def execute_action(msg: discord.Message, data: dict) -> str | None:
+    global BOT_LOG_CHANNEL_ID
+
     guild  = msg.guild
     author = msg.author
     action = data.get("action", "chat")
@@ -1468,10 +1480,17 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
     if action == "set_log_channel":
         if not guild: return "Server only."
         log_type = data.get("log_type", "").lower()
-        if log_type not in LOG_TYPES:
-            return f"❌ Invalid log type. Valid: `{', '.join(sorted(LOG_TYPES))}`"
         ch = resolve_channel(guild, data.get("channel_name", ""))
-        if not ch: return f"❌ Channel not found."
+        if not ch: return "❌ Channel not found."
+
+        # Special: bot log channel (global, persisted to DB)
+        if log_type == "botlog":
+            BOT_LOG_CHANNEL_ID = ch.id
+            asyncio.create_task(db_save_meta("botlog_channel", {"channel_id": str(ch.id)}))
+            return f"✅ Bot log channel set to {ch.mention} — I'll send startup/shutdown/security logs there."
+
+        if log_type not in LOG_TYPES:
+            return f"❌ Invalid log type. Valid: `botlog`, `{', '.join(sorted(LOG_TYPES))}`"
         log_channels.setdefault(str(guild.id), {})[log_type] = str(ch.id)
         asyncio.create_task(db_save_log_channels(str(guild.id)))
         return f"✅ **{log_type}** logs → {ch.mention}"
@@ -1511,7 +1530,7 @@ async def execute_action(msg: discord.Message, data: dict) -> str | None:
             if is_staff(author): asyncio.create_task(record_staff_action(guild, author, "mute", member.id))
             asyncio.create_task(bot_log("🔇 Muted", f"**{member}** for {secs // 60}m — {reason}", level="mod", guild=guild))
             embed = discord.Embed(title="🔇 Member Muted", color=C_ERROR, timestamp=datetime.now(timezone.utc))
-            embed.add_field(name="User",     value=member.mention,                inline=True)
+            embed.add_field(name="User",     value=member.mention,                 inline=True)
             embed.add_field(name="Duration", value=f"{secs // 60}m {secs % 60}s", inline=True)
             embed.add_field(name="By",       value=str(author),                   inline=True)
             embed.add_field(name="Reason",   value=reason,                        inline=False)
@@ -1867,10 +1886,10 @@ def _build_whois(tgt: discord.Member, guild: discord.Guild) -> str:
     return "\n".join(lines)
 
 def _build_report(guild: discord.Guild) -> str:
-    now      = datetime.now(timezone.utc)
-    gid      = str(guild.id)
-    week_ago = (now - timedelta(days=7)).isoformat()
-    month_ago= (now - timedelta(days=30)).isoformat()
+    now       = datetime.now(timezone.utc)
+    gid       = str(guild.id)
+    week_ago  = (now - timedelta(days=7)).isoformat()
+    month_ago = (now - timedelta(days=30)).isoformat()
 
     top = sorted(
         [(k, v) for k, v in activity.items() if (v.get("last") or "") >= week_ago],
@@ -1881,10 +1900,10 @@ def _build_report(guild: discord.Guild) -> str:
         f"{guild.get_member(int(k)).display_name if guild.get_member(int(k)) else k} ({v['count']})"
         for k, v in top
     ]
-    inactive    = sum(1 for v in activity.values() if (v.get("last") or "") < month_ago)
-    recent_mod  = len([e for e in mod_logs if e.get("ts", "") >= week_ago])
-    richest     = sorted(economy.items(), key=lambda x: x[1].get("coins", 0), reverse=True)[:3]
-    rich_names  = [
+    inactive   = sum(1 for v in activity.values() if (v.get("last") or "") < month_ago)
+    recent_mod = len([e for e in mod_logs if e.get("ts", "") >= week_ago])
+    richest    = sorted(economy.items(), key=lambda x: x[1].get("coins", 0), reverse=True)[:3]
+    rich_names = [
         f"{guild.get_member(int(k)).display_name if guild.get_member(int(k)) else k} — {v.get('coins', 0):,} 🪙"
         for k, v in richest
     ]
@@ -2069,11 +2088,12 @@ async def on_ready() -> None:
     await db_init()
     await db_load()
 
+    # Initialise Groq clients for every key
     for key in GROQ_KEYS:
         groq_clients[key] = AsyncGroq(api_key=key)
 
     if not GROQ_KEYS:
-        log.warning("No GROQ_KEY_x set — AI features disabled!")
+        log.warning("No GROQ_KEYS set — AI features disabled! Set GROQ_KEYS=key1,key2,... in env vars.")
     else:
         log.info(f"{len(GROQ_KEYS)} Groq key(s) loaded.")
 
@@ -2127,7 +2147,6 @@ async def on_close() -> None:
 
 
 async def _broadcast_log(embed: discord.Embed) -> None:
-    """Send an embed to BOT_LOG_CHANNEL_ID and per-guild 'bot' log channels."""
     sent_ids: set[int] = set()
     if BOT_LOG_CHANNEL_ID:
         ch = bot.get_channel(BOT_LOG_CHANNEL_ID)
@@ -2199,10 +2218,10 @@ async def on_message(msg: discord.Message) -> None:
     last_ts = e.get("last_message_ts") or 0
     if now_ts - last_ts >= MSG_COINS_COOLDOWN:
         earned = random.randint(1, 3)
-        e["coins"]           += earned
-        e["total_earned"]    += earned
-        e["messages_counted"] = e.get("messages_counted", 0) + 1
-        e["last_message_ts"]  = now_ts
+        e["coins"]            += earned
+        e["total_earned"]     += earned
+        e["messages_counted"]  = e.get("messages_counted", 0) + 1
+        e["last_message_ts"]   = now_ts
         asyncio.create_task(save_econ(uid))
 
     # AFK mention notification
@@ -2240,7 +2259,7 @@ async def on_message(msg: discord.Message) -> None:
         except Exception:
             pass
 
-    # AutoMod
+    # AutoMod (skip for owner)
     if not is_owner(msg.author.id):
         if await run_automod(msg):
             return
@@ -2248,7 +2267,7 @@ async def on_message(msg: discord.Message) -> None:
     # Prefix commands
     await bot.process_commands(msg)
 
-    # AI trigger: mention or reply
+    # AI trigger: mention or reply to bot
     if bot.user in msg.mentions or (
         msg.reference
         and msg.reference.resolved
@@ -2354,8 +2373,8 @@ async def on_member_join(member: discord.Member) -> None:
         timestamp=datetime.now(timezone.utc),
     )
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Account Created", value=fmt_ts(member.created_at),   inline=True)
-    embed.add_field(name="Account Age",     value=f"**{created_ago}** days",   inline=True)
+    embed.add_field(name="Account Created", value=fmt_ts(member.created_at),      inline=True)
+    embed.add_field(name="Account Age",     value=f"**{created_ago}** days",      inline=True)
     embed.add_field(name="Total Members",   value=str(member.guild.member_count), inline=True)
     if created_ago < 7:
         embed.add_field(name="⚠️ Warning", value="New account — possible raid member", inline=False)
@@ -2530,7 +2549,7 @@ async def on_member_unban(guild: discord.Guild, user: discord.User) -> None:
 
 @bot.command(name="help")
 async def cmd_help(ctx: commands.Context, section: str = "") -> None:
-    p = CMD_PREFIX
+    p       = CMD_PREFIX
     section = section.lower()
 
     if section in ("mod", "moderation"):
@@ -2561,15 +2580,15 @@ async def cmd_help(ctx: commands.Context, section: str = "") -> None:
     if section in ("warn", "warns", "cases"):
         embed = discord.Embed(title="📋 Warn & Case Commands", color=C_WARN, timestamp=datetime.now(timezone.utc))
         for cmd, desc in [
-            (f"{p}warn @user [reason]",      "Issue a warning."),
-            (f"{p}warns @user",              "View a user's warnings."),
-            (f"{p}mywarns",                  "View your own warnings."),
-            (f"{p}clearwarn @user <case_id>","Remove a specific warning by case ID."),
-            (f"{p}clearwarns @user",         "Clear ALL warnings for a user."),
-            (f"{p}case <case_id>",           "Look up a case by ID."),
-            (f"{p}cases @user",              "View all cases for a user."),
-            (f"{p}reason <case_id> <text>",  "Edit a case reason."),
-            (f"{p}appeal <case_id> [reason]","Submit an appeal."),
+            (f"{p}warn @user [reason]",       "Issue a warning."),
+            (f"{p}warns @user",               "View a user's warnings."),
+            (f"{p}mywarns",                   "View your own warnings."),
+            (f"{p}clearwarn @user <case_id>", "Remove a specific warning by case ID."),
+            (f"{p}clearwarns @user",          "Clear ALL warnings for a user."),
+            (f"{p}case <case_id>",            "Look up a case by ID."),
+            (f"{p}cases @user",               "View all cases for a user."),
+            (f"{p}reason <case_id> <text>",   "Edit a case reason."),
+            (f"{p}appeal <case_id> [reason]", "Submit an appeal."),
         ]:
             embed.add_field(name=f"`{cmd}`", value=desc, inline=False)
         embed.set_footer(text=f"{BOT_NAME} · {p}help for all categories")
@@ -2616,24 +2635,24 @@ async def cmd_help(ctx: commands.Context, section: str = "") -> None:
     if section in ("info", "util", "utility"):
         embed = discord.Embed(title="🔧 Utility Commands", color=C_INFO, timestamp=datetime.now(timezone.utc))
         for cmd, desc in [
-            (f"{p}whois [@user]",       "Detailed user profile."),
-            (f"{p}userinfo [@user]",    "Quick user info card."),
-            (f"{p}serverinfo",          "Server info overview."),
-            (f"{p}notes @user",         "View staff notes on a user."),
-            (f"{p}addnote @user <note>","Add a staff note."),
-            (f"{p}modlogs [@user]",     "View moderation logs."),
-            (f"{p}history @user",       "View message activity."),
-            (f"{p}investigate @user",   "AI deep investigation."),
-            (f"{p}lookup <id>",         "Look up any user by ID."),
-            (f"{p}report",              "Generate server analytics report."),
-            (f"{p}scan",                "Deep server health scan."),
-            (f"{p}afk [reason]",        "Set yourself as AFK."),
-            (f"{p}snipe",               "Show last deleted message."),
-            (f"{p}esnipe",              "Show last edited message."),
-            (f"{p}membercount",         "Member statistics."),
-            (f"{p}uptime",              "Bot uptime."),
-            (f"{p}botinfo",             "Detailed bot stats."),
-            (f"{p}ping",                "Check latency."),
+            (f"{p}whois [@user]",        "Detailed user profile."),
+            (f"{p}userinfo [@user]",     "Quick user info card."),
+            (f"{p}serverinfo",           "Server info overview."),
+            (f"{p}notes @user",          "View staff notes on a user."),
+            (f"{p}addnote @user <note>", "Add a staff note."),
+            (f"{p}modlogs [@user]",      "View moderation logs."),
+            (f"{p}history @user",        "View message activity."),
+            (f"{p}investigate @user",    "AI deep investigation."),
+            (f"{p}lookup <id>",          "Look up any user by ID."),
+            (f"{p}report",               "Generate server analytics report."),
+            (f"{p}scan",                 "Deep server health scan."),
+            (f"{p}afk [reason]",         "Set yourself as AFK."),
+            (f"{p}snipe",                "Show last deleted message."),
+            (f"{p}esnipe",               "Show last edited message."),
+            (f"{p}membercount",          "Member statistics."),
+            (f"{p}uptime",               "Bot uptime."),
+            (f"{p}botinfo",              "Detailed bot stats."),
+            (f"{p}ping",                 "Check latency."),
         ]:
             embed.add_field(name=f"`{cmd}`", value=desc, inline=False)
         embed.set_footer(text=f"{BOT_NAME} · {p}help for all categories")
@@ -2644,11 +2663,13 @@ async def cmd_help(ctx: commands.Context, section: str = "") -> None:
         embed = discord.Embed(title="📋 Logging Setup", color=C_INFO, timestamp=datetime.now(timezone.utc))
         for cmd, desc in [
             (f"{p}setlog <type> #channel", "Set a log channel."),
+            (f"{p}setbotlog #channel",     "Set the global bot log channel (startup/security)."),
             (f"{p}alerts #channel",        "Set the security alerts channel."),
             (f"{p}logstatus",              "View all configured log channels."),
         ]:
             embed.add_field(name=f"`{cmd}`", value=desc, inline=False)
         types_info = {
+            "botlog":     "Bot startup, shutdown, security (global)",
             "mod":        "Warns, mutes, kicks, bans, purges",
             "automod":    "AutoMod deleted messages and flags",
             "message":    "Deleted and edited messages",
@@ -2657,7 +2678,7 @@ async def cmd_help(ctx: commands.Context, section: str = "") -> None:
             "member":     "Role changes, nicknames, timeouts",
             "server":     "Channel/role changes, server settings",
             "invite":     "Invite create/delete/use",
-            "bot":        "Bot status and activity",
+            "bot":        "Per-guild bot activity",
             "alerts":     "Security alerts (raids, abuse)",
         }
         embed.add_field(
@@ -2712,7 +2733,7 @@ async def cmd_help(ctx: commands.Context, section: str = "") -> None:
         ("🤖 AI & Research", f"`{p}help ai`",        "ask, research, teach, setprompt, memory..."),
         ("🪙 Economy",       f"`{p}help eco`",       "daily, work, balance, leaderboard, pay..."),
         ("🔧 Utility",       f"`{p}help util`",      "whois, serverinfo, notes, snipe, investigate..."),
-        ("📋 Logging",       f"`{p}help logs`",      "setlog, alerts, logstatus (10 log types)..."),
+        ("📋 Logging",       f"`{p}help logs`",      "setlog, setbotlog, alerts, logstatus..."),
         ("🚨 Security",      f"`{p}help security`",  "raidmode, panic, stafflogs, staffset..."),
     ]:
         embed.add_field(name=f"{name} — {cmd}", value=desc, inline=False)
@@ -2721,9 +2742,11 @@ async def cmd_help(ctx: commands.Context, section: str = "") -> None:
         value=(
             f"• Mention me or reply to any of my messages to chat\n"
             f"• DM me for private AI conversations\n"
+            f"• `{p}setbotlog #channel` — set bot log channel (just ask me too!)\n"
             f"• `{p}setlog mod #channel` — set up mod logging\n"
             f"• `{p}scan` — full server health check\n"
-            f"• `{p}research <topic>` — deep AI research with web sources"
+            f"• `{p}research <topic>` — deep AI research with web sources\n"
+            f"• `{p}debug` — owner-only diagnostics"
         ),
         inline=False,
     )
@@ -2762,11 +2785,16 @@ async def cmd_uptime(ctx: commands.Context) -> None:
 
 @bot.command(name="botinfo")
 async def cmd_botinfo(ctx: commands.Context) -> None:
-    import psutil
+    try:
+        import psutil
+        mem_mb = psutil.Process().memory_info().rss / 1024 / 1024
+        mem_str = f"`{mem_mb:.1f} MB`"
+    except ImportError:
+        mem_str = "`psutil not installed`"
+
     up   = int(time.time() - start_time)
     d, h = divmod(up, 86400); h, m = divmod(h, 3600); m, s = divmod(m, 60)
-    mem_mb = psutil.Process().memory_info().rss / 1024 / 1024
-    embed  = discord.Embed(title=f"🤖 {BOT_NAME}", color=C_INFO, timestamp=datetime.now(timezone.utc))
+    embed = discord.Embed(title=f"🤖 {BOT_NAME}", color=C_INFO, timestamp=datetime.now(timezone.utc))
     embed.set_thumbnail(url=bot.user.display_avatar.url)
     active_keys = len(GROQ_KEYS) - len(_key_ratelimited)
     for name, value, inline in [
@@ -2774,16 +2802,17 @@ async def cmd_botinfo(ctx: commands.Context) -> None:
         ("Python",         f"`{platform.python_version()}`",                  True),
         ("AI Model",       f"`{AI_MODEL}`",                                   True),
         ("Ping",           f"`{round(bot.latency * 1000)}ms`",                True),
-        ("Memory",         f"`{mem_mb:.1f} MB`",                              True),
+        ("Memory",         mem_str,                                            True),
         ("Uptime",         f"`{d}d {h}h {m}m {s}s`",                         True),
         ("Servers",        f"`{len(bot.guilds)}`",                            True),
         ("Msgs Processed", f"`{msgs_processed:,}`",                           True),
         ("Groq Keys",      f"`{len(GROQ_KEYS)} ({active_keys} active)`",      True),
-        ("Database",       "✅" if _db_ok() else "❌",                        True),
-        ("AI Memories",    f"`{sum(len(v) for v in ai_memory.values())}`",     True),
+        ("Database",       "✅" if _db_ok() else "❌ Not connected",          True),
+        ("AI Memories",    f"`{sum(len(v) for v in ai_memory.values())}`",    True),
         ("Knowledge",      f"`{len(bot_knowledge)} facts`",                   True),
         ("AutoMod",        "`✅ Active`",                                     True),
         ("Raid Mode",      f"`{'🚨 ON' if any(raid_mode.values()) else '✅ Off'}`", True),
+        ("Bot Log Ch",     f"`{'Set ✅' if BOT_LOG_CHANNEL_ID else 'Not set — ask me!'}`", True),
     ]:
         embed.add_field(name=name, value=value, inline=inline)
     embed.set_footer(text=BOT_NAME)
@@ -2793,7 +2822,7 @@ async def cmd_botinfo(ctx: commands.Context) -> None:
 @bot.command(name="membercount")
 async def cmd_membercount(ctx: commands.Context) -> None:
     if not ctx.guild: return
-    g = ctx.guild
+    g       = ctx.guild
     humans  = sum(1 for m in g.members if not m.bot)
     bots_c  = sum(1 for m in g.members if m.bot)
     online  = sum(1 for m in g.members if m.status == discord.Status.online)
@@ -2802,13 +2831,13 @@ async def cmd_membercount(ctx: commands.Context) -> None:
     offline = sum(1 for m in g.members if m.status == discord.Status.offline)
     embed = discord.Embed(title=f"👥 {g.name} — Members", color=C_INFO, timestamp=datetime.now(timezone.utc))
     if g.icon: embed.set_thumbnail(url=g.icon.url)
-    embed.add_field(name="Total",      value=f"**{g.member_count:,}**",  inline=True)
-    embed.add_field(name="👤 Humans",  value=f"**{humans:,}**",          inline=True)
-    embed.add_field(name="🤖 Bots",    value=f"**{bots_c:,}**",          inline=True)
-    embed.add_field(name="🟢 Online",  value=f"**{online:,}**",          inline=True)
-    embed.add_field(name="🟡 Idle",    value=f"**{idle:,}**",            inline=True)
-    embed.add_field(name="🔴 DnD",     value=f"**{dnd:,}**",             inline=True)
-    embed.add_field(name="⚫ Offline", value=f"**{offline:,}**",         inline=True)
+    embed.add_field(name="Total",      value=f"**{g.member_count:,}**", inline=True)
+    embed.add_field(name="👤 Humans",  value=f"**{humans:,}**",         inline=True)
+    embed.add_field(name="🤖 Bots",    value=f"**{bots_c:,}**",         inline=True)
+    embed.add_field(name="🟢 Online",  value=f"**{online:,}**",         inline=True)
+    embed.add_field(name="🟡 Idle",    value=f"**{idle:,}**",           inline=True)
+    embed.add_field(name="🔴 DnD",     value=f"**{dnd:,}**",            inline=True)
+    embed.add_field(name="⚫ Offline", value=f"**{offline:,}**",        inline=True)
     embed.add_field(name="🚀 Boosts",  value=f"**Level {g.premium_tier}** ({g.premium_subscription_count})", inline=True)
     embed.set_footer(text=BOT_NAME)
     await ctx.reply(embed=embed, mention_author=False)
@@ -2900,8 +2929,7 @@ async def cmd_afk(ctx: commands.Context, *, reason: str = "AFK") -> None:
 
 @bot.command(name="warn")
 async def cmd_warn(ctx: commands.Context, member: discord.Member = None, *, reason: str = "No reason provided") -> None:
-    if not _can_mod(ctx, "warn"):
-        await deny(ctx); return
+    if not _can_mod(ctx, "warn"): await deny(ctx); return
     if not member:
         await ctx.reply(embed=discord.Embed(description=f"❌ Usage: `{CMD_PREFIX}warn @user [reason]`", color=C_ERROR), mention_author=False); return
     if member.bot:
@@ -3206,9 +3234,9 @@ async def cmd_lookup(ctx: commands.Context, user_id: int = 0) -> None:
         await ctx.reply(embed=discord.Embed(description=f"❌ User `{user_id}` not found.", color=C_ERROR), mention_author=False); return
     embed = discord.Embed(title=str(user), color=C_INFO, timestamp=datetime.now(timezone.utc))
     embed.set_thumbnail(url=user.display_avatar.url)
-    embed.add_field(name="ID",      value=f"`{user.id}`",         inline=True)
-    embed.add_field(name="Bot",     value=str(user.bot),           inline=True)
-    embed.add_field(name="Created", value=fmt_ts(user.created_at), inline=True)
+    embed.add_field(name="ID",        value=f"`{user.id}`",         inline=True)
+    embed.add_field(name="Bot",       value=str(user.bot),           inline=True)
+    embed.add_field(name="Created",   value=fmt_ts(user.created_at), inline=True)
     member = ctx.guild.get_member(user_id)
     embed.add_field(name="In Server", value="✅ Yes" if member else "❌ No", inline=True)
     if member:
@@ -3246,7 +3274,10 @@ async def cmd_history(ctx: commands.Context, member: discord.Member = None) -> N
     embed.add_field(name="Last Active",    value=fmt_ts(datetime.fromisoformat(act["last"])) if act.get("last") else "Never", inline=True)
     if act.get("channels"):
         top_chs = sorted(act["channels"].items(), key=lambda x: x[1], reverse=True)[:5]
-        ch_lines = [f"{'#' + (ctx.guild.get_channel(int(cid)).name if ctx.guild.get_channel(int(cid)) else cid)}: **{count}**" for cid, count in top_chs]
+        ch_lines = [
+            f"{'#' + (ctx.guild.get_channel(int(cid)).name if ctx.guild.get_channel(int(cid)) else cid)}: **{count}**"
+            for cid, count in top_chs
+        ]
         embed.add_field(name="Top Channels", value="\n".join(ch_lines), inline=False)
     embed.set_footer(text=BOT_NAME)
     await ctx.reply(embed=embed, mention_author=False)
@@ -3367,9 +3398,9 @@ async def cmd_staffset(ctx: commands.Context) -> None:
     mod_role    = guild.get_role(MOD_ID)
     senior_role = guild.get_role(SENIOR_MOD_ID)
     embed = discord.Embed(title="👮 Staff Role Configuration", color=C_STAFF, timestamp=datetime.now(timezone.utc))
-    embed.add_field(name=f"🔰 Trial Mod — {trial_role.mention if trial_role else f'`{TRIAL_MOD_ID}`'}",   value="Permissions: `warn`, `mute`",                      inline=False)
-    embed.add_field(name=f"⚔️ Mod — {mod_role.mention if mod_role else f'`{MOD_ID}`'}",                  value="Permissions: warn/mute/unmute/kick/ban/timeout/purge/slowmode", inline=False)
-    embed.add_field(name=f"🌟 Senior Mod — {senior_role.mention if senior_role else f'`{SENIOR_MOD_ID}`'}",value="All Mod perms + scan/report/lock/unlock",           inline=False)
+    embed.add_field(name=f"🔰 Trial Mod — {trial_role.mention if trial_role else f'`{TRIAL_MOD_ID}`'}",    value="Permissions: `warn`, `mute`",                       inline=False)
+    embed.add_field(name=f"⚔️ Mod — {mod_role.mention if mod_role else f'`{MOD_ID}`'}",                   value="Permissions: warn/mute/unmute/kick/ban/timeout/purge/slowmode", inline=False)
+    embed.add_field(name=f"🌟 Senior Mod — {senior_role.mention if senior_role else f'`{SENIOR_MOD_ID}`'}",value="All Mod perms + scan/report/lock/unlock",            inline=False)
     for rid, label in [(TRIAL_MOD_ID, "Trial Mods"), (MOD_ID, "Mods"), (SENIOR_MOD_ID, "Senior Mods")]:
         role    = guild.get_role(rid)
         members = [m.display_name for m in guild.members if role and role in m.roles]
@@ -3377,7 +3408,7 @@ async def cmd_staffset(ctx: commands.Context) -> None:
             embed.add_field(name=f"**{label}** ({len(members)})", value=", ".join(members[:10]), inline=False)
     embed.add_field(
         name="⚙️ Change Role IDs",
-        value="Update in your `.env` or NexusHost environment variables:\n`TRIAL_MOD_ROLE_ID`, `MOD_ROLE_ID`, `SENIOR_MOD_ROLE_ID`",
+        value="Update in NexusHost environment variables:\n`TRIAL_MOD_ROLE_ID`, `MOD_ROLE_ID`, `SENIOR_MOD_ROLE_ID`",
         inline=False,
     )
     embed.set_footer(text=BOT_NAME)
@@ -3387,6 +3418,18 @@ async def cmd_staffset(ctx: commands.Context) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # COMMANDS — LOG SETUP
 # ══════════════════════════════════════════════════════════════════════════════
+
+@bot.command(name="setbotlog")
+async def cmd_setbotlog(ctx: commands.Context, channel: discord.TextChannel = None) -> None:
+    """Set the global bot log channel (startup, shutdown, security events)."""
+    global BOT_LOG_CHANNEL_ID
+    if not is_owner(ctx.author.id): await deny(ctx); return
+    if not channel:
+        await ctx.reply(embed=discord.Embed(description=f"❌ Usage: `{CMD_PREFIX}setbotlog #channel`", color=C_ERROR), mention_author=False); return
+    BOT_LOG_CHANNEL_ID = channel.id
+    asyncio.create_task(db_save_meta("botlog_channel", {"channel_id": str(channel.id)}))
+    await ctx.reply(embed=discord.Embed(description=f"✅ Bot log channel set to {channel.mention}!", color=C_MOD), mention_author=False)
+
 
 @bot.command(name="alerts")
 async def cmd_alerts(ctx: commands.Context, channel: discord.TextChannel = None) -> None:
@@ -3402,10 +3445,19 @@ async def cmd_alerts(ctx: commands.Context, channel: discord.TextChannel = None)
 async def cmd_setlog(ctx: commands.Context, log_type: str = "", channel: discord.TextChannel = None) -> None:
     if not is_owner(ctx.author.id): await deny(ctx); return
     if not log_type or not channel:
-        await ctx.reply(embed=discord.Embed(description=f"❌ Usage: `{CMD_PREFIX}setlog <type> #channel`\nValid: {', '.join(f'`{t}`' for t in sorted(LOG_TYPES))}", color=C_ERROR), mention_author=False); return
+        await ctx.reply(embed=discord.Embed(description=f"❌ Usage: `{CMD_PREFIX}setlog <type> #channel`\nValid: `botlog`, {', '.join(f'`{t}`' for t in sorted(LOG_TYPES))}", color=C_ERROR), mention_author=False); return
     log_type = log_type.lower()
+
+    # Redirect botlog to the dedicated handler
+    if log_type == "botlog":
+        global BOT_LOG_CHANNEL_ID
+        BOT_LOG_CHANNEL_ID = channel.id
+        asyncio.create_task(db_save_meta("botlog_channel", {"channel_id": str(channel.id)}))
+        await ctx.reply(embed=discord.Embed(description=f"✅ Bot log channel set to {channel.mention}!", color=C_MOD), mention_author=False)
+        return
+
     if log_type not in LOG_TYPES:
-        await ctx.reply(embed=discord.Embed(description=f"❌ Invalid type. Valid: {', '.join(f'`{t}`' for t in sorted(LOG_TYPES))}", color=C_ERROR), mention_author=False); return
+        await ctx.reply(embed=discord.Embed(description=f"❌ Invalid type. Valid: `botlog`, {', '.join(f'`{t}`' for t in sorted(LOG_TYPES))}", color=C_ERROR), mention_author=False); return
     gid = str(ctx.guild.id)
     log_channels.setdefault(gid, {})[log_type] = str(channel.id)
     asyncio.create_task(db_save_log_channels(gid))
@@ -3417,6 +3469,11 @@ async def cmd_logstatus(ctx: commands.Context) -> None:
     if not is_owner(ctx.author.id): await deny(ctx); return
     lc    = log_channels.get(str(ctx.guild.id), {})
     embed = discord.Embed(title="📋 Log Channel Status", color=C_INFO, timestamp=datetime.now(timezone.utc))
+
+    # Bot log channel (global)
+    botlog_ch = bot.get_channel(BOT_LOG_CHANNEL_ID) if BOT_LOG_CHANNEL_ID else None
+    embed.add_field(name="`botlog` (global)", value=botlog_ch.mention if botlog_ch else "❌ Not set — use `.setbotlog` or ask me!", inline=True)
+
     for lt in sorted(LOG_TYPES | {"alerts"}):
         cid = lc.get(lt)
         ch  = ctx.guild.get_channel(int(cid)) if cid else None
@@ -3436,7 +3493,7 @@ async def cmd_daily(ctx: commands.Context) -> None:
         e     = get_econ(uid)
         now   = datetime.now(timezone.utc)
         today = now.date()
-        last_d= e.get("last_daily")
+        last_d = e.get("last_daily")
         if last_d:
             try:
                 last_date = datetime.fromisoformat(last_d).date()
@@ -3450,7 +3507,7 @@ async def cmd_daily(ctx: commands.Context) -> None:
             streak = (streak + 1) if last_date == today - timedelta(days=1) else 1
         else:
             streak = 1
-        reward           = daily_reward(streak)
+        reward            = daily_reward(streak)
         e["coins"]       += reward
         e["total_earned"]+= reward
         e["last_daily"]   = now.isoformat()
@@ -3459,10 +3516,10 @@ async def cmd_daily(ctx: commands.Context) -> None:
 
     embed = discord.Embed(title="🎁 Daily Reward", color=C_ECONOMY, timestamp=now)
     embed.set_author(name=ctx.author.display_name, icon_url=ctx.author.display_avatar.url)
-    embed.add_field(name="Reward",  value=f"**+{reward}** 🪙",          inline=True)
-    embed.add_field(name="Balance", value=f"**{e['coins']:,}** 🪙",      inline=True)
-    embed.add_field(name="Streak",  value=f"🔥 **{streak}** day(s)",     inline=True)
-    embed.add_field(name="Rank",    value=get_rank(e["coins"]),          inline=True)
+    embed.add_field(name="Reward",  value=f"**+{reward}** 🪙",     inline=True)
+    embed.add_field(name="Balance", value=f"**{e['coins']:,}** 🪙", inline=True)
+    embed.add_field(name="Streak",  value=f"🔥 **{streak}** day(s)", inline=True)
+    embed.add_field(name="Rank",    value=get_rank(e["coins"]),     inline=True)
     embed.set_footer(text=f"Streak bonus at 3, 7, 30 days · {BOT_NAME}")
     await ctx.reply(embed=embed, mention_author=False)
 
@@ -3503,7 +3560,7 @@ async def cmd_balance(ctx: commands.Context, member: discord.Member = None) -> N
     e      = get_econ(member.id)
     embed  = discord.Embed(title=f"🪙 {member.display_name}'s Balance", color=C_ECONOMY, timestamp=datetime.now(timezone.utc))
     embed.set_thumbnail(url=member.display_avatar.url)
-    embed.add_field(name="Coins",        value=f"**{e['coins']:,}** 🪙",             inline=True)
+    embed.add_field(name="Coins",        value=f"**{e['coins']:,}** 🪙",              inline=True)
     embed.add_field(name="Total Earned", value=f"**{e.get('total_earned', 0):,}** 🪙", inline=True)
     embed.add_field(name="Rank",         value=get_rank(e["coins"]),                   inline=True)
     embed.add_field(name="Daily Streak", value=f"🔥 **{e.get('daily_streak', 0)}d**",  inline=True)
@@ -3693,28 +3750,95 @@ async def cmd_summarize(ctx: commands.Context, count: int = 20) -> None:
 
 @bot.command(name="debug")
 async def cmd_debug(ctx: commands.Context) -> None:
+    """Full diagnostic panel — owner only."""
     if not is_owner(ctx.author.id): await deny(ctx); return
-    import psutil
-    mem_mb = psutil.Process().memory_info().rss / 1024 / 1024
-    embed  = discord.Embed(title="🛠️ Debug Info", color=C_INFO, timestamp=datetime.now(timezone.utc))
-    for name, value, inline in [
-        ("Memory",         f"`{mem_mb:.1f} MB`",                                              True),
-        ("Histories",      f"`{len(histories)}`",                                             True),
-        ("Rate Limits",    f"`{len(rate_limits)}`",                                           True),
-        ("Groq Keys",      f"`{len(GROQ_KEYS)} total / {len(_key_ratelimited)} rate-limited`",True),
-        ("Economy",        f"`{len(economy)}`",                                               True),
-        ("Warn Records",   f"`{len(warns)}`",                                                 True),
-        ("Mod Logs",       f"`{len(mod_logs)}`",                                              True),
-        ("AI Memories",    f"`{sum(len(v) for v in ai_memory.values())}`",                    True),
-        ("Knowledge",      f"`{len(bot_knowledge)}`",                                         True),
-        ("Raid Modes On",  f"`{sum(1 for v in raid_mode.values() if v)}`",                    True),
-        ("DB Connected",   "✅" if _db_ok() else "❌",                                       True),
-        ("AFK Users",      f"`{len(afk_users)}`",                                            True),
-    ]:
-        embed.add_field(name=name, value=value, inline=inline)
+
+    try:
+        import psutil
+        proc   = psutil.Process()
+        mem_mb = proc.memory_info().rss / 1024 / 1024
+        cpu    = proc.cpu_percent(interval=0.1)
+        mem_str = f"`{mem_mb:.1f} MB` · CPU `{cpu:.1f}%`"
+    except ImportError:
+        mem_str = "`psutil not installed`"
+
+    up   = int(time.time() - start_time)
+    d, h = divmod(up, 86400); h, m = divmod(h, 3600); m, s = divmod(m, 60)
+
+    active_keys    = len(GROQ_KEYS) - len(_key_ratelimited)
+    rl_keys        = len(_key_ratelimited)
+    botlog_ch      = bot.get_channel(BOT_LOG_CHANNEL_ID) if BOT_LOG_CHANNEL_ID else None
+    raid_active    = sum(1 for v in raid_mode.values() if v)
+    total_memories = sum(len(v) for v in ai_memory.values())
+    hist_sessions  = len(histories)
+
+    embed = discord.Embed(
+        title="🛠️ Debug Panel",
+        color=C_SECURITY,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=bot.user.display_avatar.url)
+
+    # ── System ────────────────────────────────────────────────────────────────
+    embed.add_field(name="⚙️ System", value=(
+        f"Memory/CPU: {mem_str}\n"
+        f"Uptime: `{d}d {h}h {m}m {s}s`\n"
+        f"Python: `{platform.python_version()}` · discord.py `{discord.__version__}`"
+    ), inline=False)
+
+    # ── AI / Groq ─────────────────────────────────────────────────────────────
+    key_status = f"`{len(GROQ_KEYS)} total` · `{active_keys} active` · `{rl_keys} rate-limited`"
+    if not GROQ_KEYS:
+        key_status = "❌ **NO KEYS LOADED** — set `GROQ_KEYS` in env vars!"
+    embed.add_field(name="🤖 AI / Groq", value=(
+        f"Keys: {key_status}\n"
+        f"Model: `{AI_MODEL}`\n"
+        f"Msgs processed: `{msgs_processed:,}`\n"
+        f"Active sessions: `{hist_sessions}`\n"
+        f"AI memories: `{total_memories}`\n"
+        f"Knowledge facts: `{len(bot_knowledge)}`\n"
+        f"Custom prompt: `{'Yes' if custom_prompt else 'No (default)'}`"
+    ), inline=False)
+
+    # ── Database ──────────────────────────────────────────────────────────────
+    embed.add_field(name="🗄️ Database", value=(
+        f"MongoDB: {'✅ Connected' if _db_ok() else '❌ Not connected (data is in-memory only)'}\n"
+        f"Users: `{len(registry)}`\n"
+        f"Warn records: `{len(warns)}`\n"
+        f"Economy entries: `{len(economy)}`\n"
+        f"Mod log entries: `{len(mod_logs)}`"
+    ), inline=False)
+
+    # ── Security ──────────────────────────────────────────────────────────────
+    embed.add_field(name="🚨 Security", value=(
+        f"Raid modes active: `{raid_active}`\n"
+        f"AFK users: `{len(afk_users)}`\n"
+        f"Rate limits tracked: `{len(rate_limits)}`\n"
+        f"Ghost ping cache: `{len(ghostping_cache)}`"
+    ), inline=False)
+
+    # ── Logging ───────────────────────────────────────────────────────────────
+    embed.add_field(name="📋 Logging", value=(
+        f"Bot log channel: {botlog_ch.mention if botlog_ch else '❌ Not set — use `.setbotlog #channel`'}\n"
+        f"Guilds with log channels: `{len(log_channels)}`"
+    ), inline=False)
+
+    # ── Bot ───────────────────────────────────────────────────────────────────
+    embed.add_field(name="🌐 Bot", value=(
+        f"Guilds: `{len(bot.guilds)}`\n"
+        f"Ping: `{round(bot.latency * 1000)}ms`\n"
+        f"Prefix: `{CMD_PREFIX}`\n"
+        f"Owner ID: `{OWNER_ID}`"
+    ), inline=False)
+
+    # ── Recent errors ─────────────────────────────────────────────────────────
     if error_log:
-        embed.add_field(name="Recent Errors", value="\n".join(f"`{e['ts'][:16]}` {e['err'][:60]}" for e in list(error_log)[-3:]), inline=False)
-    embed.set_footer(text=BOT_NAME)
+        err_lines = "\n".join(f"`{e['ts'][:16]}` {e['err'][:80]}" for e in list(error_log)[-5:])
+        embed.add_field(name=f"⚠️ Recent Errors ({len(error_log)})", value=err_lines, inline=False)
+    else:
+        embed.add_field(name="⚠️ Recent Errors", value="✅ None", inline=False)
+
+    embed.set_footer(text=f"{BOT_NAME} · Owner only")
     await ctx.reply(embed=embed, mention_author=False)
 
 
@@ -3731,6 +3855,7 @@ async def cmd_backup(ctx: commands.Context) -> None:
         "bot_knowledge": bot_knowledge,
         "mod_logs":      list(mod_logs)[-500:],
         "ai_memory":     dict(list(ai_memory.items())[:100]),
+        "botlog_channel": str(BOT_LOG_CHANNEL_ID) if BOT_LOG_CHANNEL_ID else None,
     }
     full_json  = json.dumps(data, indent=2, ensure_ascii=False)
     chunk_size = 7_000_000
@@ -3752,7 +3877,7 @@ def main() -> None:
     if not DISCORD_TOKEN:
         raise ValueError("DISCORD_TOKEN is not set. Add it to your NexusHost environment variables.")
     if not GROQ_KEYS:
-        log.warning("No GROQ_KEY_x set — AI features will not work.")
+        log.warning("GROQ_KEYS not set — AI features will not work. Add GROQ_KEYS=key1,key2,... to env vars.")
     bot.run(DISCORD_TOKEN, log_handler=None)
 
 
