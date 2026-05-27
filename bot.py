@@ -43,7 +43,7 @@ C_WARNING = 0xFEE75C
 C_GOLD    = 0xFFD700
 
 # ─── Groq Config ─────────────────────────────────────────────────────────────
-GROQ_MODEL_TEXT   = "meta-llama/llama-4-scout-17b-16e-instruct"
+GROQ_MODEL_TEXT   = "llama-3.1-8b-instant"
 GROQ_MODEL_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"
 MAX_TOKENS        = 256
 TEMPERATURE       = 1.5
