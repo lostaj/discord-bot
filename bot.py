@@ -25,7 +25,7 @@ import itertools
 from typing import Optional
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from groq import Groq
 from groq import RateLimitError
 from pymongo import MongoClient
@@ -45,6 +45,12 @@ MAX_TOKENS        = 2048
 TEMPERATURE       = 0.75
 MAX_HISTORY_TURNS = 30
 HISTORY_TTL_DAYS  = 14
+
+# ─── Member count channel ─────────────────────────────────────────────────────
+# The VC channel used as a live member counter.
+# Extracted from: https://discord.com/channels/1507918340738515074/1508204390677352629
+MEMBER_COUNT_CHANNEL_ID = 1508204390677352629
+MEMBER_COUNT_FORMAT     = "🌸 | • Members: {count}"   # edit emoji/text here freely
 
 # ─── Safety config ───────────────────────────────────────────────────────────
 BLOCKED_PATTERNS = [
@@ -152,7 +158,7 @@ class KeyRotator:
                 loop   = asyncio.get_running_loop()
                 resp   = await loop.run_in_executor(
                     None,
-                    lambda c=client: c.chat.completions.create(**kwargs)
+                    lambda c=client, kw=kwargs: c.chat.completions.create(**kw)
                 )
                 self.rotate()
                 content = resp.choices[0].message.content
@@ -162,9 +168,9 @@ class KeyRotator:
                     ).strip()
                 return (content or "").strip()
 
-            except RateLimitError:
+            except RateLimitError as e:
                 self.rotate()
-                last_exc = RateLimitError
+                last_exc = e          # FIX: store the actual exception, not the class
                 await asyncio.sleep(0.5)
             except Exception as e:
                 last_exc = e
@@ -184,13 +190,17 @@ class Database:
         db           = self._client["lxte_assistant"]
         self.history = db["conversation_history"]
         self.stats   = db["usage_stats"]
+        self.config  = db["guild_config"]        # NEW: per-guild setup config
         self._ensure_indexes()
 
     def _ensure_indexes(self):
-        try:
-            self.history.drop_index("updated_at_1")
-        except Exception:
-            pass
+        # FIX: safely recreate TTL index without crashing if it already exists
+        existing = {idx["name"] for idx in self.history.list_indexes()}
+        if "updated_at_1" in existing:
+            try:
+                self.history.drop_index("updated_at_1")
+            except Exception:
+                pass
         self.history.create_index(
             "updated_at",
             expireAfterSeconds=HISTORY_TTL_DAYS * 86_400,
@@ -198,6 +208,9 @@ class Database:
         )
         self.history.create_index([("user_id", 1), ("channel_id", 1)], background=True)
         self.stats.create_index("user_id", background=True)
+        self.config.create_index("guild_id", unique=True, background=True)
+
+    # ── History ──────────────────────────────────────────────────────────────
 
     def get_history(self, user_id: int, channel_id: int) -> list[dict]:
         doc = self.history.find_one({"user_id": user_id, "channel_id": channel_id})
@@ -218,6 +231,8 @@ class Database:
 
     def clear_history_for_user(self, user_id: int):
         self.history.delete_many({"user_id": user_id})
+
+    # ── Stats ────────────────────────────────────────────────────────────────
 
     def increment_stat(self, user_id: int, field: str):
         self.stats.update_one(
@@ -240,6 +255,28 @@ class Database:
             "total_users":     {"$sum": 1},
         }}]))
         return result[0] if result else {}
+
+    # ── Guild config ─────────────────────────────────────────────────────────
+
+    def get_config(self, guild_id: int) -> dict:
+        return self.config.find_one({"guild_id": guild_id}) or {}
+
+    def save_config(self, guild_id: int, data: dict):
+        self.config.update_one(
+            {"guild_id": guild_id},
+            {"$set": {**data, "updated_at": datetime.datetime.utcnow()}},
+            upsert=True,
+        )
+
+    def update_config(self, guild_id: int, key: str, value):
+        self.config.update_one(
+            {"guild_id": guild_id},
+            {
+                "$set": {key: value, "updated_at": datetime.datetime.utcnow()},
+                "$setOnInsert": {"guild_id": guild_id},
+            },
+            upsert=True,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -336,8 +373,9 @@ class AIEngine:
         context:        str  = "",
         is_owner:       bool = False,
         use_web_search: bool = False,
+        custom_system:  str  = "",   # NEW: per-guild custom system prompt prefix
     ) -> str:
-        system = SYSTEM_PROMPT
+        system = custom_system + "\n\n" + SYSTEM_PROMPT if custom_system else SYSTEM_PROMPT
         if is_owner:
             system += OWNER_SYSTEM_ADDITION
         if context:
@@ -353,6 +391,7 @@ class AIEngine:
             max_tokens=MAX_TOKENS,
             temperature=TEMPERATURE,
         )
+        # FIX: only attach web_search tool for text model — vision model doesn't support tools
         if use_web_search and model == GROQ_MODEL_TEXT:
             kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
 
@@ -401,6 +440,348 @@ def info_embed(title: str, desc: str, colour: int = COLOUR_INFO) -> discord.Embe
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  MEMBER COUNT WATCHER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def update_member_count_channel(guild: discord.Guild):
+    """Rename the VC to reflect current member count (bots excluded)."""
+    channel = guild.get_channel(MEMBER_COUNT_CHANNEL_ID)
+    if channel is None:
+        return
+    # Count non-bot members
+    real_count = sum(1 for m in guild.members if not m.bot)
+    new_name   = MEMBER_COUNT_FORMAT.format(count=real_count)
+    if channel.name != new_name:
+        try:
+            await channel.edit(name=new_name, reason="Member count update")
+        except discord.Forbidden:
+            print("[MemberCount]  Missing Manage Channels permission.")
+        except discord.HTTPException as e:
+            print(f"[MemberCount]  HTTPException: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SETUP WIZARD — UI VIEWS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def setup_home_embed(cfg: dict) -> discord.Embed:
+    """Main setup dashboard embed."""
+    ai_channel = cfg.get("ai_channel_id")
+    web_search = cfg.get("web_search", True)
+    owner_mode = cfg.get("owner_mode_enabled", True)
+    custom_sys = cfg.get("custom_system_prefix", "")
+    member_cnt = cfg.get("member_count_enabled", True)
+
+    ai_ch_str  = f"<#{ai_channel}>" if ai_channel else "`All channels`"
+
+    e = discord.Embed(
+        title="⚙️  LXTE's Assistant — Setup",
+        description=(
+            "Configure your bot using the buttons below.\n"
+            "Changes save **instantly** — no restart needed.\n\u200b"
+        ),
+        colour=COLOUR_PRIMARY,
+        timestamp=datetime.datetime.utcnow(),
+    )
+    e.add_field(
+        name="🤖  AI Settings",
+        value=(
+            f"**Channel lock:** {ai_ch_str}\n"
+            f"**Web search:** {'✅ On' if web_search else '❌ Off'}\n"
+            f"**Owner mode:** {'✅ On' if owner_mode else '❌ Off'}\n"
+            f"**Custom prompt:** {'✅ Set' if custom_sys else '❌ None'}"
+        ),
+        inline=True,
+    )
+    e.add_field(
+        name="📊  Member Count",
+        value=(
+            f"**Channel:** <#{MEMBER_COUNT_CHANNEL_ID}>\n"
+            f"**Status:** {'✅ Active' if member_cnt else '❌ Paused'}\n"
+            f"**Format:** `{MEMBER_COUNT_FORMAT}`"
+        ),
+        inline=True,
+    )
+    e.set_footer(text="Only admins can use this  •  Built by AJ", icon_url=get_bot_avatar())
+    return e
+
+
+class SetupHomeView(discord.ui.View):
+    """Top-level setup menu with two section buttons."""
+
+    def __init__(self, owner_id: int, guild_id: int):
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                embed=error_embed("No Permission", "Only admins can use setup."),
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="🤖  AI Settings", style=discord.ButtonStyle.primary)
+    async def btn_ai(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cfg = bot.db.get_config(self.guild_id)
+        await interaction.response.edit_message(
+            embed=ai_settings_embed(cfg),
+            view=AISettingsView(self.owner_id, self.guild_id),
+        )
+
+    @discord.ui.button(label="📊  Member Count", style=discord.ButtonStyle.secondary)
+    async def btn_member(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cfg = bot.db.get_config(self.guild_id)
+        await interaction.response.edit_message(
+            embed=member_count_embed(cfg, interaction.guild),
+            view=MemberCountView(self.owner_id, self.guild_id),
+        )
+
+    @discord.ui.button(label="✖  Close", style=discord.ButtonStyle.danger)
+    async def btn_close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.message.delete()
+
+    async def on_timeout(self):
+        try:
+            await self._message.edit(view=None)
+        except Exception:
+            pass
+
+
+# ── AI Settings ───────────────────────────────────────────────────────────────
+
+def ai_settings_embed(cfg: dict) -> discord.Embed:
+    ai_channel = cfg.get("ai_channel_id")
+    web_search = cfg.get("web_search", True)
+    owner_mode = cfg.get("owner_mode_enabled", True)
+    custom_sys = cfg.get("custom_system_prefix", "")
+
+    ai_ch_str = f"<#{ai_channel}>" if ai_channel else "`All channels (no lock)`"
+
+    e = discord.Embed(
+        title="🤖  AI Settings",
+        colour=COLOUR_AI,
+        timestamp=datetime.datetime.utcnow(),
+    )
+    e.add_field(name="📌  Channel Lock",    value=ai_ch_str,                                         inline=False)
+    e.add_field(name="🔍  Web Search",      value="✅ Enabled" if web_search else "❌ Disabled",      inline=True)
+    e.add_field(name="⚡  Owner Mode",      value="✅ Enabled" if owner_mode else "❌ Disabled",      inline=True)
+    e.add_field(name="📝  Custom Prompt",   value=f"```{custom_sys[:300]}```" if custom_sys else "`Not set`", inline=False)
+    e.set_footer(text="Changes save instantly", icon_url=get_bot_avatar())
+    return e
+
+
+class AISettingsView(discord.ui.View):
+
+    def __init__(self, owner_id: int, guild_id: int):
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                embed=error_embed("No Permission", "Only admins can use setup."),
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction):
+        cfg = bot.db.get_config(self.guild_id)
+        await interaction.response.edit_message(embed=ai_settings_embed(cfg), view=self)
+
+    @discord.ui.button(label="📌  Set Channel", style=discord.ButtonStyle.primary, row=0)
+    async def btn_set_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SetChannelModal(self.guild_id))
+
+    @discord.ui.button(label="🔓  Unlock All Channels", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_unlock(self, interaction: discord.Interaction, button: discord.ui.Button):
+        bot.db.update_config(self.guild_id, "ai_channel_id", None)
+        cfg = bot.db.get_config(self.guild_id)
+        await interaction.response.edit_message(embed=ai_settings_embed(cfg), view=self)
+
+    @discord.ui.button(label="🔍  Toggle Web Search", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_web(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cfg     = bot.db.get_config(self.guild_id)
+        current = cfg.get("web_search", True)
+        bot.db.update_config(self.guild_id, "web_search", not current)
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="⚡  Toggle Owner Mode", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_owner_mode(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                embed=error_embed("Owner Only", "Only the bot owner can toggle Owner Mode."),
+                ephemeral=True,
+            )
+            return
+        cfg     = bot.db.get_config(self.guild_id)
+        current = cfg.get("owner_mode_enabled", True)
+        bot.db.update_config(self.guild_id, "owner_mode_enabled", not current)
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="📝  Set Custom Prompt", style=discord.ButtonStyle.primary, row=1)
+    async def btn_custom_prompt(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SetCustomPromptModal(self.guild_id))
+
+    @discord.ui.button(label="🗑️  Clear Custom Prompt", style=discord.ButtonStyle.danger, row=1)
+    async def btn_clear_prompt(self, interaction: discord.Interaction, button: discord.ui.Button):
+        bot.db.update_config(self.guild_id, "custom_system_prefix", "")
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="◀  Back", style=discord.ButtonStyle.secondary, row=2)
+    async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cfg = bot.db.get_config(self.guild_id)
+        await interaction.response.edit_message(
+            embed=setup_home_embed(cfg),
+            view=SetupHomeView(self.owner_id, self.guild_id),
+        )
+
+
+class SetChannelModal(discord.ui.Modal, title="Set AI Channel"):
+    channel_id = discord.ui.TextInput(
+        label="Channel ID",
+        placeholder="Paste the channel ID here (right-click → Copy ID)",
+        max_length=25,
+        required=True,
+    )
+
+    def __init__(self, guild_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.channel_id.value.strip()
+        try:
+            ch_id = int(raw)
+        except ValueError:
+            await interaction.response.send_message(
+                embed=error_embed("Invalid ID", f"`{raw}` is not a valid channel ID."),
+                ephemeral=True,
+            )
+            return
+
+        ch = interaction.guild.get_channel(ch_id)
+        if ch is None:
+            await interaction.response.send_message(
+                embed=error_embed("Channel Not Found", f"No channel with ID `{ch_id}` in this server."),
+                ephemeral=True,
+            )
+            return
+
+        bot.db.update_config(self.guild_id, "ai_channel_id", ch_id)
+        cfg = bot.db.get_config(self.guild_id)
+        await interaction.response.edit_message(
+            embed=ai_settings_embed(cfg),
+            view=AISettingsView(bot.owner_id_int, self.guild_id),
+        )
+
+
+class SetCustomPromptModal(discord.ui.Modal, title="Set Custom System Prompt Prefix"):
+    prompt = discord.ui.TextInput(
+        label="Prefix text (prepended to base system prompt)",
+        style=discord.TextStyle.paragraph,
+        placeholder="e.g. You are speaking in the LXTE gaming server. Keep responses short and fun.",
+        max_length=800,
+        required=True,
+    )
+
+    def __init__(self, guild_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        bot.db.update_config(self.guild_id, "custom_system_prefix", self.prompt.value.strip())
+        cfg = bot.db.get_config(self.guild_id)
+        await interaction.response.edit_message(
+            embed=ai_settings_embed(cfg),
+            view=AISettingsView(bot.owner_id_int, self.guild_id),
+        )
+
+
+# ── Member Count Settings ─────────────────────────────────────────────────────
+
+def member_count_embed(cfg: dict, guild: Optional[discord.Guild]) -> discord.Embed:
+    enabled    = cfg.get("member_count_enabled", True)
+    real_count = sum(1 for m in guild.members if not m.bot) if guild else "?"
+    ch         = guild.get_channel(MEMBER_COUNT_CHANNEL_ID) if guild else None
+    ch_str     = ch.mention if ch else f"`{MEMBER_COUNT_CHANNEL_ID}` *(not found)*"
+
+    e = discord.Embed(
+        title="📊  Member Count Watcher",
+        colour=COLOUR_INFO,
+        timestamp=datetime.datetime.utcnow(),
+    )
+    e.add_field(name="📢  Channel",         value=ch_str,                                              inline=True)
+    e.add_field(name="👥  Current Count",   value=f"`{real_count}` real members",                      inline=True)
+    e.add_field(name="🔄  Status",          value="✅ Active" if enabled else "❌ Paused",              inline=True)
+    e.add_field(name="🏷️  Name Format",     value=f"`{MEMBER_COUNT_FORMAT}`",                          inline=False)
+    e.add_field(
+        name="ℹ️  How it works",
+        value=(
+            "The bot renames the VC automatically whenever\n"
+            "a member joins or leaves the server.\n"
+            "Discord rate-limits channel renames to **2/10 min** — this is handled automatically."
+        ),
+        inline=False,
+    )
+    e.set_footer(text="Changes save instantly", icon_url=get_bot_avatar())
+    return e
+
+
+class MemberCountView(discord.ui.View):
+
+    def __init__(self, owner_id: int, guild_id: int):
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                embed=error_embed("No Permission", "Only admins can use setup."),
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction):
+        cfg = bot.db.get_config(self.guild_id)
+        await interaction.response.edit_message(
+            embed=member_count_embed(cfg, interaction.guild),
+            view=self,
+        )
+
+    @discord.ui.button(label="✅  Enable", style=discord.ButtonStyle.success, row=0)
+    async def btn_enable(self, interaction: discord.Interaction, button: discord.ui.Button):
+        bot.db.update_config(self.guild_id, "member_count_enabled", True)
+        # Immediately sync the channel name
+        await update_member_count_channel(interaction.guild)
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="❌  Disable", style=discord.ButtonStyle.danger, row=0)
+    async def btn_disable(self, interaction: discord.Interaction, button: discord.ui.Button):
+        bot.db.update_config(self.guild_id, "member_count_enabled", False)
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="🔄  Force Sync Now", style=discord.ButtonStyle.primary, row=0)
+    async def btn_sync(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await update_member_count_channel(interaction.guild)
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="◀  Back", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cfg = bot.db.get_config(self.guild_id)
+        await interaction.response.edit_message(
+            embed=setup_home_embed(cfg),
+            view=SetupHomeView(self.owner_id, self.guild_id),
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  BOT
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -424,6 +805,12 @@ class LXTEBot(commands.Bot):
         )
         print(f"[LXTE's Assistant]  Ready as {self.user} ({self.user.id})")
         print(f"[LXTE's Assistant]  {len(self.guilds)} guild(s)")
+
+        # Sync member count channel on startup for all guilds
+        for guild in self.guilds:
+            cfg = self.db.get_config(guild.id)
+            if cfg.get("member_count_enabled", True):
+                await update_member_count_channel(guild)
 
     async def on_message(self, message: discord.Message):
         if message.author.bot:
@@ -451,6 +838,22 @@ class LXTEBot(commands.Bot):
 
         await self.process_commands(message)
 
+    # ── Member count events ───────────────────────────────────────────────────
+
+    async def on_member_join(self, member: discord.Member):
+        if member.bot:
+            return
+        cfg = self.db.get_config(member.guild.id)
+        if cfg.get("member_count_enabled", True):
+            await update_member_count_channel(member.guild)
+
+    async def on_member_remove(self, member: discord.Member):
+        if member.bot:
+            return
+        cfg = self.db.get_config(member.guild.id)
+        if cfg.get("member_count_enabled", True):
+            await update_member_count_channel(member.guild)
+
     async def on_command_error(self, ctx: commands.Context, error):
         if isinstance(error, commands.CommandNotFound):
             return
@@ -472,14 +875,39 @@ class LXTEBot(commands.Bot):
 bot = LXTEBot()
 
 
+# ── SETUP ─────────────────────────────────────────────────────────────────────
+
+@bot.command(name="setup", aliases=["config", "configure"])
+@commands.has_permissions(administrator=True)
+async def cmd_setup(ctx: commands.Context):
+    """Interactive setup wizard. Admin only."""
+    cfg  = bot.db.get_config(ctx.guild.id)
+    view = SetupHomeView(bot.owner_id_int, ctx.guild.id)
+    msg  = await ctx.send(embed=setup_home_embed(cfg), view=view)
+    view._message = msg
+
+
 # ── ASK ───────────────────────────────────────────────────────────────────────
 
 @bot.command(name="ask", aliases=["ai", "q"])
 @commands.cooldown(rate=5, per=10, type=commands.BucketType.user)
 async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this image?"):
     is_owner = (ctx.author.id == bot.owner_id_int)
+    cfg      = bot.db.get_config(ctx.guild.id) if ctx.guild else {}
 
-    if not is_owner:
+    # Channel lock check
+    locked_channel = cfg.get("ai_channel_id")
+    if locked_channel and ctx.channel.id != locked_channel and not is_owner:
+        await ctx.send(
+            embed=error_embed("Wrong Channel", f"AI commands are locked to <#{locked_channel}>."),
+            delete_after=8,
+        )
+        return
+
+    # Check owner mode setting
+    owner_mode_active = is_owner and cfg.get("owner_mode_enabled", True)
+
+    if not owner_mode_active:
         safe, _ = is_safe(question)
         if not safe:
             await ctx.send(embed=error_embed("Nice Try 😐", "That's not happening."))
@@ -487,8 +915,11 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
 
     async with ctx.typing():
         try:
-            history   = bot.db.get_history(ctx.author.id, ctx.channel.id)
-            context   = build_context(ctx)
+            history       = bot.db.get_history(ctx.author.id, ctx.channel.id)
+            context       = build_context(ctx)
+            custom_system = cfg.get("custom_system_prefix", "")
+            web_enabled   = cfg.get("web_search", True)
+
             has_image = bool(
                 ctx.message.attachments
                 and ctx.message.attachments[0].content_type
@@ -501,21 +932,22 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
                     {"type": "text",      "text": question},
                 ]
                 model = GROQ_MODEL_VISION
-                web   = False
+                web   = False   # vision model doesn't support web search tools
             else:
                 user_content = question
                 model        = GROQ_MODEL_TEXT
-                web          = any(t in question.lower() for t in WEB_TRIGGERS)
+                web          = web_enabled and any(t in question.lower() for t in WEB_TRIGGERS)
 
             answer = await bot.ai.ask(
                 user_content, history, model,
                 context=context,
-                is_owner=is_owner,
+                is_owner=owner_mode_active,
                 use_web_search=web,
+                custom_system=custom_system,
             )
 
-            history.append({"role": "user",     "content": question})
-            history.append({"role": "assistant", "content": answer})
+            history.append({"role": "user",      "content": question})
+            history.append({"role": "assistant",  "content": answer})
             bot.db.save_history(ctx.author.id, ctx.channel.id, history)
             bot.db.increment_stat(ctx.author.id, "questions")
 
@@ -544,6 +976,7 @@ async def cmd_help(ctx: commands.Context):
         "> `.ask` + image → image analysis\n"
         "> **@mention** me or **reply** to me — both work too."
     ), inline=False)
+    e.add_field(name="⚙️  `.setup`",  value="Configure the bot (admin only).",             inline=False)
     e.add_field(name="🧹  `.clear`",  value="Wipe your conversation history in this channel.", inline=False)
     e.add_field(name="📊  `.stats`",  value="See your usage stats.",                           inline=False)
     e.add_field(name="ℹ️  `.about`",  value="Info about the bot.",                             inline=False)
@@ -551,7 +984,8 @@ async def cmd_help(ctx: commands.Context):
         "• Knows every member, role, and channel\n"
         "• Auto web search for news/prices/events\n"
         "• 5 API keys — never goes down from rate limits\n"
-        "• 30-message memory per channel · 14-day TTL"
+        "• 30-message memory per channel · 14-day TTL\n"
+        "• Member count VC updates on every join/leave"
     ), inline=False)
     e.set_footer(
         text=f"Requested by {ctx.author.display_name}  •  Built by AJ",
@@ -607,7 +1041,9 @@ async def cmd_about(ctx: commands.Context):
         "• Auto web search\n"
         "• Image analysis\n"
         "• 5-key API rotation — zero downtime\n"
-        "• @mention & reply triggers"
+        "• @mention & reply triggers\n"
+        "• Live member count VC\n"
+        "• Interactive `.setup` wizard"
     ), inline=False)
     guilds = len(bot.guilds)
     e.set_footer(
@@ -647,6 +1083,11 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
             "🔑  API Keys",
             f"**{bot.ai._rotator._count}** key(s) loaded and rotating.",
         ))
+
+    elif action == "synccount":
+        for guild in bot.guilds:
+            await update_member_count_channel(guild)
+        await ctx.send(embed=success_embed("Synced", "Member count channels updated for all guilds."))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
