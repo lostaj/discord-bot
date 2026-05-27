@@ -9,7 +9,7 @@ Environment variables required:
   DISCORD_TOKEN   — your bot token
   GROQ_API_KEY_1  — Groq API key #1 (required)
   GROQ_API_KEY_2  — Groq API key #2 (optional)
-  GROQ_API_KEY_3  — Groq API key #3 (optional)
+  GROQ_API_KEY_3  — Groq API key #3 (optional)e
   GROQ_API_KEY_4  — Groq API key #4 (optional)
   GROQ_API_KEY_5  — Groq API key #5 (optional)
   MONGO_URI       — MongoDB connection string
