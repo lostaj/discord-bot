@@ -47,14 +47,16 @@ C_GOLD    = 0xFFD700
 # ─── Groq Config ─────────────────────────────────────────────────────────────
 GROQ_MODEL_TEXT   = "llama-3.1-8b-instant"
 GROQ_MODEL_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"
-MAX_TOKENS        = 512     # bumped for smarter, fuller responses
-TEMPERATURE       = 0.7     # slightly lower = more coherent and accurate
+MAX_TOKENS        = 512
+TEMPERATURE       = 0.7
 MAX_HISTORY_TURNS = 30
 HISTORY_TTL_DAYS  = 14
 
 # ─── Rate limit ──────────────────────────────────────────────────────────────
-USER_COOLDOWN_SECS = 5.0   # non-owners only
-_last_used: dict[int, float] = {}
+USER_COOLDOWN_SECS    = 5.0    # non-owners only — for .ask
+GEN_COOLDOWN_SECS     = 15.0   # separate cooldown for image generation
+_last_used:     dict[int, float] = {}
+_last_gen_used: dict[int, float] = {}
 
 # ─── Member Count ────────────────────────────────────────────────────────────
 MEMBER_COUNT_CHANNEL_ID = 1508204390677352629
@@ -193,14 +195,12 @@ def format_fake_ping(text: str, guild: Optional[discord.Guild]) -> str:
 
     def replace_mention(m):
         raw_name = m.group(1).strip()
-        # Try to find the actual member by display name or username (case-insensitive)
         member = discord.utils.find(
             lambda mem: mem.display_name.lower() == raw_name.lower()
                         or mem.name.lower() == raw_name.lower(),
             guild.members,
         )
         if member:
-            # Use their real display name, no actual ping
             return f"@{member.display_name}"
         return f"@{raw_name}"
 
@@ -411,11 +411,6 @@ def is_safe(text: str) -> tuple[bool, str]:
 
 
 def build_context(ctx: commands.Context) -> str:
-    """
-    Build a rich context string injected into the system prompt.
-    Includes full member roster with username, display name, ID so the AI
-    can accurately identify anyone mentioned.
-    """
     lines  = []
     member = ctx.author
 
@@ -451,7 +446,6 @@ def build_context(ctx: commands.Context) -> str:
         for m in guild.members:
             if m.bot:
                 continue
-            m_roles = ", ".join(r.name for r in m.roles if r.name != "@everyone") or "none"
             joined  = m.joined_at.strftime('%Y-%m-%d') if m.joined_at else 'unknown'
             lines.append(
                 f"  {m.display_name} | {m.name} | {m.id} | "
@@ -464,7 +458,6 @@ def build_context(ctx: commands.Context) -> str:
             for u in ctx.message.mentions:
                 m = guild.get_member(u.id)
                 if m:
-                    m_roles = ", ".join(r.name for r in m.roles if r.name != "@everyone") or "none"
                     lines.append(
                         f"  {m.display_name} | {m.name} | {m.id} | "
                         f"{m.top_role.name} | admin:{m.guild_permissions.administrator} | {str(m.status)}"
@@ -531,29 +524,22 @@ def make_embed(color: int) -> discord.Embed:
 
 
 def ai_embed(answer: str, ctx: commands.Context, guild: Optional[discord.Guild] = None) -> discord.Embed:
-    """AI response embed — clean, polished, no bold spam, fake pings rendered properly."""
     answer = clean_ai_response(answer, guild)
     if len(answer) > 4000:
         answer = answer[:3990] + "\n…"
 
-    # Subtle gradient-style color based on message length — short=purple, long=blue
     color = 0x9B59B6 if len(answer) < 200 else 0x7289DA
 
     e = discord.Embed(description=answer, color=color)
-
-    # Clean author line with bot avatar — no clutter
     e.set_author(
         name="LXTE's Assistant",
         icon_url=get_avatar(ctx.bot.user),
     )
-
-    # Footer: who asked + timestamp — minimal
     e.set_footer(
         text=f"asked by {ctx.author.display_name}",
         icon_url=ctx.author.display_avatar.url,
     )
     e.timestamp = datetime.now(timezone.utc)
-
     return e
 
 
@@ -628,7 +614,10 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.ai` / `.q` — same thing\n\n"
             "You can also @mention me or reply to my messages.\n"
             "Image analysis and web search happen automatically.\n\n"
-            "5s cooldown per user. Owner has no cooldown."
+            "`.generate <prompt>` — generate an image with Flux\n"
+            "`.gen <prompt>` — same thing\n\n"
+            "5s cooldown on chat · 15s cooldown on image gen.\n"
+            "Owner has no cooldown."
         ), C_AI, user)
 
     elif category == "ascend":
@@ -669,7 +658,7 @@ class HelpView(discord.ui.View):
 
         options = [
             discord.SelectOption(label="Home",     value="home",   emoji="🏠", description="Back to start"),
-            discord.SelectOption(label="AI",        value="ai",     emoji="🤖", description="Ask, image analysis"),
+            discord.SelectOption(label="AI",        value="ai",     emoji="🤖", description="Ask, image gen"),
             discord.SelectOption(label="Ascend",    value="ascend", emoji="⬆️", description="Leveling & leaderboard"),
             discord.SelectOption(label="Utilities", value="utils",  emoji="📌", description="Help, about, stats"),
         ]
@@ -1191,7 +1180,6 @@ class LXTEBot(commands.Bot):
         if isinstance(error, commands.MissingPermissions):
             await ctx.send(embed=error_embed("Nope", "No permission.", ctx.bot.user))
         elif isinstance(error, commands.CommandOnCooldown):
-            # Only show cooldown if not owner
             if ctx.author.id != self.owner_id_int:
                 await ctx.send(embed=error_embed("Slow down", f"Wait {error.retry_after:.1f}s", ctx.bot.user))
         elif isinstance(error, commands.MissingRequiredArgument):
@@ -1299,50 +1287,77 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
     await ctx.reply(
         embed=ai_embed(answer, ctx, guild=ctx.guild),
         mention_author=False,
-        allowed_mentions=discord.AllowedMentions.none(),  # never actually ping
+        allowed_mentions=discord.AllowedMentions.none(),
     )
 
 
-@bot.command(name="generate", aliases=["gen", "draw", "imagine", "img"])
+# ─── Image Generation ────────────────────────────────────────────────────────
+# Aliases: .generate and .gen ONLY
+# Uses Pollinations.ai free tier with Flux model (no API key required)
+# Separate cooldown dict from .ask to avoid cross-contamination
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bot.command(name="generate", aliases=["gen"])
 async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
-    """Generate an image using Pollinations.ai — free, no key needed."""
+    """Generate an image using Pollinations.ai Flux — free, no key needed."""
     if not prompt:
-        await ctx.send(embed=error_embed("Missing prompt", "Usage: `.generate a dinosaur wearing sunglasses`", ctx.bot.user))
+        await ctx.send(embed=error_embed(
+            "Missing prompt",
+            "Usage: `.generate a cat wearing a crown`",
+            ctx.bot.user,
+        ))
         return
 
     is_owner = ctx.author.id == bot.owner_id_int
+
+    # ── Separate rate limit from .ask ─────────────────────────────────────────
     if not is_owner:
         now_ts    = time.monotonic()
-        last      = _last_used.get(ctx.author.id, 0.0)
-        remaining = USER_COOLDOWN_SECS - (now_ts - last)
+        last      = _last_gen_used.get(ctx.author.id, 0.0)
+        remaining = GEN_COOLDOWN_SECS - (now_ts - last)
         if remaining > 0:
             await ctx.send(
-                embed=error_embed("Slow down", f"Wait {remaining:.1f}s.", ctx.bot.user),
-                delete_after=4,
+                embed=error_embed("Slow down", f"Wait {remaining:.1f}s before generating again.", ctx.bot.user),
+                delete_after=5,
             )
             return
-        _last_used[ctx.author.id] = now_ts
+        _last_gen_used[ctx.author.id] = now_ts
 
-    safe, _ = is_safe(prompt)
-    if not safe and not is_owner:
-        await ctx.send(embed=error_embed("Nice try 😐", "Not happening.", ctx.bot.user))
-        return
+    # Safety check (skipped for owner)
+    if not is_owner:
+        safe, _ = is_safe(prompt)
+        if not safe:
+            await ctx.send(embed=error_embed("Nice try 😐", "Not happening.", ctx.bot.user))
+            return
 
     async with ctx.typing():
         try:
-            from urllib.parse import quote_plus
             import io
-            encoded = quote_plus(prompt)
+            from urllib.parse import quote
+
+            # Pollinations free Flux endpoint — no API key, no auth needed
+            # quote() (not quote_plus) is more reliable for image prompts
+            encoded = quote(prompt, safe="")
             seed    = abs(hash(f"{ctx.author.id}{prompt}")) % 99999
+
             img_url = (
                 f"https://image.pollinations.ai/prompt/{encoded}"
-                f"?width=1024&height=1024&seed={seed}&nologo=true&safe=true&model=flux"
+                f"?model=flux&width=1024&height=1024&seed={seed}&nologo=true&safe=true"
             )
 
-            async with httpx.AsyncClient(timeout=40) as client:
-                resp = await client.get(img_url)
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.get(img_url, follow_redirects=True)
                 resp.raise_for_status()
                 img_bytes = resp.content
+
+            # Sanity check — Pollinations returns a placeholder on bad prompts
+            if len(img_bytes) < 5000:
+                await ctx.send(embed=error_embed(
+                    "Generation failed",
+                    "Got a bad response from Pollinations. Try a different prompt.",
+                    ctx.bot.user,
+                ))
+                return
 
             file = discord.File(fp=io.BytesIO(img_bytes), filename="generated.png")
 
@@ -1355,9 +1370,20 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
             )
 
             await ctx.reply(file=file, embed=e, mention_author=False)
+            await bot.db.increment_stat(ctx.author.id, "images_generated")
 
         except httpx.HTTPStatusError as exc:
-            await ctx.send(embed=error_embed("Generation failed", f"Pollinations returned {exc.response.status_code}. Try a different prompt.", ctx.bot.user))
+            await ctx.send(embed=error_embed(
+                "Generation failed",
+                f"Pollinations returned HTTP {exc.response.status_code}. Try a different prompt.",
+                ctx.bot.user,
+            ))
+        except httpx.TimeoutException:
+            await ctx.send(embed=error_embed(
+                "Timed out",
+                "Pollinations took too long. Try again in a moment.",
+                ctx.bot.user,
+            ))
         except Exception as exc:
             logger.error("Image gen error: %s", exc, exc_info=exc)
             await ctx.send(embed=error_embed("Error", "Something went wrong generating that image.", ctx.bot.user))
@@ -1437,9 +1463,10 @@ async def cmd_stats(ctx: commands.Context):
     e = make_embed(C_SUCCESS)
     e.title = f"📊 {ctx.author.display_name}"
     e.set_thumbnail(url=ctx.author.display_avatar.url)
-    e.add_field(name="Questions",   value=f"`{data.get('questions', 0):,}`", inline=True)
-    e.add_field(name="First seen",  value=fmt(data.get("first_seen")),        inline=True)
-    e.add_field(name="Last active", value=fmt(data.get("last_seen")),         inline=True)
+    e.add_field(name="Questions",       value=f"`{data.get('questions', 0):,}`",         inline=True)
+    e.add_field(name="Images",          value=f"`{data.get('images_generated', 0):,}`",  inline=True)
+    e.add_field(name="First seen",      value=fmt(data.get("first_seen")),                inline=True)
+    e.add_field(name="Last active",     value=fmt(data.get("last_seen")),                 inline=True)
 
     global_data = await bot.db.global_stats()
     if global_data:
@@ -1460,7 +1487,7 @@ async def cmd_about(ctx: commands.Context):
     e.set_thumbnail(url=get_avatar(ctx.bot.user))
     e.add_field(name="Prefix",   value="`.`",                  inline=True)
     e.add_field(name="Memory",   value="Per channel, 14 days", inline=True)
-    e.add_field(name="Cooldown", value="5s (owner: none)",      inline=True)
+    e.add_field(name="Cooldown", value="5s chat · 15s image",  inline=True)
     e.set_footer(
         text=f"{len(bot.guilds)} server{'s' if len(bot.guilds) != 1 else ''}  •  Built by AJ",
         icon_url=get_avatar(ctx.bot.user),
@@ -1470,7 +1497,6 @@ async def cmd_about(ctx: commands.Context):
 
 @bot.command(name="admin", hidden=True)
 async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
-    # Only the owner can run admin commands, always
     if ctx.author.id != bot.owner_id_int:
         return
 
@@ -1481,17 +1507,13 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
         proc        = psutil.Process(os.getpid())
         proc_mem    = proc.memory_info().rss
 
-        # Accurate guild/member counts
         total_members = sum(g.member_count for g in bot.guilds)
         total_humans  = sum(sum(1 for m in g.members if not m.bot) for g in bot.guilds)
         total_bots    = sum(sum(1 for m in g.members if m.bot) for g in bot.guilds)
-
-        # Online members across all guilds (approximate)
-        online_count = sum(
+        online_count  = sum(
             sum(1 for m in g.members if not m.bot and m.status != discord.Status.offline)
             for g in bot.guilds
         )
-
         uptime_str = format_uptime(bot.start_time)
 
         desc = (
