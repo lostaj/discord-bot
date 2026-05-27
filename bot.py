@@ -1364,11 +1364,12 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
             encoded = quote(prompt, safe="")
             seed    = abs(hash(f"{ctx.author.id}{prompt}")) % 99999
 
-            # gen.pollinations.ai — new unified endpoint, free tier
-            # model=sana is the confirmed free model as of 2026
+            # image.pollinations.ai — correct free endpoint per official docs
+            # flux is the default free model; nologo requires an account so omit it
+            # enhance=true lets Pollinations improve the prompt for better results
             img_url = (
-                f"https://gen.pollinations.ai/image/{encoded}"
-                f"?model=sana&width=1024&height=1024&seed={seed}&nologo=true"
+                f"https://image.pollinations.ai/prompt/{encoded}"
+                f"?model=flux&width=1024&height=1024&seed={seed}&enhance=false&private=false"
             )
 
             # 👀 → ⏳
