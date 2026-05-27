@@ -47,8 +47,8 @@ C_GOLD    = 0xFFD700
 # ─── Groq Config ─────────────────────────────────────────────────────────────
 GROQ_MODEL_TEXT   = "llama-3.1-8b-instant"
 GROQ_MODEL_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"
-MAX_TOKENS        = 512
-TEMPERATURE       = 0.7
+MAX_TOKENS        = 400
+TEMPERATURE       = 0.65
 MAX_HISTORY_TURNS = 30
 HISTORY_TTL_DAYS  = 14
 
@@ -1241,6 +1241,12 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
             await ctx.send(embed=error_embed("Nice try 😐", "Not happening.", ctx.bot.user))
             return
 
+    # 👀 — bot saw the message
+    try:
+        await ctx.message.add_reaction("👀")
+    except Exception:
+        pass
+
     async with ctx.typing():
         try:
             history       = await bot.db.get_history(ctx.author.id, ctx.channel.id)
@@ -1266,6 +1272,13 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
                 model        = GROQ_MODEL_TEXT
                 use_web      = web_enabled and any(t in question.lower() for t in WEB_TRIGGERS)
 
+            # 👀 → ⏳
+            try:
+                await ctx.message.remove_reaction("👀", ctx.bot.user)
+                await ctx.message.add_reaction("⏳")
+            except Exception:
+                pass
+
             answer = await bot.ai.ask(
                 user_content, history, model,
                 context=context_str,
@@ -1289,6 +1302,11 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
         mention_author=False,
         allowed_mentions=discord.AllowedMentions.none(),
     )
+    # Remove ⏳ once reply is sent
+    try:
+        await ctx.message.remove_reaction("⏳", ctx.bot.user)
+    except Exception:
+        pass
 
 
 # ─── Image Generation ────────────────────────────────────────────────────────
@@ -1330,6 +1348,12 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
             await ctx.send(embed=error_embed("Nice try 😐", "Not happening.", ctx.bot.user))
             return
 
+    # 👀 — bot saw the message
+    try:
+        await ctx.message.add_reaction("👀")
+    except Exception:
+        pass
+
     async with ctx.typing():
         try:
             import io
@@ -1342,10 +1366,17 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
 
             img_url = (
                 f"https://image.pollinations.ai/prompt/{encoded}"
-                f"?model=flux&width=1024&height=1024&seed={seed}&nologo=true&safe=true"
+                f"?width=1024&height=1024&seed={seed}&nologo=true&safe=true"
             )
 
-            async with httpx.AsyncClient(timeout=60) as client:
+            # 👀 → ⏳
+            try:
+                await ctx.message.remove_reaction("👀", ctx.bot.user)
+                await ctx.message.add_reaction("⏳")
+            except Exception:
+                pass
+
+            async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0)) as client:
                 resp = await client.get(img_url, follow_redirects=True)
                 resp.raise_for_status()
                 img_bytes = resp.content
@@ -1371,6 +1402,10 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
 
             await ctx.reply(file=file, embed=e, mention_author=False)
             await bot.db.increment_stat(ctx.author.id, "images_generated")
+            try:
+                await ctx.message.remove_reaction("⏳", ctx.bot.user)
+            except Exception:
+                pass
 
         except httpx.HTTPStatusError as exc:
             await ctx.send(embed=error_embed(
@@ -1379,6 +1414,11 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
                 ctx.bot.user,
             ))
         except httpx.TimeoutException:
+            try:
+                await ctx.message.remove_reaction("👀", ctx.bot.user)
+                await ctx.message.remove_reaction("⏳", ctx.bot.user)
+            except Exception:
+                pass
             await ctx.send(embed=error_embed(
                 "Timed out",
                 "Pollinations took too long. Try again in a moment.",
@@ -1386,6 +1426,11 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
             ))
         except Exception as exc:
             logger.error("Image gen error: %s", exc, exc_info=exc)
+            try:
+                await ctx.message.remove_reaction("👀", ctx.bot.user)
+                await ctx.message.remove_reaction("⏳", ctx.bot.user)
+            except Exception:
+                pass
             await ctx.send(embed=error_embed("Error", "Something went wrong generating that image.", ctx.bot.user))
 
 
