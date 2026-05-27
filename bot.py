@@ -1364,9 +1364,11 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
             encoded = quote(prompt, safe="")
             seed    = abs(hash(f"{ctx.author.id}{prompt}")) % 99999
 
+            # gen.pollinations.ai — new unified endpoint, free tier
+            # model=sana is the confirmed free model as of 2026
             img_url = (
-                f"https://image.pollinations.ai/prompt/{encoded}"
-                f"?width=1024&height=1024&seed={seed}&nologo=true&safe=true"
+                f"https://gen.pollinations.ai/image/{encoded}"
+                f"?model=sana&width=1024&height=1024&seed={seed}&nologo=true"
             )
 
             # 👀 → ⏳
@@ -1408,11 +1410,19 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
                 pass
 
         except httpx.HTTPStatusError as exc:
-            await ctx.send(embed=error_embed(
-                "Generation failed",
-                f"Pollinations returned HTTP {exc.response.status_code}. Try a different prompt.",
-                ctx.bot.user,
-            ))
+            try:
+                await ctx.message.remove_reaction("👀", ctx.bot.user)
+                await ctx.message.remove_reaction("⏳", ctx.bot.user)
+            except Exception:
+                pass
+            code = exc.response.status_code
+            if code == 402:
+                msg = "The image service requires payment for this request. The bot owner needs to update the endpoint."
+            elif code == 429:
+                msg = "Pollinations is rate-limiting us. Try again in a minute."
+            else:
+                msg = f"Pollinations returned HTTP {code}. Try again shortly."
+            await ctx.send(embed=error_embed("Generation failed", msg, ctx.bot.user))
         except httpx.TimeoutException:
             try:
                 await ctx.message.remove_reaction("👀", ctx.bot.user)
