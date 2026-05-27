@@ -9,7 +9,7 @@ Environment variables required:
   DISCORD_TOKEN   — your bot token
   GROQ_API_KEY_1  — Groq API key #1 (required)
   GROQ_API_KEY_2  — Groq API key #2 (optional)
-  GROQ_API_KEY_3  — Groq API key #3 (optional)e
+  GROQ_API_KEY_3  — Groq API key #3 (optional)
   GROQ_API_KEY_4  — Groq API key #4 (optional)
   GROQ_API_KEY_5  — Groq API key #5 (optional)
   MONGO_URI       — MongoDB connection string
@@ -449,7 +449,7 @@ async def update_member_count_channel(guild: discord.Guild):
     if channel is None:
         return
     # Count non-bot members
-    real_count = sum(1 for m in guild.members if not m.bot)
+    real_count = guild.member_count
     new_name   = MEMBER_COUNT_FORMAT.format(count=real_count)
     if channel.name != new_name:
         try:
@@ -706,7 +706,7 @@ class SetCustomPromptModal(discord.ui.Modal, title="Set Custom System Prompt Pre
 
 def member_count_embed(cfg: dict, guild: Optional[discord.Guild]) -> discord.Embed:
     enabled    = cfg.get("member_count_enabled", True)
-    real_count = sum(1 for m in guild.members if not m.bot) if guild else "?"
+    real_count = guild.member_count if guild else "?"
     ch         = guild.get_channel(MEMBER_COUNT_CHANNEL_ID) if guild else None
     ch_str     = ch.mention if ch else f"`{MEMBER_COUNT_CHANNEL_ID}` *(not found)*"
 
@@ -716,7 +716,7 @@ def member_count_embed(cfg: dict, guild: Optional[discord.Guild]) -> discord.Emb
         timestamp=datetime.datetime.utcnow(),
     )
     e.add_field(name="📢  Channel",         value=ch_str,                                              inline=True)
-    e.add_field(name="👥  Current Count",   value=f"`{real_count}` real members",                      inline=True)
+    e.add_field(name="👥  Current Count",   value=f"`{real_count}` members",                      inline=True)
     e.add_field(name="🔄  Status",          value="✅ Active" if enabled else "❌ Paused",              inline=True)
     e.add_field(name="🏷️  Name Format",     value=f"`{MEMBER_COUNT_FORMAT}`",                          inline=False)
     e.add_field(
@@ -857,6 +857,9 @@ class LXTEBot(commands.Bot):
     async def on_command_error(self, ctx: commands.Context, error):
         if isinstance(error, commands.CommandNotFound):
             return
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send(embed=error_embed("No Permission", "You don't have permission to use that command."))
+            return
         if isinstance(error, commands.MissingRequiredArgument):
             await ctx.send(embed=error_embed("Missing argument", f"Usage: `.{ctx.command.name} <...>`"))
         elif isinstance(error, commands.CommandOnCooldown):
@@ -878,9 +881,15 @@ bot = LXTEBot()
 # ── SETUP ─────────────────────────────────────────────────────────────────────
 
 @bot.command(name="setup", aliases=["config", "configure"])
-@commands.has_permissions(administrator=True)
 async def cmd_setup(ctx: commands.Context):
     """Interactive setup wizard. Admin only."""
+    is_owner = (ctx.author.id == bot.owner_id_int)
+    is_admin = ctx.guild and ctx.author.guild_permissions.administrator
+
+    if not is_owner and not is_admin:
+        await ctx.send(embed=error_embed("No Permission", "You need **Administrator** to use setup."))
+        return
+
     cfg  = bot.db.get_config(ctx.guild.id)
     view = SetupHomeView(bot.owner_id_int, ctx.guild.id)
     msg  = await ctx.send(embed=setup_home_embed(cfg), view=view)
