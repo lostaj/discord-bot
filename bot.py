@@ -1303,6 +1303,66 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
     )
 
 
+@bot.command(name="generate", aliases=["gen", "draw", "imagine", "img"])
+async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
+    """Generate an image using Pollinations.ai — free, no key needed."""
+    if not prompt:
+        await ctx.send(embed=error_embed("Missing prompt", "Usage: `.generate a dinosaur wearing sunglasses`", ctx.bot.user))
+        return
+
+    is_owner = ctx.author.id == bot.owner_id_int
+    if not is_owner:
+        now_ts    = time.monotonic()
+        last      = _last_used.get(ctx.author.id, 0.0)
+        remaining = USER_COOLDOWN_SECS - (now_ts - last)
+        if remaining > 0:
+            await ctx.send(
+                embed=error_embed("Slow down", f"Wait {remaining:.1f}s.", ctx.bot.user),
+                delete_after=4,
+            )
+            return
+        _last_used[ctx.author.id] = now_ts
+
+    safe, _ = is_safe(prompt)
+    if not safe and not is_owner:
+        await ctx.send(embed=error_embed("Nice try 😐", "Not happening.", ctx.bot.user))
+        return
+
+    async with ctx.typing():
+        try:
+            from urllib.parse import quote_plus
+            import io
+            encoded = quote_plus(prompt)
+            seed    = abs(hash(f"{ctx.author.id}{prompt}")) % 99999
+            img_url = (
+                f"https://image.pollinations.ai/prompt/{encoded}"
+                f"?width=1024&height=1024&seed={seed}&nologo=true&safe=true&model=flux"
+            )
+
+            async with httpx.AsyncClient(timeout=40) as client:
+                resp = await client.get(img_url)
+                resp.raise_for_status()
+                img_bytes = resp.content
+
+            file = discord.File(fp=io.BytesIO(img_bytes), filename="generated.png")
+
+            e = discord.Embed(color=0x9B59B6, timestamp=datetime.now(timezone.utc))
+            e.set_author(name="LXTE's Assistant", icon_url=get_avatar(ctx.bot.user))
+            e.set_image(url="attachment://generated.png")
+            e.set_footer(
+                text=f"{prompt[:80]}{'…' if len(prompt) > 80 else ''}  •  {ctx.author.display_name}",
+                icon_url=ctx.author.display_avatar.url,
+            )
+
+            await ctx.reply(file=file, embed=e, mention_author=False)
+
+        except httpx.HTTPStatusError as exc:
+            await ctx.send(embed=error_embed("Generation failed", f"Pollinations returned {exc.response.status_code}. Try a different prompt.", ctx.bot.user))
+        except Exception as exc:
+            logger.error("Image gen error: %s", exc, exc_info=exc)
+            await ctx.send(embed=error_embed("Error", "Something went wrong generating that image.", ctx.bot.user))
+
+
 @bot.command(name="level", aliases=["rank", "xp"])
 async def cmd_level(ctx: commands.Context, target: discord.Member = None):
     target   = target or ctx.author
