@@ -52,6 +52,11 @@ TEMPERATURE       = 0.65
 MAX_HISTORY_TURNS = 30
 HISTORY_TTL_DAYS  = 14
 
+# ─── Pollinations ────────────────────────────────────────────────────────────
+# Get a FREE token at https://auth.pollinations.ai (sign in with Discord, 30s)
+# Then add POLLINATIONS_TOKEN=your_token to your .env — no payment needed.
+POLLINATIONS_TOKEN = os.environ.get("POLLINATIONS_TOKEN", "")
+
 # ─── Rate limit ──────────────────────────────────────────────────────────────
 USER_COOLDOWN_SECS    = 5.0    # non-owners only — for .ask
 GEN_COOLDOWN_SECS     = 15.0   # separate cooldown for image generation
@@ -1364,13 +1369,15 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
             encoded = quote(prompt, safe="")
             seed    = abs(hash(f"{ctx.author.id}{prompt}")) % 99999
 
-            # image.pollinations.ai — correct free endpoint per official docs
-            # flux is the default free model; nologo requires an account so omit it
-            # enhance=true lets Pollinations improve the prompt for better results
             img_url = (
                 f"https://image.pollinations.ai/prompt/{encoded}"
-                f"?model=flux&width=1024&height=1024&seed={seed}&enhance=false&private=false"
+                f"?model=flux&width=1024&height=1024&seed={seed}"
             )
+
+            # Build headers — include token if configured
+            headers = {"User-Agent": "LXTEBot/7.0"}
+            if POLLINATIONS_TOKEN:
+                headers["Authorization"] = f"Bearer {POLLINATIONS_TOKEN}"
 
             # 👀 → ⏳
             try:
@@ -1380,7 +1387,7 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
                 pass
 
             async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0)) as client:
-                resp = await client.get(img_url, follow_redirects=True)
+                resp = await client.get(img_url, headers=headers, follow_redirects=True)
                 resp.raise_for_status()
                 img_bytes = resp.content
 
@@ -1418,7 +1425,7 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
                 pass
             code = exc.response.status_code
             if code == 402:
-                msg = "The image service requires payment for this request. The bot owner needs to update the endpoint."
+                msg = "Missing Pollinations token. Owner: get a free token at auth.pollinations.ai and add POLLINATIONS_TOKEN to .env"
             elif code == 429:
                 msg = "Pollinations is rate-limiting us. Try again in a minute."
             else:
