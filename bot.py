@@ -2209,7 +2209,8 @@ def ar_settings_embed(config, guild, user=None):
     lines = []
     for entry in autoroles:
         role = guild.get_role(entry.get("role_id")) if guild else None
-        lines.append(f"• {role.mention if role else f'`{entry.get(\"role_id\")}` (deleted?)'}")
+        rid = entry.get("role_id")
+        lines.append(f"• {role.mention if role else f'`{rid}` (deleted?)'}")
     e = make_embed(C_SUCCESS)
     e.title       = "🎭 Auto-Roles"
     e.description = "\n".join(lines) if lines else "`None configured.`"
