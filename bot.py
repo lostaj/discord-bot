@@ -1314,13 +1314,7 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
     except Exception:
         pass
 
-
 # ─── Image Generation ────────────────────────────────────────────────────────
-# Aliases: .generate and .gen ONLY
-# Uses Pollinations.ai free tier with Flux model (no API key required)
-# Separate cooldown dict from .ask to avoid cross-contamination
-# ─────────────────────────────────────────────────────────────────────────────
-
 @bot.command(name="generate", aliases=["gen"])
 async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
     """Generate an image using Pollinations.ai Flux — free, no key needed."""
@@ -1334,7 +1328,6 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
 
     is_owner = ctx.author.id == bot.owner_id_int
 
-    # ── Separate rate limit from .ask ─────────────────────────────────────────
     if not is_owner:
         now_ts    = time.monotonic()
         last      = _last_gen_used.get(ctx.author.id, 0.0)
@@ -1347,26 +1340,34 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
             return
         _last_gen_used[ctx.author.id] = now_ts
 
-    # Safety check (skipped for owner)
     if not is_owner:
         safe, _ = is_safe(prompt)
         if not safe:
             await ctx.send(embed=error_embed("Nice try 😐", "Not happening.", ctx.bot.user))
             return
 
-    # 👀 — bot saw the message
     try:
         await ctx.message.add_reaction("👀")
     except Exception:
         pass
+
+    wait_embed = discord.Embed(
+        description="🎨 Generating your image...\n⏱️ Estimated wait: **10–25 seconds**",
+        color=0x9B59B6,
+        timestamp=datetime.now(timezone.utc),
+    )
+    wait_embed.set_footer(
+        text=f"Prompt: {prompt[:80]}{'…' if len(prompt) > 80 else ''}",
+        icon_url=ctx.author.display_avatar.url,
+    )
+    status_msg = await ctx.reply(embed=wait_embed, mention_author=False)
+    gen_start  = time.monotonic()
 
     async with ctx.typing():
         try:
             import io
             from urllib.parse import quote
 
-            # Pollinations free Flux endpoint — no API key, no auth needed
-            # quote() (not quote_plus) is more reliable for image prompts
             encoded = quote(prompt, safe="")
             seed    = abs(hash(f"{ctx.author.id}{prompt}")) % 99999
 
@@ -1375,12 +1376,10 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
                 f"?model=flux&width=1024&height=1024&seed={seed}"
             )
 
-            # Build headers — include token if configured
             headers = {"User-Agent": "LXTEBot/7.0"}
             if POLLINATIONS_TOKEN:
                 headers["Authorization"] = f"Bearer {POLLINATIONS_TOKEN}"
 
-            # 👀 → ⏳
             try:
                 await ctx.message.remove_reaction("👀", ctx.bot.user)
                 await ctx.message.add_reaction("⏳")
@@ -1392,8 +1391,8 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
                 resp.raise_for_status()
                 img_bytes = resp.content
 
-            # Sanity check — Pollinations returns a placeholder on bad prompts
             if len(img_bytes) < 5000:
+                await status_msg.delete()
                 await ctx.send(embed=error_embed(
                     "Generation failed",
                     "Got a bad response from Pollinations. Try a different prompt.",
@@ -1401,16 +1400,18 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
                 ))
                 return
 
-            file = discord.File(fp=io.BytesIO(img_bytes), filename="generated.png")
+            elapsed = time.monotonic() - gen_start
+            file    = discord.File(fp=io.BytesIO(img_bytes), filename="generated.png")
 
             e = discord.Embed(color=0x9B59B6, timestamp=datetime.now(timezone.utc))
             e.set_author(name="LXTE's Assistant", icon_url=get_avatar(ctx.bot.user))
             e.set_image(url="attachment://generated.png")
             e.set_footer(
-                text=f"{prompt[:80]}{'…' if len(prompt) > 80 else ''}  •  {ctx.author.display_name}",
+                text=f"{prompt[:80]}{'…' if len(prompt) > 80 else ''}  •  {ctx.author.display_name}  •  took {elapsed:.1f}s",
                 icon_url=ctx.author.display_avatar.url,
             )
 
+            await status_msg.delete()
             await ctx.reply(file=file, embed=e, mention_author=False)
             await bot.db.increment_stat(ctx.author.id, "images_generated")
             try:
@@ -1419,6 +1420,7 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
                 pass
 
         except httpx.HTTPStatusError as exc:
+            await status_msg.delete()
             try:
                 await ctx.message.remove_reaction("👀", ctx.bot.user)
                 await ctx.message.remove_reaction("⏳", ctx.bot.user)
@@ -1433,6 +1435,7 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
                 msg = f"Pollinations returned HTTP {code}. Try again shortly."
             await ctx.send(embed=error_embed("Generation failed", msg, ctx.bot.user))
         except httpx.TimeoutException:
+            await status_msg.delete()
             try:
                 await ctx.message.remove_reaction("👀", ctx.bot.user)
                 await ctx.message.remove_reaction("⏳", ctx.bot.user)
@@ -1445,6 +1448,7 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
             ))
         except Exception as exc:
             logger.error("Image gen error: %s", exc, exc_info=exc)
+            await status_msg.delete()
             try:
                 await ctx.message.remove_reaction("👀", ctx.bot.user)
                 await ctx.message.remove_reaction("⏳", ctx.bot.user)
