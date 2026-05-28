@@ -186,13 +186,12 @@ def progress_bar(current: int, needed: int, length: int = 15) -> str:
     filled = int(length * current / needed)
     return "█" * filled + "░" * (length - filled)
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 #  POST-PROCESSING
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Matches @Name patterns — first char must be alphanumeric, no email/URL chars inside
-_MENTION_RE = re.compile(r'(?<![A-Za-z0-9])@([A-Za-z0-9][A-Za-z0-9_\.\- ]{0,31})')
+# Matches @Name patterns — allows spaces/special chars up to 32 chars, stops at space/end
+_MENTION_RE = re.compile(r'(?<![A-Za-z0-9])@(.{1,32})(?=\s|$)')
 
 
 def strip_bold(text: str) -> str:
@@ -202,6 +201,10 @@ def strip_bold(text: str) -> str:
 
 def _resolve_mention(raw: str, guild: discord.Guild):
     """Try to resolve an @name to a member or role. Returns (member, role)."""
+    # Block Discord system pings and invalid strings (emails/urls)
+    if raw.lower() in ('everyone', 'here') or '@' in raw or ':' in raw or '/' in raw:
+        return None, None
+
     member = discord.utils.find(
         lambda mem: mem.display_name.lower() == raw.lower()
                     or mem.name.lower() == raw.lower(),
@@ -230,8 +233,6 @@ def format_mentions(text: str, guild: Optional[discord.Guild]) -> str:
 
     def replace_mention(m):
         raw = m.group(1).strip()
-        if '@' in raw or ':' in raw or '/' in raw:
-            return f"@{raw}"
         member, role = _resolve_mention(raw, guild)
         if member:
             return f"@{member.display_name}"
@@ -266,7 +267,7 @@ def clean_ai_response(text: str, guild: Optional[discord.Guild] = None) -> str:
 def extract_pings(answer: str, guild: Optional[discord.Guild]) -> tuple[str, str]:
     """
     Extract @name patterns and convert to real <@id>/<@&id> for message content
-    so Discord renders them as highlighted pills visually.
+    so Discord renders them as highlighted pills visually via the -# trick.
 
     With allowed_mentions=none() on the reply, NO actual notifications fire —
     but the pills still show up in the message content. The embed gets clean
@@ -281,8 +282,6 @@ def extract_pings(answer: str, guild: Optional[discord.Guild]) -> tuple[str, str
 
     def replace(m):
         raw = m.group(1).strip()
-        if '@' in raw or ':' in raw or '/' in raw:
-            return f"@{raw}"
         member, role = _resolve_mention(raw, guild)
         if member:
             ping_parts.append(f"<@{member.id}>")
