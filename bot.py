@@ -2884,21 +2884,6 @@ class DoubleXPAddModal(discord.ui.Modal, title="Add Double XP Role"):
         if not role:
             await interaction.response.send_message(embed=error_embed("Not found", f"No role `{self.role_name.value}`.", interaction.client.user), ephemeral=True)
             return
-
-            class DoubleXPAddModal(discord.ui.Modal, title="Add Double XP Role"):
-    role_name = discord.ui.TextInput(label="Role name", max_length=100)
-
-    def __init__(self, guild_id, owner_id, message=None):
-        super().__init__()
-        self.guild_id = guild_id
-        self.owner_id = owner_id
-        self._message = message
-
-    async def on_submit(self, interaction):
-        role = resolve_role(interaction.guild, self.role_name.value)
-        if not role:
-            await interaction.response.send_message(embed=error_embed("Not found", f"No role `{self.role_name.value}`.", interaction.client.user), ephemeral=True)
-            return
         config   = await get_config_cached(self.guild_id)
         role_ids = config.get("double_xp_roles", [])
         if role.id in role_ids:
@@ -2929,7 +2914,6 @@ class DoubleXPRemoveModal(discord.ui.Modal, title="Remove Double XP Role"):
         await bot.db.update_config(self.guild_id, "double_xp_roles", role_ids)
         config = await get_config_cached(self.guild_id)
         await interaction.response.edit_message(embed=doublexp_settings_embed(config, interaction.guild, interaction.client.user), view=DoubleXPSettingsView(self.owner_id, self.guild_id, self._message))
-
 
 # ─── XP Decay Settings ────────────────────────────────────────────────────────
 
@@ -4893,5 +4877,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-        config   = await get_config_cached(self.guild_id)
-        role_ids = config.get("double
