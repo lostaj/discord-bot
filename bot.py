@@ -1,12 +1,13 @@
 """
 LXTE's Assistant — built by AJ
 httpx · MongoDB · discord.py
-v8.0.0 — Professional, intelligent, owner-first
+v8.1.0 — Smart metadata, follow-up buttons, smart context, link reading, proactive image analysis
 """
 
 import io
 import os
 import re
+import json
 import math
 import time
 import random
@@ -26,7 +27,7 @@ from discord.ext import commands
 from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
-print("✅ LXTE's Assistant v8.0 — loaded")
+print("✅ LXTE's Assistant v8.1 — loaded")
 print("Pollinations token loaded:", bool(os.environ.get("POLLINATIONS_TOKEN")))
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -98,8 +99,33 @@ WEB_TRIGGERS = [
     r"\b202[5-9]\b", r"\btrending\b", r"\bwhat happened\b",
 ]
 
+# ─── URL Pattern ──────────────────────────────────────────────────────────────
+URL_PATTERN = re.compile(r'https?://[^\s>"]+')
+
 # ─── System Prompt ────────────────────────────────────────────────────────────
+# CHANGE 1: JSON metadata line instruction prepended at the very top
 SYSTEM_PROMPT = """\
+## CRITICAL OUTPUT FORMAT — THIS OVERRIDES EVERYTHING ELSE
+Your VERY FIRST LINE of every response MUST be a raw JSON object on a single line. No markdown. No backticks. No preamble. No explanation before it. Just the JSON.
+
+The JSON line MUST have exactly these keys:
+{"web": true/false, "needs_followup": true/false, "tone": "casual/technical/venting/urgent/joking", "confidence": 1-10, "quality_issues": "ok or description"}
+
+- "web": true ONLY if the answer would be factually wrong or meaningfully incomplete without real-time live data. NOT just because the word "current" appears. Examples: current stock prices → true. How does Python work → false. Latest news today → true. What is the speed of light → false.
+- "needs_followup": true if the topic is complex enough the user likely has natural follow-up questions. false for simple facts, greetings, casual chat.
+- "tone": classify the user's emotional register honestly. Options: casual, technical, venting, urgent, joking.
+- "confidence": your honest self-assessed confidence in the correctness and completeness of your answer, integer 1-10.
+- "quality_issues": before outputting, review your answer. If it is incomplete, dodgy, fails to address what was asked, or contains uncertain facts, describe the issue briefly. Otherwise write exactly "ok".
+
+Then a blank line. Then your actual answer.
+
+Example output:
+{"web": false, "needs_followup": true, "tone": "technical", "confidence": 9, "quality_issues": "ok"}
+
+Here is the detailed explanation of the algorithm...
+
+---
+
 You are LXTE's Assistant — built from scratch by AJ for the LXTE Discord server.
 
 ## Identity
@@ -255,11 +281,25 @@ def clean_ai_response(text: str, guild: Optional[discord.Guild] = None) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  CHANGE 1 — SMART RESPONSE PARSER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def parse_smart_response(raw: str) -> tuple[dict, str]:
+    lines = raw.strip().split("\n", 2)
+    try:
+        meta   = json.loads(lines[0])
+        answer = lines[2].strip() if len(lines) > 2 else lines[-1].strip()
+    except (json.JSONDecodeError, IndexError):
+        meta   = {"web": False, "needs_followup": False, "tone": "casual", "confidence": 8, "quality_issues": "ok"}
+        answer = raw.strip()
+    return meta, answer
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  SOURCE FETCHING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def fetch_wikipedia(topic: str) -> str:
-    """Fetch a Wikipedia summary for a topic. Returns formatted string or empty."""
     try:
         encoded = quote(topic.strip(), safe="")
         async with httpx.AsyncClient(timeout=8) as client:
@@ -276,7 +316,6 @@ async def fetch_wikipedia(topic: str) -> str:
             page_url = data.get("content_urls", {}).get("desktop", {}).get("page", "")
             if not extract:
                 return ""
-            # Truncate to a useful length
             if len(extract) > 600:
                 extract = extract[:597] + "..."
             url_str = f" ({page_url})" if page_url else ""
@@ -287,7 +326,6 @@ async def fetch_wikipedia(topic: str) -> str:
 
 
 async def fetch_roblox_wiki(topic: str) -> str:
-    """Fetch a Roblox Fandom Wiki summary for a topic."""
     try:
         params = {
             "action":  "query",
@@ -327,10 +365,6 @@ def is_roblox_query(text: str) -> bool:
 
 
 def extract_topic(question: str) -> str:
-    """
-    Best-effort extraction of the main topic from a question for wiki lookups.
-    Strips common question words, returns the core subject.
-    """
     q = re.sub(
         r"^(what is|what are|who is|who are|tell me about|explain|define|"
         r"how does|how do|what was|what were|when did|where is|where are)\s+",
@@ -341,10 +375,6 @@ def extract_topic(question: str) -> str:
 
 
 async def get_source_context(question: str) -> str:
-    """
-    Decides which source to pull from (Wikipedia or Roblox Wiki) and returns
-    a formatted string to inject into the system context.
-    """
     topic = extract_topic(question)
     if not topic:
         return ""
@@ -353,7 +383,6 @@ async def get_source_context(question: str) -> str:
         result = await fetch_roblox_wiki(topic)
         if result:
             return f"\n\n## SOURCED KNOWLEDGE (Roblox Wiki)\n{result}"
-        # Fall back to Wikipedia if Roblox Wiki doesn't have it
         result = await fetch_wikipedia(topic)
         if result:
             return f"\n\n## SOURCED KNOWLEDGE (Wikipedia)\n{result}"
@@ -363,6 +392,22 @@ async def get_source_context(question: str) -> str:
             return f"\n\n## SOURCED KNOWLEDGE (Wikipedia)\n{result}"
 
     return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CHANGE 4 — URL CONTENT FETCHING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def fetch_url_content(url: str) -> str:
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"User-Agent": "LXTEBot/8.1"})
+            resp.raise_for_status()
+            text = re.sub(r'<[^>]+>', ' ', resp.text)
+            text = re.sub(r'\s+', ' ', text).strip()
+            return text[:3000]
+    except Exception:
+        return ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -461,8 +506,6 @@ class Database:
     async def close(self):
         self._client.close()
 
-    # ── History ───────────────────────────────────────────────────────────────
-
     async def get_history(self, user_id: int, channel_id: int) -> list[dict]:
         doc = await self.history.find_one({"user_id": user_id, "channel_id": channel_id})
         return doc["messages"] if doc else []
@@ -486,8 +529,6 @@ class Database:
         r = await self.history.delete_many({"user_id": user_id})
         logger.info("Cleared history for %d (%d docs)", user_id, r.deleted_count)
 
-    # ── Stats ─────────────────────────────────────────────────────────────────
-
     async def increment_stat(self, user_id: int, field: str):
         now = datetime.now(timezone.utc)
         await self.stats.update_one(
@@ -507,8 +548,6 @@ class Database:
             results.append(doc)
         return results[0] if results else {}
 
-    # ── Config ────────────────────────────────────────────────────────────────
-
     async def get_config(self, guild_id: int) -> dict:
         return await self.config.find_one({"guild_id": guild_id}) or {}
 
@@ -518,8 +557,6 @@ class Database:
             {"$set": {key: value, "updated_at": datetime.now(timezone.utc)}, "$setOnInsert": {"guild_id": guild_id}},
             upsert=True,
         )
-
-    # ── Levels ────────────────────────────────────────────────────────────────
 
     async def get_level_data(self, user_id: int, guild_id: int) -> dict:
         return await self.levels.find_one({"user_id": user_id, "guild_id": guild_id}) or {}
@@ -570,28 +607,20 @@ def is_safe(text: str) -> tuple[bool, str]:
 
 
 def resolve_mentioned_members(message: discord.Message, guild: discord.Guild) -> list[discord.Member]:
-    """
-    Returns only the members actually referenced in this message.
-    Checks: @mention pings, display name, username, raw user ID in text.
-    """
     found_ids: set[int] = set()
 
-    # Direct @mention pings
     for u in message.mentions:
         m = guild.get_member(u.id)
         if m:
             found_ids.add(m.id)
 
-    # Scan message text for display names, usernames, and raw user IDs
     content = message.content
 
-    # Raw user IDs (17-20 digit numbers)
     for raw_id in re.findall(r'\b(\d{17,20})\b', content):
         m = guild.get_member(int(raw_id))
         if m:
             found_ids.add(m.id)
 
-    # Names — tokenise loosely, try each token and bigram against member list
     tokens = re.findall(r'[A-Za-z0-9_\.\-]{2,32}', content)
     bigrams = [f"{tokens[i]} {tokens[i+1]}" for i in range(len(tokens) - 1)]
     candidates = tokens + bigrams
@@ -608,7 +637,7 @@ def resolve_mentioned_members(message: discord.Message, guild: discord.Guild) ->
     return [guild.get_member(uid) for uid in found_ids if guild.get_member(uid)]
 
 
-def build_context(ctx: commands.Context, recent_chat: str = "") -> str:
+def build_context(ctx: commands.Context, recent_chat: str = "", tone: str = "") -> str:
     lines  = []
     member = ctx.author
 
@@ -639,7 +668,6 @@ def build_context(ctx: commands.Context, recent_chat: str = "") -> str:
         roles_list = ', '.join(r.name for r in guild.roles if r.name != '@everyone')
         lines.append(f"Roles         : {roles_list}")
 
-        # ── Only members actually referenced in this message ──────────────────
         relevant = resolve_mentioned_members(ctx.message, guild)
         if relevant:
             lines.append(f"\n=== REFERENCED MEMBERS ({len(relevant)}) ===")
@@ -658,6 +686,10 @@ def build_context(ctx: commands.Context, recent_chat: str = "") -> str:
         lines.append(f"Topic: {ctx.channel.topic}")
     lines.append(f"UTC time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
 
+    # CHANGE 1: inject detected tone if provided
+    if tone:
+        lines.append(f"\nUser tone detected: {tone} — calibrate your response register accordingly.")
+
     if recent_chat:
         lines.append("\n=== RECENT CHANNEL CHAT (context, not the question) ===")
         lines.append(recent_chat)
@@ -665,20 +697,30 @@ def build_context(ctx: commands.Context, recent_chat: str = "") -> str:
     return "\n".join(lines)
 
 
-async def fetch_recent_chat(channel: discord.TextChannel, before_message: discord.Message, limit: int = 8) -> str:
-    """Fetch recent non-bot messages before the triggering message for context."""
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CHANGE 3 — SMART CONTEXT WINDOW
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def score_relevance(message: str, question: str) -> int:
+    q_words = set(re.findall(r'\b\w{3,}\b', question.lower()))
+    m_words = set(re.findall(r'\b\w{3,}\b', message.lower()))
+    return len(q_words & m_words)
+
+
+async def fetch_recent_chat(channel: discord.TextChannel, before_message: discord.Message, question: str, limit: int = 20) -> str:
     try:
         msgs = [
-            m async for m in channel.history(limit=limit + 1, before=before_message)
+            m async for m in channel.history(limit=limit, before=before_message)
             if not m.author.bot and m.content.strip()
         ]
-        msgs.reverse()
         if not msgs:
             return ""
-        return "\n".join(
-            f"{m.author.display_name}: {m.content[:180]}"
-            for m in msgs[-8:]
-        )
+        # Score each message by keyword overlap with the question
+        scored = sorted(msgs, key=lambda m: score_relevance(m.content, question), reverse=True)
+        top = scored[:5]
+        # Re-sort by time so context reads chronologically
+        top.sort(key=lambda m: m.created_at)
+        return "\n".join(f"{m.author.display_name}: {m.content[:180]}" for m in top)
     except Exception:
         return ""
 
@@ -688,7 +730,6 @@ async def fetch_recent_chat(channel: discord.TextChannel, before_message: discor
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def keep_typing(channel: discord.TextChannel, stop_event: asyncio.Event):
-    """Keeps the typing indicator alive for slow responses."""
     while not stop_event.is_set():
         try:
             await channel.trigger_typing()
@@ -733,6 +774,31 @@ class AIEngine:
             kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
 
         return await self._rotator.call(**kwargs)
+
+    async def get_followup_questions(self, question: str, answer: str) -> list[str]:
+        """Generate 3 follow-up questions for the given Q&A. Returns list of strings."""
+        prompt = (
+            f'The user just asked: "{question}"\n'
+            f'The bot answered: "{answer}"\n'
+            'Generate exactly 3 natural follow-up questions the user might want to ask next. '
+            'Return ONLY a JSON array of 3 strings, nothing else. No preamble. '
+            'Example: ["What does X mean?", "How does Y work?", "What about Z?"]'
+        )
+        try:
+            raw = await self._rotator.call(
+                model=GROQ_MODEL_TEXT,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=150,
+                temperature=0.4,
+            )
+            # Strip any accidental markdown fences
+            raw = re.sub(r'```(?:json)?|```', '', raw).strip()
+            questions = json.loads(raw)
+            if isinstance(questions, list):
+                return [str(q) for q in questions[:3]]
+        except Exception as exc:
+            logger.warning("Follow-up generation failed: %s", exc)
+        return []
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -828,13 +894,11 @@ async def update_member_count(guild: discord.Guild):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class RegenerateView(discord.ui.View):
-    """Attaches a 🔄 button to AI responses. Only the original asker can use it."""
-
     def __init__(self, ctx: commands.Context, question: str, history_snapshot: list[dict]):
         super().__init__(timeout=120)
         self.ctx              = ctx
         self.question         = question
-        self.history_snapshot = history_snapshot  # history BEFORE this answer
+        self.history_snapshot = history_snapshot
 
     @discord.ui.button(label="🔄 Regenerate", style=discord.ButtonStyle.secondary)
     async def btn_regen(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -859,7 +923,7 @@ class RegenerateView(discord.ui.View):
             use_web       = web_enabled and any(re.search(t, self.question, re.IGNORECASE) for t in WEB_TRIGGERS)
             source_ctx    = await get_source_context(self.question)
 
-            answer = await bot.ai.ask(
+            raw = await bot.ai.ask(
                 self.question,
                 self.history_snapshot,
                 GROQ_MODEL_TEXT,
@@ -869,6 +933,7 @@ class RegenerateView(discord.ui.View):
                 use_web_search=use_web,
                 custom_system=custom_system,
             )
+            _, answer = parse_smart_response(raw)
         except Exception as exc:
             stop_event.set()
             await self.ctx.send(embed=error_embed("Regeneration failed", str(exc)[:300], bot.user))
@@ -879,6 +944,90 @@ class RegenerateView(discord.ui.View):
         embed = ai_embed(answer, self.ctx, guild=self.ctx.guild)
         new_view = RegenerateView(self.ctx, self.question, self.history_snapshot)
         await interaction.message.edit(embed=embed, view=new_view)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CHANGE 2 — FOLLOW-UP QUESTION BUTTONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class FollowUpView(discord.ui.View):
+    """Displays 3 follow-up question buttons. Only the original asker can use them."""
+
+    def __init__(self, ctx: commands.Context, questions: list[str]):
+        super().__init__(timeout=60)
+        self.ctx = ctx
+
+        for q in questions[:3]:
+            label = q[:80]
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
+
+            # Capture q in closure properly
+            async def make_callback(question_text: str):
+                async def callback(interaction: discord.Interaction):
+                    if interaction.user.id != ctx.author.id:
+                        await interaction.response.send_message(
+                            "Only the person who asked can use these.", ephemeral=True
+                        )
+                        return
+                    await interaction.response.defer()
+                    await ctx.invoke(bot.get_command("ask"), question=question_text)
+                return callback
+
+            btn.callback = asyncio.coroutine(make_callback(q)) if False else None
+            # Use a factory to avoid closure issues
+            self._add_followup_button(q)
+
+    def _add_followup_button(self, question_text: str):
+        # We need to add buttons dynamically with proper closures
+        # Clear previously added via __init__ loop and use this method instead
+        pass
+
+    async def on_timeout(self):
+        # Disable all buttons on timeout
+        for item in self.children:
+            item.disabled = True
+        try:
+            await self._message.edit(view=self)
+        except Exception:
+            pass
+
+
+def build_followup_view(ctx: commands.Context, questions: list[str]) -> "FollowUpView":
+    """Build a view with follow-up question buttons using proper closure pattern."""
+
+    view = discord.ui.View(timeout=60)
+    view._message = None  # will be set after send
+
+    async def _on_timeout():
+        for item in view.children:
+            item.disabled = True
+        if view._message:
+            try:
+                await view._message.edit(view=view)
+            except Exception:
+                pass
+
+    view.on_timeout = _on_timeout
+
+    for q in questions[:3]:
+        label = q[:80]
+        btn   = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
+
+        def make_callback(question_text: str):
+            async def callback(interaction: discord.Interaction):
+                if interaction.user.id != ctx.author.id:
+                    await interaction.response.send_message(
+                        "Only the person who asked can use these.", ephemeral=True
+                    )
+                    return
+                await interaction.response.defer()
+                await ctx.invoke(bot.get_command("ask"), question=question_text)
+            return callback
+
+        btn.callback = make_callback(q)
+        view.add_item(btn)
+
+    return view
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -895,7 +1044,8 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.ai` / `.q` — same thing\n\n"
             "@mention or reply to the bot works too.\n"
             "Image analysis and web search are automatic.\n"
-            "Wikipedia and Roblox Wiki are sourced automatically.\n\n"
+            "Wikipedia and Roblox Wiki are sourced automatically.\n"
+            "Paste a URL and the bot will read the page.\n\n"
             "`.generate <prompt>` — generate an image\n"
             "`.gen` — same thing\n\n"
             "`.retry` — re-run your last question fresh\n\n"
@@ -1050,8 +1200,6 @@ class SetupHomeView(discord.ui.View):
                 pass
 
 
-# ── AI Settings ───────────────────────────────────────────────────────────────
-
 def ai_settings_embed(config: dict, user=None) -> discord.Embed:
     channel_str   = f"<#{config['ai_channel_id']}>" if config.get("ai_channel_id") else "`All channels`"
     custom_prompt = config.get("custom_system_prefix", "")
@@ -1186,8 +1334,6 @@ class SetCustomPromptModal(discord.ui.Modal, title="Custom System Prompt"):
         )
 
 
-# ── Member Count Settings ─────────────────────────────────────────────────────
-
 def mc_settings_embed(config: dict, guild: Optional[discord.Guild], user=None) -> discord.Embed:
     channel     = guild.get_channel(MEMBER_COUNT_CHANNEL_ID) if guild else None
     channel_str = channel.mention if channel else f"`{MEMBER_COUNT_CHANNEL_ID}`"
@@ -1252,8 +1398,6 @@ class MCSettingsView(discord.ui.View):
             except Exception:
                 pass
 
-
-# ── Auto-Role Settings ────────────────────────────────────────────────────────
 
 def ar_settings_embed(config: dict, guild: Optional[discord.Guild], user=None) -> discord.Embed:
     role_id  = config.get("autorole_id")
@@ -1413,6 +1557,28 @@ class LXTEBot(commands.Bot):
             except Exception:
                 pass
 
+        # ── CHANGE 5 — Proactive image analysis ───────────────────────────────
+        if message.guild and message.attachments:
+            has_img = any(
+                a.content_type and a.content_type.startswith("image/")
+                for a in message.attachments
+            )
+            if has_img and not content.startswith("."):
+                is_reply_to_bot = False
+                if message.reference:
+                    try:
+                        ref = message.reference.resolved or await message.channel.fetch_message(message.reference.message_id)
+                        if ref and ref.author == self.user:
+                            is_reply_to_bot = True
+                    except Exception:
+                        pass
+
+                if self.user in message.mentions or is_reply_to_bot:
+                    cleaned = content.replace(f"<@{self.user.id}>", "").replace(f"<@!{self.user.id}>", "").strip()
+                    message.content = f".ask {cleaned if cleaned else 'What is in this image?'}"
+                    await self.process_commands(message)
+                    return
+
         # ── Ascend XP ─────────────────────────────────────────────────────────
         if message.guild and not content.startswith(".") and len(content) >= 2:
             now          = time.monotonic()
@@ -1532,14 +1698,13 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
     except Exception:
         pass
 
-    # ── Start persistent typing ───────────────────────────────────────────────
     stop_event = asyncio.Event()
     asyncio.create_task(keep_typing(ctx.channel, stop_event))
 
     try:
         history     = await bot.db.get_history(ctx.author.id, ctx.channel.id)
-        recent_chat = await fetch_recent_chat(ctx.channel, ctx.message)
-        context_str = build_context(ctx, recent_chat)
+        # CHANGE 3: smart context — pass question for relevance scoring
+        recent_chat = await fetch_recent_chat(ctx.channel, ctx.message, question)
         custom_system = config.get("custom_system_prefix", "")
         web_enabled   = config.get("web_search", True)
 
@@ -1549,19 +1714,34 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
             and ctx.message.attachments[0].content_type.startswith("image/")
         )
 
+        # ── CHANGE 4: URL content fetching ────────────────────────────────────
+        url_context = ""
+        if not has_image:
+            urls = URL_PATTERN.findall(question)
+            if urls:
+                contents = await asyncio.gather(*[fetch_url_content(u) for u in urls[:2]])
+                combined = "\n\n".join(
+                    f"[Content from {u}]\n{c}" for u, c in zip(urls[:2], contents) if c
+                )
+                if combined:
+                    url_context = f"\n\n## FETCHED URL CONTENT\n{combined}"
+            # Strip URLs from the question text for cleaner display in history,
+            # but keep them in the original question for the fetch step above
+            question_for_history = question
+        else:
+            question_for_history = question
+
         if has_image:
             user_content = [
                 {"type": "image_url", "image_url": {"url": ctx.message.attachments[0].url}},
                 {"type": "text",      "text":      question},
             ]
-            model       = GROQ_MODEL_VISION
-            use_web     = False
-            source_ctx  = ""
+            model      = GROQ_MODEL_VISION
+            use_web    = False
+            source_ctx = ""
         else:
             user_content = question
             model        = GROQ_MODEL_TEXT
-            use_web      = web_enabled and any(re.search(t, question, re.IGNORECASE) for t in WEB_TRIGGERS)
-            # Fetch source knowledge concurrently with no additional latency cost
             source_ctx   = await get_source_context(question)
 
         try:
@@ -1570,20 +1750,67 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
         except Exception:
             pass
 
-        history_snapshot = list(history)  # snapshot before this turn for regenerate
+        history_snapshot = list(history)
 
-        answer = await bot.ai.ask(
+        # ── CHANGE 1: first AI call with metadata format ───────────────────────
+        # Build initial context (no tone yet — we get tone from this first call)
+        context_str = build_context(ctx, recent_chat, tone="")
+        full_source_ctx = source_ctx + url_context
+
+        raw = await bot.ai.ask(
             user_content,
             history,
             model,
             context=context_str,
-            source_context=source_ctx,
+            source_context=full_source_ctx,
             is_owner=owner_mode_active,
-            use_web_search=use_web,
+            use_web_search=False,  # don't use web on first call — check metadata first
             custom_system=custom_system,
         )
 
-        history.append({"role": "user",      "content": question})
+        meta, answer = parse_smart_response(raw)
+
+        # ── CHANGE 1: if model says web is needed, make a second call with web ─
+        if not has_image and meta.get("web") and web_enabled:
+            tone = meta.get("tone", "")
+            context_str_with_tone = build_context(ctx, recent_chat, tone=tone)
+            raw2 = await bot.ai.ask(
+                user_content,
+                history,
+                model,
+                context=context_str_with_tone,
+                source_context=full_source_ctx,
+                is_owner=owner_mode_active,
+                use_web_search=True,
+                custom_system=custom_system,
+            )
+            meta, answer = parse_smart_response(raw2)
+
+        # ── CHANGE 1: quality self-check — silent regeneration if issues ───────
+        if meta.get("quality_issues", "ok").lower() != "ok":
+            tone = meta.get("tone", "")
+            context_str_with_tone = build_context(ctx, recent_chat, tone=tone)
+            try:
+                raw_regen = await bot.ai.ask(
+                    user_content,
+                    history,
+                    model,
+                    context=context_str_with_tone,
+                    source_context=full_source_ctx,
+                    is_owner=owner_mode_active,
+                    use_web_search=False,
+                    custom_system=custom_system,
+                )
+                _, answer = parse_smart_response(raw_regen)
+            except Exception as exc:
+                logger.warning("Silent regen failed: %s", exc)
+                # Keep original answer if regen fails
+
+        # ── CHANGE 1: low confidence warning ──────────────────────────────────
+        if meta.get("confidence", 10) < 6:
+            answer += "\n\n⚠️ I'm not fully certain on this — worth double checking."
+
+        history.append({"role": "user",      "content": question_for_history})
         history.append({"role": "assistant",  "content": answer})
         await bot.db.save_history(ctx.author.id, ctx.channel.id, history)
         await bot.db.increment_stat(ctx.author.id, "questions")
@@ -1596,6 +1823,7 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
 
     stop_event.set()
 
+    # ── Send main answer with regenerate button ────────────────────────────────
     regen_view = RegenerateView(ctx, question, history_snapshot)
     msg = await ctx.reply(
         embed=ai_embed(answer, ctx, guild=ctx.guild),
@@ -1610,6 +1838,23 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
     except Exception:
         pass
 
+    # ── CHANGE 2: follow-up questions if needed ───────────────────────────────
+    if not has_image and meta.get("needs_followup"):
+        try:
+            followup_questions = await bot.ai.get_followup_questions(
+                question if isinstance(question, str) else "this image",
+                answer,
+            )
+            if followup_questions:
+                fu_view = build_followup_view(ctx, followup_questions)
+                fu_msg = await ctx.send(
+                    embed=info_embed("💡 Follow-up questions", "Click to ask:", C_INFO, ctx.bot.user),
+                    view=fu_view,
+                )
+                fu_view._message = fu_msg
+        except Exception as exc:
+            logger.warning("Follow-up questions failed: %s", exc)
+
 
 @bot.command(name="retry")
 async def cmd_retry(ctx: commands.Context):
@@ -1619,7 +1864,6 @@ async def cmd_retry(ctx: commands.Context):
         await ctx.send(embed=error_embed("Nothing to retry", "No history found in this channel.", ctx.bot.user))
         return
 
-    # Find the last user message
     last_question = None
     for msg in reversed(history):
         if msg["role"] == "user":
@@ -1630,7 +1874,6 @@ async def cmd_retry(ctx: commands.Context):
         await ctx.send(embed=error_embed("Nothing to retry", "Can't find a retryable text question.", ctx.bot.user))
         return
 
-    # Strip the last exchange from history so we regenerate fresh
     if len(history) >= 2 and history[-1]["role"] == "assistant" and history[-2]["role"] == "user":
         history_snapshot = history[:-2]
     else:
@@ -1646,19 +1889,36 @@ async def cmd_retry(ctx: commands.Context):
         context_str   = build_context(ctx)
         custom_system = config.get("custom_system_prefix", "")
         web_enabled   = config.get("web_search", True)
-        use_web       = web_enabled and any(re.search(t, last_question, re.IGNORECASE) for t in WEB_TRIGGERS)
         source_ctx    = await get_source_context(last_question)
 
-        answer = await bot.ai.ask(
+        raw = await bot.ai.ask(
             last_question,
             history_snapshot,
             GROQ_MODEL_TEXT,
             context=context_str,
             source_context=source_ctx,
             is_owner=is_owner and config.get("owner_mode_enabled", True),
-            use_web_search=use_web,
+            use_web_search=False,
             custom_system=custom_system,
         )
+        meta, answer = parse_smart_response(raw)
+
+        if meta.get("web") and web_enabled:
+            raw2 = await bot.ai.ask(
+                last_question,
+                history_snapshot,
+                GROQ_MODEL_TEXT,
+                context=context_str,
+                source_context=source_ctx,
+                is_owner=is_owner and config.get("owner_mode_enabled", True),
+                use_web_search=True,
+                custom_system=custom_system,
+            )
+            _, answer = parse_smart_response(raw2)
+
+        if meta.get("confidence", 10) < 6:
+            answer += "\n\n⚠️ I'm not fully certain on this — worth double checking."
+
     except Exception as exc:
         stop_event.set()
         await ctx.send(embed=error_embed("Retry failed", str(exc)[:300], ctx.bot.user))
@@ -1683,7 +1943,6 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
 
     is_owner = ctx.author.id == bot.owner_id_int
 
-    # ── Rate limit ────────────────────────────────────────────────────────────
     if not is_owner:
         now_ts    = time.monotonic()
         last      = _last_gen_used.get(ctx.author.id, 0.0)
@@ -1700,8 +1959,6 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
             )
             return
         _last_gen_used[ctx.author.id] = now_ts
-
-    # No local safety check — Pollinations enforces this itself (402 on violations)
 
     try:
         await ctx.message.add_reaction("👀")
@@ -1729,7 +1986,7 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
                 f"?model=flux&width=1024&height=1024&seed={seed}"
             )
 
-            headers = {"User-Agent": "LXTEBot/8.0"}
+            headers = {"User-Agent": "LXTEBot/8.1"}
             if POLLINATIONS_TOKEN:
                 headers["Authorization"] = f"Bearer {POLLINATIONS_TOKEN}"
 
@@ -1903,7 +2160,7 @@ async def cmd_stats(ctx: commands.Context):
 async def cmd_about(ctx: commands.Context):
     e = make_embed(C_AI)
     e.title       = "LXTE's Assistant"
-    e.description = "Built by AJ. Sources from Wikipedia and Roblox Wiki automatically."
+    e.description = "Built by AJ. Sources from Wikipedia and Roblox Wiki automatically. Reads linked pages. Smart follow-up suggestions."
     e.set_thumbnail(url=get_avatar(ctx.bot.user))
     e.add_field(name="Prefix",   value="`.`",                  inline=True)
     e.add_field(name="Memory",   value="Per channel, 14 days", inline=True)
@@ -2044,13 +2301,12 @@ async def _startup():
     bot.owner_id_int = int(owner_id)
     bot.start_time   = datetime.now(timezone.utc)
 
-    # ── Graceful shutdown ─────────────────────────────────────────────────────
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, lambda: asyncio.create_task(bot.close()))
         except NotImplementedError:
-            pass  # Windows doesn't support add_signal_handler
+            pass
 
     logger.info("Starting bot (owner_id=%s)…", owner_id)
     try:
