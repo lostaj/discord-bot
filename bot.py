@@ -2822,7 +2822,7 @@ def doublexp_settings_embed(config, guild, user=None):
     lines    = []
     for rid in role_ids:
         role = guild.get_role(rid) if guild else None
-        lines.append(f"• {role.mention if role else f'`{rid}''}")
+        lines.append(f"• {role.mention if role else f'`{rid}`'}")
     e = make_embed(C_GOLD)
     e.title       = "⚡ Double XP Roles"
     e.description = "\n".join(lines) if lines else "`None configured.`"
