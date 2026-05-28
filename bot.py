@@ -27,7 +27,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
 print("✅ LXTE's Assistant v7.2.1 — loaded")
-print("sigma rizz")
+print("model has landed")
 print("Pollinations token loaded:", bool(os.environ.get("POLLINATIONS_TOKEN")))
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
@@ -225,8 +225,8 @@ def _resolve_mention(raw: str, guild: discord.Guild):
 
 def format_mentions(text: str, guild: Optional[discord.Guild]) -> str:
     """
-    Convert @name patterns into visual non-pinging @displayname text.
-    Used inside embed descriptions.
+    Convert @name patterns into clickable profile links INSIDE the embed.
+    Discord doesn't allow native <@id> pills in embeds, so we use hyperlinks.
     """
     if not guild:
         return text
@@ -235,7 +235,8 @@ def format_mentions(text: str, guild: Optional[discord.Guild]) -> str:
         raw = m.group(1).strip()
         member, role = _resolve_mention(raw, guild)
         if member:
-            return f"@{member.display_name}"
+            # Clickable profile link that renders cleanly inside the embed
+            return f"[@{member.display_name}](https://discord.com/users/{member.id})"
         if role:
             return f"@{role.name}"
         return f"@{raw}"
@@ -262,38 +263,6 @@ def clean_ai_response(text: str, guild: Optional[discord.Guild] = None) -> str:
     if guild:
         text = format_mentions(text, guild)
     return text
-
-
-def extract_pings(answer: str, guild: Optional[discord.Guild]) -> tuple[str, str]:
-    """
-    Extract @name patterns and convert to real <@id>/<@&id> for message content
-    so Discord renders them as highlighted pills visually via the -# trick.
-
-    With allowed_mentions=none() on the reply, NO actual notifications fire —
-    but the pills still show up in the message content. The embed gets clean
-    @displayname text so it reads naturally.
-
-    Returns (ping_content, cleaned_answer).
-    """
-    if not guild:
-        return "", answer
-
-    ping_parts: list[str] = []
-
-    def replace(m):
-        raw = m.group(1).strip()
-        member, role = _resolve_mention(raw, guild)
-        if member:
-            ping_parts.append(f"<@{member.id}>")
-            return f"@{member.display_name}"
-        if role:
-            ping_parts.append(f"<@&{role.id}>")
-            return f"@{role.name}"
-        return f"@{raw}"
-
-    cleaned = _MENTION_RE.sub(replace, answer)
-    return " ".join(ping_parts) if ping_parts else "", cleaned
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  API KEY ROTATOR
@@ -1380,17 +1349,13 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
             await ctx.send(embed=error_embed("Error", f"```{str(exc)[:300]}```", ctx.bot.user))
             return
 
-    # ── Tiny mention pills via -# small text trick ──
-    ping_content, cleaned_answer = extract_pings(answer, ctx.guild)
-    embed = ai_embed(cleaned_answer, ctx, guild=ctx.guild)
-
-    content_str = f"-# {ping_content}" if ping_content else None
+    # ── Clean embed only — clickable hyperlinks for mentions ──
+    embed = ai_embed(answer, ctx, guild=ctx.guild)
 
     await ctx.reply(
-        content=content_str,               # tiny pills render here
-        embed=embed,                        # readable @name in embed
+        embed=embed,
         mention_author=False,
-        allowed_mentions=discord.AllowedMentions.none(), # still no notifications
+        allowed_mentions=discord.AllowedMentions.none(),
     )
     try:
         await ctx.message.remove_reaction("⏳", ctx.bot.user)
