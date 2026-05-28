@@ -27,6 +27,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
 print("✅ LXTE's Assistant v7.0 — loaded")
+print("Pollinations token loaded:", bool(os.environ.get("POLLINATIONS_TOKEN")))
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logger = logging.getLogger("lxte")
