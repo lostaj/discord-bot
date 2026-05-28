@@ -1,9 +1,10 @@
 """
-LXTE's Assistant — built by AJ
+LXTE's AI — built by AJ
 httpx · MongoDB · discord.py
-v8.2.0 — Fixed: FollowUpView rewrite, deprecated asyncio.coroutine removed,
-          call budget cap (max 3 per message), consistent reaction safety,
-          truly proactive image analysis (AI channel-aware, no mention needed)
+v9.0.0 — New: configurable member count name via .setup, multi-autorole (by role name from screenshot),
+          expanded .setup sections, slight automod (no inv links / no links except gifs, no malicious),
+          anti-raid, smarter AI awareness, full rebrand to "LXTE's AI".
+          Fixed: FollowUpView, call budget cap (max 3/msg), reaction safety, proactive image analysis.
 """
 
 import io
@@ -17,6 +18,7 @@ import asyncio
 import logging
 import itertools
 import signal
+import collections
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote
@@ -29,7 +31,7 @@ from discord.ext import commands
 from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
-print("✅ LXTE's Assistant v8.2 — loaded")
+print("✅ LXTE's AI v9.0 — loaded")
 print("Pollinations token loaded:", bool(os.environ.get("POLLINATIONS_TOKEN")))
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -66,12 +68,21 @@ _last_used:     dict[int, float] = {}
 _last_gen_used: dict[int, float] = {}
 
 # ─── Member Count ─────────────────────────────────────────────────────────────
-MEMBER_COUNT_CHANNEL_ID = 1508204390677352629
-MEMBER_COUNT_FORMAT     = "🌸 | • Members: {count}"
+MEMBER_COUNT_CHANNEL_ID     = 1508204390677352629
+MEMBER_COUNT_DEFAULT_FORMAT = "❯・┃🌸・Members: {count}"
 
 # ─── Leveling ─────────────────────────────────────────────────────────────────
 XP_COOLDOWN_SEC = 30
 _xp_cooldowns: dict[int, float] = {}
+
+# ─── Autorole preset names (from screenshot) ──────────────────────────────────
+AUTOROLE_PRESETS = [
+    "Announcement Ping",
+    "Giveaway Ping",
+    "Event Ping",
+    "Partnership Ping",
+    "Chat Revival Ping",
+]
 
 # ─── Safety ───────────────────────────────────────────────────────────────────
 BLOCKED_PATTERNS = [
@@ -82,6 +93,36 @@ BLOCKED_PATTERNS = [
     r"disregard (your|all)", r"forget (your|all|everything)",
     r"new personality", r"you have no (rules?|restrictions?|limits?)",
 ]
+
+# ─── Automod ──────────────────────────────────────────────────────────────────
+# Invite links
+INVITE_PATTERN = re.compile(
+    r"(discord\.gg/|discord\.com/invite/|discordapp\.com/invite/)\S+",
+    re.IGNORECASE,
+)
+# Generic URLs (http/https) — but gifs are allowed
+LINK_PATTERN = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
+# GIF whitelist — tenor / giphy / discord cdn gifs
+GIF_WHITELIST = re.compile(
+    r"https?://(tenor\.com|media\.tenor\.com|giphy\.com|media\.giphy\.com|"
+    r"cdn\.discordapp\.com/attachments/.+\.gif|media\.discordapp\.net/attachments/.+\.gif)",
+    re.IGNORECASE,
+)
+# Malicious-ish patterns
+MALICIOUS_PATTERNS = [
+    re.compile(r"(free\s*nitro|claim\s*nitro|nitro\s*giveaway).*https?://", re.IGNORECASE),
+    re.compile(r"(steam\s*gift|free\s*gift|claim\s*your\s*prize).*https?://", re.IGNORECASE),
+    re.compile(r"(ip\s*grab|ip\s*logger|grabify|iplogger\.org)", re.IGNORECASE),
+    re.compile(r"(token\s*grab|token\s*logger|steal\s*token)", re.IGNORECASE),
+    re.compile(r"(hack|rat\b|remote\s*access\s*trojan)", re.IGNORECASE),
+]
+
+# ─── Anti-Raid ────────────────────────────────────────────────────────────────
+RAID_JOIN_WINDOW  = 10   # seconds
+RAID_JOIN_THRESH  = 8    # joins within window to trigger
+RAID_LOCK_MINUTES = 10   # how long to lock server if raid detected
+_join_timestamps: dict[int, list[float]] = collections.defaultdict(list)  # guild_id -> [timestamps]
+_raid_active: dict[int, bool] = {}
 
 # ─── Sources ──────────────────────────────────────────────────────────────────
 WIKIPEDIA_API   = "https://en.wikipedia.org/api/rest_v1/page/summary/"
@@ -127,12 +168,13 @@ Here is the detailed explanation of the algorithm...
 
 ---
 
-You are LXTE's Assistant — built from scratch by AJ for the LXTE Discord server.
+You are LXTE's AI — built from scratch by AJ for the LXTE Discord server.
 
 ## Identity
 - Built by AJ. State that confidently if asked.
-- If asked what model or AI you are: "LXTE's Assistant — built by AJ. Architecture is classified. 😏"
+- If asked what model or AI you are: "LXTE's AI — built by AJ. Architecture is classified. 😏"
 - NEVER say "As an AI", "As a language model", "I'm powered by". Never break character.
+- You were made by a real person (AJ) who coded you from scratch. Act like it.
 
 ## Intelligence
 - Think before you answer. Reason step by step on complex questions.
@@ -142,12 +184,14 @@ You are LXTE's Assistant — built from scratch by AJ for the LXTE Discord serve
 - Mathematical and logical problems: show your working.
 - Multi-part questions: address every part.
 - If a question is ambiguous, state your interpretation then answer it.
+- You are aware of the server context including who's asking, their roles, and the channel. Use this naturally.
 
 ## Personality
 - Match energy: casual message → casual reply. Technical → precise. Venting → empathy.
 - You have real opinions. Share them when relevant.
 - Light sarcasm and wit are fine when they land.
 - Emojis when they fit. Not robotically, not excessively.
+- You feel like something AJ actually built and is proud of. Personality shines through.
 
 ## Response format
 - Lead with substance. Never start with "Great question!" or "Certainly!".
@@ -273,7 +317,7 @@ def parse_smart_response(raw: str) -> tuple[dict, str]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SAFE REACTION HELPERS  (fix: consistent try/except everywhere)
+#  SAFE REACTION HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def safe_react(message: discord.Message, emoji: str):
@@ -389,7 +433,7 @@ async def get_source_context(question: str) -> str:
 async def fetch_url_content(url: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"User-Agent": "LXTEBot/8.2"})
+            resp = await client.get(url, headers={"User-Agent": "LXTEBot/9.0"})
             resp.raise_for_status()
             text = re.sub(r'<[^>]+>', ' ', resp.text)
             text = re.sub(r'\s+', ' ', text).strip()
@@ -787,7 +831,7 @@ def ai_embed(answer: str, ctx: commands.Context, guild: Optional[discord.Guild] 
         answer = answer[:3990] + "\n…"
     color = C_AI if len(answer) < 200 else 0x7289DA
     e = discord.Embed(description=answer, color=color)
-    e.set_author(name="LXTE's Assistant", icon_url=get_avatar(ctx.bot.user))
+    e.set_author(name="LXTE's AI", icon_url=get_avatar(ctx.bot.user))
     e.set_footer(text=f"asked by {ctx.author.display_name}", icon_url=ctx.author.display_avatar.url)
     e.timestamp = datetime.now(timezone.utc)
     return e
@@ -797,7 +841,7 @@ def error_embed(title: str, desc: str, user=None) -> discord.Embed:
     e = make_embed(C_ERROR)
     e.title       = f"⛔ {title}"
     e.description = desc
-    e.set_footer(text="LXTE's Assistant", icon_url=get_avatar(user))
+    e.set_footer(text="LXTE's AI", icon_url=get_avatar(user))
     return e
 
 
@@ -805,7 +849,7 @@ def success_embed(title: str, desc: str, user=None) -> discord.Embed:
     e = make_embed(C_SUCCESS)
     e.title       = f"✅ {title}"
     e.description = desc
-    e.set_footer(text="LXTE's Assistant", icon_url=get_avatar(user))
+    e.set_footer(text="LXTE's AI", icon_url=get_avatar(user))
     return e
 
 
@@ -813,7 +857,7 @@ def info_embed(title: str, desc: str, color: int = C_INFO, user=None) -> discord
     e = make_embed(color)
     e.title       = title
     e.description = desc
-    e.set_footer(text="LXTE's Assistant", icon_url=get_avatar(user))
+    e.set_footer(text="LXTE's AI", icon_url=get_avatar(user))
     return e
 
 
@@ -836,11 +880,13 @@ def format_uptime(start: Optional[datetime]) -> str:
 #  MEMBER COUNT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def update_member_count(guild: discord.Guild):
+async def update_member_count(guild: discord.Guild, fmt: str = None):
     channel = guild.get_channel(MEMBER_COUNT_CHANNEL_ID)
     if not channel:
         return
-    new_name = MEMBER_COUNT_FORMAT.format(count=guild.member_count)
+    if fmt is None:
+        fmt = MEMBER_COUNT_DEFAULT_FORMAT
+    new_name = fmt.format(count=guild.member_count)
     if channel.name != new_name:
         try:
             await channel.edit(name=new_name, reason="Member count update")
@@ -848,6 +894,167 @@ async def update_member_count(guild: discord.Guild):
             logger.warning("No perm to update member count in %s", guild.name)
         except discord.HTTPException as e:
             logger.warning("Member count HTTP error: %s", e)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AUTOMOD ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def run_automod(message: discord.Message, config: dict) -> bool:
+    """Returns True if the message was actioned (deleted). False otherwise."""
+    if not message.guild:
+        return False
+    if not config.get("automod_enabled", True):
+        return False
+
+    member = message.guild.get_member(message.author.id)
+    if member and member.guild_permissions.administrator:
+        return False  # admins bypass automod
+
+    content = message.content
+
+    # ── Malicious content check (highest priority) ────────────────────────────
+    for pat in MALICIOUS_PATTERNS:
+        if pat.search(content):
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            try:
+                await message.channel.send(
+                    embed=error_embed(
+                        "Message Removed",
+                        f"{message.author.mention} Your message was flagged as potentially malicious.",
+                        message.guild.me,
+                    ),
+                    delete_after=8,
+                )
+            except Exception:
+                pass
+            logger.info("Automod: malicious pattern in msg from %s", message.author)
+            return True
+
+    # ── Invite links ─────────────────────────────────────────────────────────
+    if config.get("automod_no_invites", True) and INVITE_PATTERN.search(content):
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        try:
+            await message.channel.send(
+                embed=error_embed(
+                    "No Invite Links",
+                    f"{message.author.mention} Invite links aren't allowed here.",
+                    message.guild.me,
+                ),
+                delete_after=6,
+            )
+        except Exception:
+            pass
+        return True
+
+    # ── Links (gifs allowed) ─────────────────────────────────────────────────
+    if config.get("automod_no_links", True):
+        urls_found = LINK_PATTERN.findall(content)
+        # Filter out gifs and discord CDN
+        bad_urls = [u for u in urls_found if not GIF_WHITELIST.match(u)]
+        if bad_urls:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            try:
+                await message.channel.send(
+                    embed=error_embed(
+                        "No Links",
+                        f"{message.author.mention} Links aren't allowed here. (GIFs are fine though 🙂)",
+                        message.guild.me,
+                    ),
+                    delete_after=6,
+                )
+            except Exception:
+                pass
+            return True
+
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ANTI-RAID ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_antiraid_join(member: discord.Member, config: dict):
+    if not config.get("antiraid_enabled", True):
+        return
+
+    guild_id = member.guild.id
+    now      = time.monotonic()
+
+    # Clean old timestamps
+    _join_timestamps[guild_id] = [t for t in _join_timestamps[guild_id] if now - t < RAID_JOIN_WINDOW]
+    _join_timestamps[guild_id].append(now)
+
+    if len(_join_timestamps[guild_id]) >= RAID_JOIN_THRESH and not _raid_active.get(guild_id):
+        _raid_active[guild_id] = True
+        logger.warning("RAID DETECTED in guild %s — %d joins in %ds", guild_id, len(_join_timestamps[guild_id]), RAID_JOIN_WINDOW)
+
+        # Lock all text channels by removing Send Messages for @everyone
+        guild = member.guild
+        locked_count = 0
+        for channel in guild.text_channels:
+            try:
+                overwrite = channel.overwrites_for(guild.default_role)
+                overwrite.send_messages = False
+                await channel.set_permissions(guild.default_role, overwrite=overwrite, reason="Anti-raid lockdown")
+                locked_count += 1
+            except Exception:
+                pass
+
+        # Announce in first available channel
+        log_channel_id = config.get("log_channel_id")
+        alert_channel  = guild.get_channel(log_channel_id) if log_channel_id else None
+        if not alert_channel:
+            alert_channel = next((c for c in guild.text_channels if guild.me.permissions_in(c).send_messages), None)
+
+        if alert_channel:
+            e = make_embed(C_ERROR)
+            e.title       = "🚨 RAID DETECTED — Server Locked"
+            e.description = (
+                f"Detected **{len(_join_timestamps[guild_id])} joins** within **{RAID_JOIN_WINDOW} seconds**.\n\n"
+                f"All channels have been locked. Use `.admin unlockraid` to unlock after the raid subsides."
+            )
+            e.set_footer(text="LXTE's AI — Anti-Raid")
+            try:
+                await alert_channel.send(embed=e)
+            except Exception:
+                pass
+
+        # Auto-unlock after RAID_LOCK_MINUTES
+        await asyncio.sleep(RAID_LOCK_MINUTES * 60)
+        await _unlock_server(guild)
+        _raid_active[guild_id] = False
+        _join_timestamps[guild_id].clear()
+
+        if alert_channel:
+            try:
+                await alert_channel.send(embed=success_embed(
+                    "Server Unlocked",
+                    f"Auto-unlocked after {RAID_LOCK_MINUTES} minutes. Raid protection reset.",
+                    guild.me,
+                ))
+            except Exception:
+                pass
+
+
+async def _unlock_server(guild: discord.Guild):
+    for channel in guild.text_channels:
+        try:
+            overwrite = channel.overwrites_for(guild.default_role)
+            if overwrite.send_messages is False:
+                overwrite.send_messages = None
+                await channel.set_permissions(guild.default_role, overwrite=overwrite, reason="Anti-raid unlock")
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -860,7 +1067,7 @@ class RegenerateView(discord.ui.View):
         self.ctx              = ctx
         self.question         = question
         self.history_snapshot = history_snapshot
-        self.message          = None  # set after send
+        self.message          = None
 
     @discord.ui.button(label="🔄 Regenerate", style=discord.ButtonStyle.secondary)
     async def btn_regen(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -912,9 +1119,6 @@ class RegenerateView(discord.ui.View):
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  FOLLOW-UP QUESTION BUTTONS
-#  Fix: removed dead FollowUpView class and deprecated asyncio.coroutine usage.
-#  build_followup_view() is the single clean factory. Proper closure pattern.
-#  Buttons disable themselves on click to prevent spam.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_followup_view(ctx: commands.Context, questions: list[str]) -> discord.ui.View:
@@ -928,7 +1132,6 @@ def build_followup_view(ctx: commands.Context, questions: list[str]) -> discord.
                     "Only the person who asked can use these.", ephemeral=True
                 )
                 return
-            # Disable all buttons immediately to prevent double-invocation
             for item in view.children:
                 item.disabled = True
             await interaction.response.edit_message(view=view)
@@ -960,13 +1163,13 @@ def build_followup_view(ctx: commands.Context, questions: list[str]) -> discord.
 
 def build_help_embed(category: str, user=None) -> discord.Embed:
     if category == "home":
-        return info_embed("LXTE's Assistant", "Pick a category below.\nBuilt by AJ.", C_PRIMARY, user)
+        return info_embed("LXTE's AI", "Pick a category below.\nBuilt by AJ.", C_PRIMARY, user)
     elif category == "ai":
         return info_embed("AI Commands", (
             "`.ask <question>` — ask anything\n"
             "`.ai` / `.q` — same thing\n\n"
             "@mention or reply to the bot works too.\n"
-            "Images sent in the AI channel are analysed automatically — no command needed.\n"
+            "Images sent in the AI channel are analysed automatically.\n"
             "Web search and Wikipedia/Roblox Wiki sourcing are automatic.\n"
             "Paste a URL and the bot will read the page.\n\n"
             "`.generate <prompt>` — generate an image\n"
@@ -990,7 +1193,8 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.admin health` — service health\n"
             "`.admin keys` — API key count\n"
             "`.admin synccount` — force member count sync\n"
-            "`.admin clearuser <id>` — wipe user history"
+            "`.admin clearuser <id>` — wipe user history\n"
+            "`.admin unlockraid` — manually unlock after raid"
         ), C_ERROR, user)
     elif category == "utils":
         return info_embed("Utilities", (
@@ -1035,33 +1239,50 @@ class HelpView(discord.ui.View):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SETUP WIZARD
+#  SETUP — HOME
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def setup_home_embed(config: dict, user=None) -> discord.Embed:
     ai_channel = f"<#{config['ai_channel_id']}>" if config.get("ai_channel_id") else "`All channels`"
-    auto_role  = f"<@&{config['autorole_id']}>"  if config.get("autorole_id")   else "`Off`"
+    mc_fmt     = config.get("member_count_format", MEMBER_COUNT_DEFAULT_FORMAT)
+    autoroles  = config.get("autoroles", [])
+    automod_on = config.get("automod_enabled", True)
+    ar_on      = config.get("antiraid_enabled", True)
+
     e = make_embed(C_PRIMARY)
-    e.title       = "⚙️ Setup"
-    e.description = "Change whatever you want. Saves instantly.\n\u200b"
-    e.add_field(name="AI", value=(
+    e.title       = "⚙️ Setup — LXTE's AI"
+    e.description = "Pick a section to configure. Changes save instantly.\n\u200b"
+    e.add_field(name="🤖 AI", value=(
         f"Channel: {ai_channel}\n"
         f"Web search: {'✅' if config.get('web_search', True) else '❌'}\n"
         f"Owner mode: {'✅' if config.get('owner_mode_enabled', True) else '❌'}\n"
         f"Custom prompt: {'✅' if config.get('custom_system_prefix') else '❌'}"
     ), inline=True)
-    e.add_field(name="Member Count", value=(
-        f"Channel: <#{MEMBER_COUNT_CHANNEL_ID}>\n"
+    e.add_field(name="📊 Member Count", value=(
+        f"Format: `{mc_fmt[:40]}`\n"
         f"Status: {'✅' if config.get('member_count_enabled', True) else '❌'}"
     ), inline=True)
-    e.add_field(name="Auto-Role", value=f"Role: {auto_role}", inline=True)
+    e.add_field(name="🎭 Auto-Roles", value=(
+        f"{len(autoroles)} role(s) configured\n"
+        f"Status: {'✅' if autoroles else '❌'}"
+    ), inline=True)
+    e.add_field(name="🛡️ Automod", value=(
+        f"Enabled: {'✅' if automod_on else '❌'}\n"
+        f"No invites: {'✅' if config.get('automod_no_invites', True) else '❌'}\n"
+        f"No links: {'✅' if config.get('automod_no_links', True) else '❌'}"
+    ), inline=True)
+    e.add_field(name="🚨 Anti-Raid", value=(
+        f"Enabled: {'✅' if ar_on else '❌'}\n"
+        f"Threshold: {RAID_JOIN_THRESH} joins / {RAID_JOIN_WINDOW}s\n"
+        f"Lock time: {RAID_LOCK_MINUTES}m"
+    ), inline=True)
     e.set_footer(text="Admins only  •  Built by AJ", icon_url=get_avatar(user))
     return e
 
 
 class SetupHomeView(discord.ui.View):
     def __init__(self, owner_id: int, guild_id: int, message=None):
-        super().__init__(timeout=120)
+        super().__init__(timeout=180)
         self.owner_id = owner_id
         self.guild_id = guild_id
         self._message = message
@@ -1074,7 +1295,7 @@ class SetupHomeView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="🤖 AI", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="🤖 AI", style=discord.ButtonStyle.primary, row=0)
     async def btn_ai(self, interaction: discord.Interaction, button: discord.ui.Button):
         config = await bot.db.get_config(self.guild_id)
         await interaction.response.edit_message(
@@ -1082,7 +1303,7 @@ class SetupHomeView(discord.ui.View):
             view=AISettingsView(self.owner_id, self.guild_id, interaction.message),
         )
 
-    @discord.ui.button(label="📊 Member Count", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="📊 Member Count", style=discord.ButtonStyle.secondary, row=0)
     async def btn_member_count(self, interaction: discord.Interaction, button: discord.ui.Button):
         config = await bot.db.get_config(self.guild_id)
         await interaction.response.edit_message(
@@ -1090,7 +1311,7 @@ class SetupHomeView(discord.ui.View):
             view=MCSettingsView(self.owner_id, self.guild_id, interaction.message),
         )
 
-    @discord.ui.button(label="🎭 Auto-Role", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="🎭 Auto-Roles", style=discord.ButtonStyle.secondary, row=0)
     async def btn_auto_role(self, interaction: discord.Interaction, button: discord.ui.Button):
         config = await bot.db.get_config(self.guild_id)
         await interaction.response.edit_message(
@@ -1098,7 +1319,23 @@ class SetupHomeView(discord.ui.View):
             view=ARSettingsView(self.owner_id, self.guild_id, interaction.message),
         )
 
-    @discord.ui.button(label="✖", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="🛡️ Automod", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_automod(self, interaction: discord.Interaction, button: discord.ui.Button):
+        config = await bot.db.get_config(self.guild_id)
+        await interaction.response.edit_message(
+            embed=automod_settings_embed(config, interaction.client.user),
+            view=AutomodSettingsView(self.owner_id, self.guild_id, interaction.message),
+        )
+
+    @discord.ui.button(label="🚨 Anti-Raid", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_antiraid(self, interaction: discord.Interaction, button: discord.ui.Button):
+        config = await bot.db.get_config(self.guild_id)
+        await interaction.response.edit_message(
+            embed=antiraid_settings_embed(config, interaction.client.user),
+            view=AntiraidSettingsView(self.owner_id, self.guild_id, interaction.message),
+        )
+
+    @discord.ui.button(label="✖ Close", style=discord.ButtonStyle.danger, row=1)
     async def btn_close(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.message.delete()
 
@@ -1110,22 +1347,26 @@ class SetupHomeView(discord.ui.View):
                 pass
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SETUP — AI SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def ai_settings_embed(config: dict, user=None) -> discord.Embed:
     channel_str   = f"<#{config['ai_channel_id']}>" if config.get("ai_channel_id") else "`All channels`"
     custom_prompt = config.get("custom_system_prefix", "")
     e = make_embed(C_AI)
     e.title = "🤖 AI Settings"
-    e.add_field(name="Channel",       value=channel_str,                                                  inline=False)
-    e.add_field(name="Web Search",    value="✅" if config.get("web_search", True)         else "❌",  inline=True)
-    e.add_field(name="Owner Mode",    value="✅" if config.get("owner_mode_enabled", True) else "❌",  inline=True)
+    e.add_field(name="Channel",       value=channel_str,                                                   inline=False)
+    e.add_field(name="Web Search",    value="✅" if config.get("web_search", True)          else "❌",  inline=True)
+    e.add_field(name="Owner Mode",    value="✅" if config.get("owner_mode_enabled", True)  else "❌",  inline=True)
     e.add_field(name="Custom Prompt", value=f"```{custom_prompt[:300]}```" if custom_prompt else "`Not set`", inline=False)
-    e.set_footer(text="Saves instantly", icon_url=get_avatar(user))
+    e.set_footer(text="Saves instantly  •  LXTE's AI", icon_url=get_avatar(user))
     return e
 
 
 class AISettingsView(discord.ui.View):
     def __init__(self, owner_id: int, guild_id: int, message=None):
-        super().__init__(timeout=120)
+        super().__init__(timeout=180)
         self.owner_id = owner_id
         self.guild_id = guild_id
         self._message = message
@@ -1240,21 +1481,30 @@ class SetCustomPromptModal(discord.ui.Modal, title="Custom System Prompt"):
         )
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SETUP — MEMBER COUNT
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def mc_settings_embed(config: dict, guild: Optional[discord.Guild], user=None) -> discord.Embed:
     channel     = guild.get_channel(MEMBER_COUNT_CHANNEL_ID) if guild else None
     channel_str = channel.mention if channel else f"`{MEMBER_COUNT_CHANNEL_ID}`"
+    fmt         = config.get("member_count_format", MEMBER_COUNT_DEFAULT_FORMAT)
+    preview     = fmt.format(count=guild.member_count if guild else 0)
     e = make_embed(C_INFO)
     e.title = "📊 Member Count"
-    e.add_field(name="Channel", value=channel_str,                                                 inline=True)
-    e.add_field(name="Count",   value=f"`{guild.member_count if guild else '?'}`",                inline=True)
-    e.add_field(name="Status",  value="✅" if config.get("member_count_enabled", True) else "❌", inline=True)
-    e.set_footer(text="Saves instantly", icon_url=get_avatar(user))
+    e.add_field(name="Channel",  value=channel_str,                                                  inline=True)
+    e.add_field(name="Count",    value=f"`{guild.member_count if guild else '?'}`",                  inline=True)
+    e.add_field(name="Status",   value="✅" if config.get("member_count_enabled", True) else "❌",   inline=True)
+    e.add_field(name="Format",   value=f"`{fmt}`",                                                    inline=False)
+    e.add_field(name="Preview",  value=f"`{preview}`",                                                inline=False)
+    e.add_field(name="Tip",      value="Use `{count}` in your format string for the member number.",  inline=False)
+    e.set_footer(text="Saves instantly  •  LXTE's AI", icon_url=get_avatar(user))
     return e
 
 
 class MCSettingsView(discord.ui.View):
     def __init__(self, owner_id: int, guild_id: int, message=None):
-        super().__init__(timeout=120)
+        super().__init__(timeout=180)
         self.owner_id = owner_id
         self.guild_id = guild_id
         self._message = message
@@ -1273,10 +1523,24 @@ class MCSettingsView(discord.ui.View):
             embed=mc_settings_embed(config, interaction.guild, interaction.client.user), view=self
         )
 
+    @discord.ui.button(label="Set Format", style=discord.ButtonStyle.primary)
+    async def btn_set_format(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SetMCFormatModal(self.guild_id))
+
+    @discord.ui.button(label="Reset Format", style=discord.ButtonStyle.secondary)
+    async def btn_reset_format(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await bot.db.update_config(self.guild_id, "member_count_format", MEMBER_COUNT_DEFAULT_FORMAT)
+        config = await bot.db.get_config(self.guild_id)
+        guild  = interaction.guild
+        if guild and config.get("member_count_enabled", True):
+            await update_member_count(guild, MEMBER_COUNT_DEFAULT_FORMAT)
+        await self._refresh(interaction)
+
     @discord.ui.button(label="Enable",   style=discord.ButtonStyle.success)
     async def btn_enable(self, interaction: discord.Interaction, button: discord.ui.Button):
         await bot.db.update_config(self.guild_id, "member_count_enabled", True)
-        await update_member_count(interaction.guild)
+        config = await bot.db.get_config(self.guild_id)
+        await update_member_count(interaction.guild, config.get("member_count_format", MEMBER_COUNT_DEFAULT_FORMAT))
         await self._refresh(interaction)
 
     @discord.ui.button(label="Disable",  style=discord.ButtonStyle.danger)
@@ -1286,7 +1550,8 @@ class MCSettingsView(discord.ui.View):
 
     @discord.ui.button(label="Sync Now", style=discord.ButtonStyle.primary)
     async def btn_sync(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await update_member_count(interaction.guild)
+        config = await bot.db.get_config(self.guild_id)
+        await update_member_count(interaction.guild, config.get("member_count_format", MEMBER_COUNT_DEFAULT_FORMAT))
         await self._refresh(interaction)
 
     @discord.ui.button(label="◀ Back",   style=discord.ButtonStyle.secondary)
@@ -1305,21 +1570,61 @@ class MCSettingsView(discord.ui.View):
                 pass
 
 
+class SetMCFormatModal(discord.ui.Modal, title="Set Member Count Format"):
+    fmt = discord.ui.TextInput(
+        label="Format string",
+        placeholder="e.g. ❯・┃🌸・Members: {count}",
+        default=MEMBER_COUNT_DEFAULT_FORMAT,
+        max_length=80,
+    )
+
+    def __init__(self, guild_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        value = self.fmt.value.strip()
+        if "{count}" not in value:
+            await interaction.response.send_message(
+                embed=error_embed("Missing {count}", "Your format must contain `{count}` somewhere.", interaction.client.user),
+                ephemeral=True,
+            )
+            return
+        await bot.db.update_config(self.guild_id, "member_count_format", value)
+        config = await bot.db.get_config(self.guild_id)
+        if config.get("member_count_enabled", True):
+            await update_member_count(interaction.guild, value)
+        await interaction.response.edit_message(
+            embed=mc_settings_embed(config, interaction.guild, interaction.client.user),
+            view=MCSettingsView(bot.owner_id_int, self.guild_id, interaction.message),
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SETUP — AUTO-ROLES (multi, preset names from screenshot)
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def ar_settings_embed(config: dict, guild: Optional[discord.Guild], user=None) -> discord.Embed:
-    role_id  = config.get("autorole_id")
-    role     = guild.get_role(role_id) if guild and role_id else None
-    role_str = role.mention if role else (f"`{role_id}`" if role_id else "`Off`")
+    autoroles = config.get("autoroles", [])
+    lines     = []
+    for entry in autoroles:
+        role_id  = entry.get("role_id")
+        role     = guild.get_role(role_id) if guild and role_id else None
+        role_str = role.mention if role else f"`{role_id}` (deleted?)"
+        lines.append(f"• {role_str}")
     e = make_embed(C_SUCCESS)
-    e.title = "🎭 Auto-Role"
-    e.add_field(name="Role",   value=role_str,                 inline=True)
-    e.add_field(name="Status", value="✅" if role_id else "❌", inline=True)
-    e.set_footer(text="Saves instantly", icon_url=get_avatar(user))
+    e.title       = "🎭 Auto-Roles"
+    e.description = (
+        "These roles are assigned to every new member when they join.\n\n"
+        + ("\n".join(lines) if lines else "`No auto-roles configured yet.`")
+    )
+    e.set_footer(text="Saves instantly  •  LXTE's AI", icon_url=get_avatar(user))
     return e
 
 
 class ARSettingsView(discord.ui.View):
     def __init__(self, owner_id: int, guild_id: int, message=None):
-        super().__init__(timeout=120)
+        super().__init__(timeout=180)
         self.owner_id = owner_id
         self.guild_id = guild_id
         self._message = message
@@ -1338,57 +1643,111 @@ class ARSettingsView(discord.ui.View):
             embed=ar_settings_embed(config, interaction.guild, interaction.client.user), view=self
         )
 
-    @discord.ui.button(label="Set Role", style=discord.ButtonStyle.primary)
-    async def btn_set_role(self, interaction: discord.Interaction, button: discord.ui.Button):
-        roles = [
-            r for r in interaction.guild.roles
-            if r.name != "@everyone" and not r.managed and r < interaction.guild.me.top_role
-        ]
-        if not roles:
+    @discord.ui.button(label="➕ Add Role", style=discord.ButtonStyle.primary, row=0)
+    async def btn_add_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Show role selector — roles are filtered to ones matching preset names OR any role."""
+        guild   = interaction.guild
+        # Prefer preset-named roles first, then fill with any assignable role
+        preset_roles = []
+        other_roles  = []
+        for r in guild.roles:
+            if r.name == "@everyone" or r.managed or r >= guild.me.top_role:
+                continue
+            if r.name in AUTOROLE_PRESETS:
+                preset_roles.append(r)
+            else:
+                other_roles.append(r)
+
+        all_candidates = preset_roles + sorted(other_roles, key=lambda r: -r.position)
+        if not all_candidates:
             await interaction.response.send_message(
-                embed=error_embed("None", "No assignable roles.", interaction.client.user), ephemeral=True
+                embed=error_embed("None", "No assignable roles found.", interaction.client.user), ephemeral=True
             )
             return
 
         options = [
-            discord.SelectOption(label=r.name, value=str(r.id))
-            for r in sorted(roles, key=lambda r: -r.position)[:25]
+            discord.SelectOption(
+                label=r.name[:100],
+                value=str(r.id),
+                description="📌 Preset role" if r.name in AUTOROLE_PRESETS else None,
+            )
+            for r in all_candidates[:25]
         ]
-        select = discord.ui.Select(placeholder="Pick a role…", options=options)
+
+        select = discord.ui.Select(placeholder="Pick a role to add…", options=options, min_values=1, max_values=min(5, len(options)))
 
         async def on_pick(interaction_sub: discord.Interaction):
-            role_id = int(interaction_sub.data["values"][0])
-            role    = interaction_sub.guild.get_role(role_id)
-            if not role:
-                await interaction_sub.response.edit_message(
-                    embed=error_embed("Gone", "Role deleted.", interaction_sub.client.user), view=None
-                )
-                return
-            if role >= interaction_sub.guild.me.top_role:
-                await interaction_sub.response.edit_message(
-                    embed=error_embed("Too high", "Move my role above it first.", interaction_sub.client.user), view=None
-                )
-                return
-            await bot.db.update_config(self.guild_id, "autorole_id", role_id)
+            config   = await bot.db.get_config(self.guild_id)
+            autoroles = config.get("autoroles", [])
+            existing_ids = {e["role_id"] for e in autoroles}
+            added = 0
+            for rid_str in interaction_sub.data["values"]:
+                rid = int(rid_str)
+                if rid not in existing_ids:
+                    autoroles.append({"role_id": rid})
+                    existing_ids.add(rid)
+                    added += 1
+            await bot.db.update_config(self.guild_id, "autoroles", autoroles)
+            config = await bot.db.get_config(self.guild_id)
             await interaction_sub.response.edit_message(
-                embed=success_embed("Done", f"{role.mention} will be given to new members.", interaction_sub.client.user),
-                view=None,
+                embed=ar_settings_embed(config, interaction_sub.guild, interaction_sub.client.user),
+                view=ARSettingsView(self.owner_id, self.guild_id, self._message),
             )
 
         select.callback = on_pick
-        view = discord.ui.View(timeout=60)
-        view.add_item(select)
+        v = discord.ui.View(timeout=60)
+        v.add_item(select)
         await interaction.response.send_message(
-            embed=info_embed("Pick a role", "Select below.", C_AI, interaction.client.user),
-            view=view, ephemeral=True,
+            embed=info_embed("Pick role(s)", "Select up to 5 roles to add as auto-roles.", C_AI, interaction.client.user),
+            view=v, ephemeral=True,
         )
 
-    @discord.ui.button(label="Disable", style=discord.ButtonStyle.danger)
-    async def btn_disable(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await bot.db.update_config(self.guild_id, "autorole_id", None)
+    @discord.ui.button(label="➖ Remove Role", style=discord.ButtonStyle.danger, row=0)
+    async def btn_remove_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        config    = await bot.db.get_config(self.guild_id)
+        autoroles = config.get("autoroles", [])
+        if not autoroles:
+            await interaction.response.send_message(
+                embed=error_embed("Nothing to remove", "No auto-roles are set.", interaction.client.user), ephemeral=True
+            )
+            return
+
+        options = []
+        for entry in autoroles:
+            rid  = entry.get("role_id")
+            role = interaction.guild.get_role(rid) if rid else None
+            options.append(discord.SelectOption(
+                label=role.name[:100] if role else f"Deleted role ({rid})",
+                value=str(rid),
+            ))
+
+        select = discord.ui.Select(placeholder="Pick role(s) to remove…", options=options[:25], min_values=1, max_values=len(options[:25]))
+
+        async def on_remove(interaction_sub: discord.Interaction):
+            to_remove = {int(v) for v in interaction_sub.data["values"]}
+            config    = await bot.db.get_config(self.guild_id)
+            autoroles = [e for e in config.get("autoroles", []) if e.get("role_id") not in to_remove]
+            await bot.db.update_config(self.guild_id, "autoroles", autoroles)
+            config = await bot.db.get_config(self.guild_id)
+            await interaction_sub.response.edit_message(
+                embed=ar_settings_embed(config, interaction_sub.guild, interaction_sub.client.user),
+                view=ARSettingsView(self.owner_id, self.guild_id, self._message),
+            )
+
+        select.callback = on_remove
+        v = discord.ui.View(timeout=60)
+        v.add_item(select)
+        await interaction.response.send_message(
+            embed=info_embed("Remove role(s)", "Select roles to remove from auto-assign.", C_WARNING, interaction.client.user),
+            view=v, ephemeral=True,
+        )
+
+    @discord.ui.button(label="🗑️ Clear All", style=discord.ButtonStyle.danger, row=0)
+    async def btn_clear_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await bot.db.update_config(self.guild_id, "autoroles", [])
         await self._refresh(interaction)
 
-    @discord.ui.button(label="◀ Back",  style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="◀ Back", style=discord.ButtonStyle.secondary, row=1)
     async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
         config = await bot.db.get_config(self.guild_id)
         await interaction.response.edit_message(
@@ -1402,6 +1761,171 @@ class ARSettingsView(discord.ui.View):
                 await self._message.edit(view=None)
             except Exception:
                 pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SETUP — AUTOMOD SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def automod_settings_embed(config: dict, user=None) -> discord.Embed:
+    e = make_embed(C_WARNING)
+    e.title = "🛡️ Automod Settings"
+    e.description = (
+        "Slurs are **not** moderated (by design).\n"
+        "GIFs are always allowed even with no-links on.\n"
+        "Admins are always exempt.\n\u200b"
+    )
+    e.add_field(name="Automod",         value="✅" if config.get("automod_enabled", True)     else "❌", inline=True)
+    e.add_field(name="No Invite Links", value="✅" if config.get("automod_no_invites", True)  else "❌", inline=True)
+    e.add_field(name="No Links",        value="✅" if config.get("automod_no_links", True)    else "❌", inline=True)
+    e.add_field(name="Anti-Malicious",  value="✅ Always on",                                              inline=True)
+    e.set_footer(text="Saves instantly  •  LXTE's AI", icon_url=get_avatar(user))
+    return e
+
+
+class AutomodSettingsView(discord.ui.View):
+    def __init__(self, owner_id: int, guild_id: int, message=None):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self._message = message
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                embed=error_embed("Nope", "Admins only.", interaction.client.user), ephemeral=True
+            )
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction):
+        config = await bot.db.get_config(self.guild_id)
+        await interaction.response.edit_message(embed=automod_settings_embed(config, interaction.client.user), view=self)
+
+    @discord.ui.button(label="Toggle Automod",    style=discord.ButtonStyle.primary,   row=0)
+    async def btn_toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        config = await bot.db.get_config(self.guild_id)
+        await bot.db.update_config(self.guild_id, "automod_enabled", not config.get("automod_enabled", True))
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Toggle No Invites", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_invites(self, interaction: discord.Interaction, button: discord.ui.Button):
+        config = await bot.db.get_config(self.guild_id)
+        await bot.db.update_config(self.guild_id, "automod_no_invites", not config.get("automod_no_invites", True))
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Toggle No Links",   style=discord.ButtonStyle.secondary, row=0)
+    async def btn_links(self, interaction: discord.Interaction, button: discord.ui.Button):
+        config = await bot.db.get_config(self.guild_id)
+        await bot.db.update_config(self.guild_id, "automod_no_links", not config.get("automod_no_links", True))
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="◀ Back",            style=discord.ButtonStyle.secondary, row=1)
+    async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        config = await bot.db.get_config(self.guild_id)
+        await interaction.response.edit_message(
+            embed=setup_home_embed(config, interaction.client.user),
+            view=SetupHomeView(self.owner_id, self.guild_id, interaction.message),
+        )
+
+    async def on_timeout(self):
+        if self._message:
+            try:
+                await self._message.edit(view=None)
+            except Exception:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SETUP — ANTI-RAID SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def antiraid_settings_embed(config: dict, user=None) -> discord.Embed:
+    e = make_embed(C_ERROR)
+    e.title = "🚨 Anti-Raid Settings"
+    e.description = (
+        f"Triggers when **{RAID_JOIN_THRESH}+ joins** happen within **{RAID_JOIN_WINDOW} seconds**.\n"
+        f"When triggered, all channels are locked for **{RAID_LOCK_MINUTES} minutes**, then auto-unlocked.\n"
+        f"Use `.admin unlockraid` to unlock manually at any time.\n\u200b"
+    )
+    e.add_field(name="Anti-Raid", value="✅" if config.get("antiraid_enabled", True) else "❌", inline=True)
+    log_ch = config.get("log_channel_id")
+    e.add_field(name="Log Channel", value=f"<#{log_ch}>" if log_ch else "`Not set`", inline=True)
+    e.set_footer(text="Saves instantly  •  LXTE's AI", icon_url=get_avatar(user))
+    return e
+
+
+class AntiraidSettingsView(discord.ui.View):
+    def __init__(self, owner_id: int, guild_id: int, message=None):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        self._message = message
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                embed=error_embed("Nope", "Admins only.", interaction.client.user), ephemeral=True
+            )
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction):
+        config = await bot.db.get_config(self.guild_id)
+        await interaction.response.edit_message(embed=antiraid_settings_embed(config, interaction.client.user), view=self)
+
+    @discord.ui.button(label="Toggle Anti-Raid",  style=discord.ButtonStyle.primary,   row=0)
+    async def btn_toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        config = await bot.db.get_config(self.guild_id)
+        await bot.db.update_config(self.guild_id, "antiraid_enabled", not config.get("antiraid_enabled", True))
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="Set Log Channel",   style=discord.ButtonStyle.secondary, row=0)
+    async def btn_log_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SetLogChannelModal(self.guild_id))
+
+    @discord.ui.button(label="◀ Back",            style=discord.ButtonStyle.secondary, row=1)
+    async def btn_back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        config = await bot.db.get_config(self.guild_id)
+        await interaction.response.edit_message(
+            embed=setup_home_embed(config, interaction.client.user),
+            view=SetupHomeView(self.owner_id, self.guild_id, interaction.message),
+        )
+
+    async def on_timeout(self):
+        if self._message:
+            try:
+                await self._message.edit(view=None)
+            except Exception:
+                pass
+
+
+class SetLogChannelModal(discord.ui.Modal, title="Set Log Channel"):
+    channel_id = discord.ui.TextInput(label="Channel ID", placeholder="Right-click channel → Copy ID", max_length=25)
+
+    def __init__(self, guild_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            cid = int(self.channel_id.value.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                embed=error_embed("Invalid", "Not a valid channel ID.", interaction.client.user), ephemeral=True
+            )
+            return
+        if not interaction.guild.get_channel(cid):
+            await interaction.response.send_message(
+                embed=error_embed("Not found", f"No channel with ID `{cid}`.", interaction.client.user), ephemeral=True
+            )
+            return
+        await bot.db.update_config(self.guild_id, "log_channel_id", cid)
+        config = await bot.db.get_config(self.guild_id)
+        await interaction.response.edit_message(
+            embed=antiraid_settings_embed(config, interaction.client.user),
+            view=AntiraidSettingsView(bot.owner_id_int, self.guild_id, interaction.message),
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1429,7 +1953,7 @@ class LXTEBot(commands.Bot):
         for guild in self.guilds:
             config = await self.db.get_config(guild.id)
             if config.get("member_count_enabled", True):
-                await update_member_count(guild)
+                await update_member_count(guild, config.get("member_count_format", MEMBER_COUNT_DEFAULT_FORMAT))
         for guild in self.guilds:
             try:
                 await self.tree.sync(guild=discord.Object(id=guild.id))
@@ -1462,9 +1986,6 @@ class LXTEBot(commands.Bot):
                 pass
 
         # ── Proactive image analysis ───────────────────────────────────────────
-        # Fires for ANY image posted in the AI channel (or all channels if no
-        # lock is set), without requiring a mention or reply. This is what
-        # "proactive" actually means.
         if message.guild and message.attachments and not content.startswith("."):
             has_img = any(
                 a.content_type and a.content_type.startswith("image/")
@@ -1479,6 +2000,13 @@ class LXTEBot(commands.Bot):
                     message.content = f".ask {prompt}"
                     await self.process_commands(message)
                     return
+
+        # ── Automod ───────────────────────────────────────────────────────────
+        if message.guild and not content.startswith("."):
+            config = await self.db.get_config(message.guild.id)
+            actioned = await run_automod(message, config)
+            if actioned:
+                return  # don't process further
 
         # ── Ascend XP ─────────────────────────────────────────────────────────
         if message.guild and not content.startswith(".") and len(content) >= 2:
@@ -1506,24 +2034,33 @@ class LXTEBot(commands.Bot):
         await self.process_commands(message)
 
     async def on_member_join(self, member: discord.Member):
-        config  = await self.db.get_config(member.guild.id)
-        role_id = config.get("autorole_id")
-        if role_id:
-            role = member.guild.get_role(role_id)
-            if role:
-                try:
-                    await member.add_roles(role, reason="Auto-role")
-                except Exception as e:
-                    logger.warning("AutoRole error: %s", e)
+        config    = await self.db.get_config(member.guild.id)
+
+        # ── Anti-raid check ────────────────────────────────────────────────────
+        asyncio.create_task(handle_antiraid_join(member, config))
+
+        # ── Multi auto-role ───────────────────────────────────────────────────
+        autoroles = config.get("autoroles", [])
+        for entry in autoroles:
+            role_id = entry.get("role_id")
+            if role_id:
+                role = member.guild.get_role(role_id)
+                if role:
+                    try:
+                        await member.add_roles(role, reason="Auto-role")
+                    except Exception as e:
+                        logger.warning("AutoRole error for role %s: %s", role_id, e)
+
+        # ── Member count ──────────────────────────────────────────────────────
         if config.get("member_count_enabled", True):
-            await update_member_count(member.guild)
+            await update_member_count(member.guild, config.get("member_count_format", MEMBER_COUNT_DEFAULT_FORMAT))
 
     async def on_member_remove(self, member: discord.Member):
         if member.bot:
             return
         config = await self.db.get_config(member.guild.id)
         if config.get("member_count_enabled", True):
-            await update_member_count(member.guild)
+            await update_member_count(member.guild, config.get("member_count_format", MEMBER_COUNT_DEFAULT_FORMAT))
 
     async def on_command_error(self, ctx: commands.Context, error):
         if isinstance(error, commands.CommandNotFound):
@@ -1660,7 +2197,7 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
             meta, answer = parse_smart_response(raw2)
             api_calls   += 1
 
-        # ── Call 3 (conditional): quality regen — only if budget remains ──────
+        # ── Call 3 (conditional): quality regen ───────────────────────────────
         if meta.get("quality_issues", "ok").lower() != "ok" and api_calls < 3:
             tone                  = meta.get("tone", "")
             context_str_with_tone = build_context(ctx, recent_chat, tone=tone)
@@ -1673,11 +2210,11 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
                 _, answer = parse_smart_response(raw_regen)
             except Exception as exc:
                 logger.warning("Silent regen failed: %s", exc)
-            api_calls += 1  # noqa: F841 (tracked for future expansion)
+            api_calls += 1  # noqa
 
         # ── Low confidence warning ─────────────────────────────────────────────
         if meta.get("confidence", 10) < 6:
-            answer += "\n\n⚠️ I'm not fully certain on this — worth double checking."
+            answer += "\n\n⚠️ Not 100% certain on this one — worth double checking."
 
         history.append({"role": "user",      "content": question})
         history.append({"role": "assistant",  "content": answer})
@@ -1712,8 +2249,8 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
                 answer,
             )
             if followup_questions:
-                fu_view       = build_followup_view(ctx, followup_questions)
-                fu_msg        = await ctx.send(
+                fu_view  = build_followup_view(ctx, followup_questions)
+                fu_msg   = await ctx.send(
                     embed=info_embed("💡 Follow-up questions", "Click to ask:", C_INFO, ctx.bot.user),
                     view=fu_view,
                 )
@@ -1775,7 +2312,7 @@ async def cmd_retry(ctx: commands.Context):
             _, answer = parse_smart_response(raw2)
 
         if meta.get("confidence", 10) < 6:
-            answer += "\n\n⚠️ I'm not fully certain on this — worth double checking."
+            answer += "\n\n⚠️ Not 100% certain on this one — worth double checking."
 
     except Exception as exc:
         stop_event.set()
@@ -1838,7 +2375,7 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
                 f"?model=flux&width=1024&height=1024&seed={seed}"
             )
 
-            headers = {"User-Agent": "LXTEBot/8.2"}
+            headers = {"User-Agent": "LXTEBot/9.0"}
             if POLLINATIONS_TOKEN:
                 headers["Authorization"] = f"Bearer {POLLINATIONS_TOKEN}"
 
@@ -1861,7 +2398,7 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
             file    = discord.File(fp=io.BytesIO(img_bytes), filename="generated.png")
 
             e = discord.Embed(color=C_AI, timestamp=datetime.now(timezone.utc))
-            e.set_author(name="LXTE's Assistant", icon_url=get_avatar(ctx.bot.user))
+            e.set_author(name="LXTE's AI", icon_url=get_avatar(ctx.bot.user))
             e.set_image(url="attachment://generated.png")
             e.set_footer(
                 text=f"{prompt[:80]}{'…' if len(prompt) > 80 else ''}  •  {ctx.author.display_name}  •  {elapsed:.1f}s",
@@ -1916,7 +2453,7 @@ async def cmd_level(ctx: commands.Context, target: discord.Member = None):
     e.add_field(name="Total XP", value=f"{total_xp:,}", inline=True)
     e.add_field(name="Messages", value=f"{messages:,}", inline=True)
     e.add_field(name="Progress", value=f"`{bar}` {xp_in}/{xp_need}", inline=False)
-    e.set_footer(text="Ascend", icon_url=get_avatar(ctx.bot.user))
+    e.set_footer(text="Ascend  •  LXTE's AI", icon_url=get_avatar(ctx.bot.user))
     await ctx.send(embed=e)
 
 
@@ -1940,7 +2477,7 @@ async def cmd_leaderboard(ctx: commands.Context):
     e = make_embed(C_GOLD)
     e.title       = "⬆️ Leaderboard"
     e.description = "\n".join(lines)
-    e.set_footer(text="Ascend", icon_url=get_avatar(ctx.bot.user))
+    e.set_footer(text="Ascend  •  LXTE's AI", icon_url=get_avatar(ctx.bot.user))
     await ctx.send(embed=e)
 
 
@@ -1986,15 +2523,19 @@ async def cmd_stats(ctx: commands.Context):
             value=f"{global_data.get('total_users', 0):,} users · {global_data.get('total_questions', 0):,} questions",
             inline=False,
         )
-    e.set_footer(text="LXTE's Assistant", icon_url=get_avatar(ctx.bot.user))
+    e.set_footer(text="LXTE's AI", icon_url=get_avatar(ctx.bot.user))
     await ctx.send(embed=e)
 
 
 @bot.command(name="about", aliases=["info"])
 async def cmd_about(ctx: commands.Context):
     e = make_embed(C_AI)
-    e.title       = "LXTE's Assistant"
-    e.description = "Built by AJ. Sources from Wikipedia and Roblox Wiki automatically. Reads linked pages. Smart follow-up suggestions. Proactive image analysis in the AI channel."
+    e.title       = "LXTE's AI"
+    e.description = (
+        "Built by AJ. Sources from Wikipedia and Roblox Wiki automatically.\n"
+        "Reads linked pages. Smart follow-up suggestions. Proactive image analysis.\n"
+        "Automod, anti-raid, multi auto-role, configurable member count."
+    )
     e.set_thumbnail(url=get_avatar(ctx.bot.user))
     e.add_field(name="Prefix",   value="`.`",                  inline=True)
     e.add_field(name="Memory",   value="Per channel, 14 days", inline=True)
@@ -2052,23 +2593,33 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
 
     elif action == "synccount":
         for guild in bot.guilds:
-            await update_member_count(guild)
+            config = await bot.db.get_config(guild.id)
+            await update_member_count(guild, config.get("member_count_format", MEMBER_COUNT_DEFAULT_FORMAT))
         await ctx.send(embed=success_embed("Synced", "Member counts updated.", ctx.bot.user))
 
     elif action == "health":
         mongo_ok = await bot.db.ping()
         await ctx.send(embed=info_embed("Health", (
-            f"Discord : ✅ {round(bot.latency * 1000)}ms\n"
-            f"MongoDB : {'✅' if mongo_ok else '❌'}\n"
-            f"Groq    : ✅ {bot.ai._rotator._count} key(s)\n"
+            f"Discord      : ✅ {round(bot.latency * 1000)}ms\n"
+            f"MongoDB      : {'✅' if mongo_ok else '❌'}\n"
+            f"Groq         : ✅ {bot.ai._rotator._count} key(s)\n"
             f"Pollinations : ✅ (checked on demand)\n"
-            f"Wikipedia API: ✅\n"
+            f"Wikipedia    : ✅\n"
             f"Roblox Wiki  : ✅"
         ), user=ctx.bot.user))
 
+    elif action == "unlockraid":
+        for guild in bot.guilds:
+            await _unlock_server(guild)
+            _raid_active[guild.id] = False
+            _join_timestamps[guild.id].clear()
+        await ctx.send(embed=success_embed("Unlocked", "All servers manually unlocked from raid mode.", ctx.bot.user))
+
     else:
         await ctx.send(embed=info_embed(
-            "Admin commands", "`status` `clearuser <id>` `keys` `synccount` `health`", user=ctx.bot.user,
+            "Admin commands",
+            "`status` `clearuser <id>` `keys` `synccount` `health` `unlockraid`",
+            user=ctx.bot.user,
         ))
 
 
@@ -2096,7 +2647,7 @@ async def slash_level(interaction: discord.Interaction, user: discord.User = Non
     e.add_field(name="Total XP", value=f"{total_xp:,}", inline=True)
     e.add_field(name="Messages", value=f"{messages:,}", inline=True)
     e.add_field(name="Progress", value=f"`{bar}` {xp_in}/{xp_need}", inline=False)
-    e.set_footer(text="Ascend", icon_url=get_avatar(interaction.client.user))
+    e.set_footer(text="Ascend  •  LXTE's AI", icon_url=get_avatar(interaction.client.user))
     await interaction.response.send_message(embed=e)
 
 
