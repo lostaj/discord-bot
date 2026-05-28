@@ -48,7 +48,7 @@ C_GOLD    = 0xFFD700
 
 # ─── Groq Config ─────────────────────────────────────────────────────────────
 GROQ_MODEL_TEXT   = "llama-3.3-70b-versatile"
-GROQ_MODEL_VISION = "qwen/qwen3-vl-32b-instruct"
+GROQ_MODEL_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"
 MAX_TOKENS        = 256
 TEMPERATURE       = 0.65
 MAX_HISTORY_TURNS = 30
