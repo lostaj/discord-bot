@@ -1,17 +1,15 @@
 """
 LXTE's Assistant — built by AJ
 httpx · MongoDB · discord.py
-v7.1.0 — Polished, smarter, owner-first
+v7.2.0 — Polished, smarter, owner-first
 """
-
-import sys, types
-sys.modules['audioop'] = types.ModuleType('audioop')
 
 import io
 import os
 import re
 import math
 import time
+import random
 import asyncio
 import logging
 import itertools
@@ -71,6 +69,9 @@ MEMBER_COUNT_FORMAT     = "🌸 | • Members: {count}"
 # ─── Leveling ─────────────────────────────────────────────────────────────────
 XP_COOLDOWN_SEC = 30
 _xp_cooldowns: dict[int, float] = {}
+
+# ─── Context Limits ───────────────────────────────────────────────────────────
+MAX_CONTEXT_MEMBERS = 120
 
 # ─── Safety ───────────────────────────────────────────────────────────────────
 BLOCKED_PATTERNS = [
@@ -189,59 +190,71 @@ def progress_bar(current: int, needed: int, length: int = 15) -> str:
 #  POST-PROCESSING
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Matches @Name patterns — first char must be alphanumeric, no email/URL chars inside
+_MENTION_RE = re.compile(r'(?<![A-Za-z0-9])@([A-Za-z0-9][A-Za-z0-9_\.\- ]{0,31})')
+
+
 def strip_bold(text: str) -> str:
     """Remove **bold** markdown from AI responses. Keep *italic* and `code`."""
     return re.sub(r'\*\*(.+?)\*\*', r'\1', text)
 
 
+def _resolve_mention(raw: str, guild: discord.Guild):
+    """Try to resolve an @name to a member or role. Returns (member, role)."""
+    if not raw or '@' in raw or ':' in raw or '/' in raw or ' ' not in raw and '.' in raw and '@' not in raw:
+        # Skip anything that looks like an email, URL, or has invalid chars
+        # But allow single-word names that happen to have a dot (like "Dr. Doom")
+        pass
+
+    member = discord.utils.find(
+        lambda mem: mem.display_name.lower() == raw.lower()
+                    or mem.name.lower() == raw.lower(),
+        guild.members,
+    )
+    if member:
+        return member, None
+
+    role = discord.utils.find(
+        lambda r: r.name.lower() == raw.lower(),
+        guild.roles,
+    )
+    if role:
+        return None, role
+
+    return None, None
+
+
 def format_mentions(text: str, guild: Optional[discord.Guild]) -> str:
     """
-    Convert @name patterns from AI into visual non-pinging styled text.
-    Tries to match members first, then roles.
-    Falls back to plain @name if nothing found.
+    Convert @name patterns into visual non-pinging @displayname text.
+    Used inside embed descriptions.
     """
     if not guild:
         return text
 
     def replace_mention(m):
         raw = m.group(1).strip()
-
-        # Try member match first
-        member = discord.utils.find(
-            lambda mem: mem.display_name.lower() == raw.lower()
-                        or mem.name.lower() == raw.lower(),
-            guild.members,
-        )
+        if '@' in raw or ':' in raw or '/' in raw:
+            return f"@{raw}"
+        member, role = _resolve_mention(raw, guild)
         if member:
             return f"@{member.display_name}"
-
-        # Try role match
-        role = discord.utils.find(
-            lambda r: r.name.lower() == raw.lower(),
-            guild.roles,
-        )
         if role:
             return f"@{role.name}"
-
         return f"@{raw}"
 
-    return re.sub(r'@([A-Za-z0-9_\.\- ]{1,64})', replace_mention, text)
+    return _MENTION_RE.sub(replace_mention, text)
 
 
 def format_timestamps(text: str) -> str:
-    """
-    Convert [timestamp:YYYY-MM-DD HH:MM] patterns into Discord relative timestamps.
-    The AI can use this syntax to embed live countdowns/relative times.
-    """
+    """Convert [timestamp:YYYY-MM-DD HH:MM] into Discord <t:unix:R>."""
     def replace_ts(m):
         raw = m.group(1).strip()
         try:
             dt = datetime.strptime(raw, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-            unix = int(dt.timestamp())
-            return f"<t:{unix}:R>"
+            return f"<t:{int(dt.timestamp())}:R>"
         except ValueError:
             return raw
-
     return re.sub(r'\[timestamp:([^\]]+)\]', replace_ts, text)
 
 
@@ -256,9 +269,13 @@ def clean_ai_response(text: str, guild: Optional[discord.Guild] = None) -> str:
 
 def extract_pings(answer: str, guild: Optional[discord.Guild]) -> tuple[str, str]:
     """
-    Extract @name patterns and convert to real <@id>/<@&id> for message content
+    Extract @name patterns and convert to real <@id>/<@&id> for message.content
     so Discord renders them as highlighted pills visually.
-    allowed_mentions=none() on the reply blocks actual notifications.
+
+    With allowed_mentions=none() on the reply, NO actual notifications fire —
+    but the pills still show up in the message content. The embed gets clean
+    @displayname text so it reads naturally.
+
     Returns (ping_content, cleaned_answer).
     """
     if not guild:
@@ -268,24 +285,18 @@ def extract_pings(answer: str, guild: Optional[discord.Guild]) -> tuple[str, str
 
     def replace(m):
         raw = m.group(1).strip()
-        member = discord.utils.find(
-            lambda mem: mem.display_name.lower() == raw.lower()
-                        or mem.name.lower() == raw.lower(),
-            guild.members,
-        )
+        if '@' in raw or ':' in raw or '/' in raw:
+            return f"@{raw}"
+        member, role = _resolve_mention(raw, guild)
         if member:
             ping_parts.append(f"<@{member.id}>")
             return f"@{member.display_name}"
-        role = discord.utils.find(
-            lambda r: r.name.lower() == raw.lower(),
-            guild.roles,
-        )
         if role:
             ping_parts.append(f"<@&{role.id}>")
             return f"@{role.name}"
         return f"@{raw}"
 
-    cleaned = re.sub(r'@([A-Za-z0-9_\.\- ]{1,64})', replace, answer)
+    cleaned = _MENTION_RE.sub(replace, answer)
     return " ".join(ping_parts) if ping_parts else "", cleaned
 
 
@@ -515,11 +526,21 @@ def build_context(ctx: commands.Context) -> str:
         roles_list = ', '.join(r.name for r in guild.roles if r.name != '@everyone')
         lines.append(f"Roles         : {roles_list}")
 
-        lines.append("\n=== ALL MEMBERS (non-bot) ===")
+        # ── Capped member list — sorted: online first, then by join date ──
+        non_bots = [m for m in guild.members if not m.bot]
+        # Priority: online > idle/dnd > offline, then by join date
+        status_priority = {
+            discord.Status.online: 0,
+            discord.Status.idle: 1,
+            discord.Status.dnd: 1,
+            discord.Status.offline: 2,
+        }
+        non_bots.sort(key=lambda m: (status_priority.get(m.status, 3), m.joined_at or datetime.min))
+        shown = non_bots[:MAX_CONTEXT_MEMBERS]
+
+        lines.append(f"\n=== MEMBERS (showing {len(shown)}/{len(non_bots)} non-bot) ===")
         lines.append("Format: display_name | username | user_id | top_role | admin | status | joined")
-        for m in guild.members:
-            if m.bot:
-                continue
+        for m in shown:
             joined = m.joined_at.strftime('%Y-%m-%d') if m.joined_at else 'unknown'
             lines.append(
                 f"  {m.display_name} | {m.name} | {m.id} | "
@@ -1365,8 +1386,13 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
             await ctx.send(embed=error_embed("Error", f"```{str(exc)[:300]}```", ctx.bot.user))
             return
 
+    # ── Visual pings: extract <@id> for message content, clean text for embed ─
+    ping_content, cleaned_answer = extract_pings(answer, ctx.guild)
+    embed = ai_embed(cleaned_answer, ctx, guild=ctx.guild)
+
     await ctx.reply(
-        embed=ai_embed(answer, ctx, guild=ctx.guild),
+        content=ping_content or None,       # highlighted pills render here (no notification)
+        embed=embed,                        # readable @displayname text in embed
         mention_author=False,
         allowed_mentions=discord.AllowedMentions.none(),
     )
@@ -1437,14 +1463,14 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
     async with ctx.typing():
         try:
             encoded = quote(prompt, safe="")
-            seed    = abs(hash(f"{ctx.author.id}{prompt}")) % 99999
+            seed    = random.randint(0, 99999)  # ✅ true randomness — same prompt = different image
 
             img_url = (
                 f"https://image.pollinations.ai/prompt/{encoded}"
                 f"?model=flux&width=1024&height=1024&seed={seed}"
             )
 
-            headers = {"User-Agent": "LXTEBot/7.1"}
+            headers = {"User-Agent": "LXTEBot/7.2"}
             if POLLINATIONS_TOKEN:
                 headers["Authorization"] = f"Bearer {POLLINATIONS_TOKEN}"
 
