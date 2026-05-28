@@ -1,7 +1,7 @@
 """
 LXTE's Assistant — built by AJ
 httpx · MongoDB · discord.py
-v8.0.0 — Engineered, social-aware, owner-first
+v8.0.1 — Engineered, social-aware, owner-first
 """
 
 import io
@@ -27,7 +27,7 @@ from discord.ext import commands
 from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
-print("✅ LXTE's Assistant v8.0 — loaded")
+print("✅ LXTE's Assistant v8.0.1 — loaded")
 print("Pollinations token loaded:", bool(os.environ.get("POLLINATIONS_TOKEN")))
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
@@ -48,7 +48,7 @@ C_GOLD    = 0xFFD700
 
 # ─── Groq Config ─────────────────────────────────────────────────────────────
 GROQ_MODEL_TEXT   = "llama-3.3-70b-versatile"
-GROQ_MODEL_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"
+GROQ_MODEL_VISION = "qwen/qwen3-vl-32b-instruct"
 MAX_TOKENS        = 256
 TEMPERATURE       = 0.65
 MAX_HISTORY_TURNS = 30
@@ -1113,10 +1113,6 @@ class LXTEBot(commands.Bot):
         self.start_time:   Optional[datetime] = None
         self.http_client:  httpx.AsyncClient  = None  # type: ignore
 
-    async def setup_hook(self):
-        # Persistent HTTP client used by Groq rotator and Image Gen
-        self.http_client = httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0))
-
     async def on_ready(self):
         await self.change_presence(
             activity=discord.Activity(type=discord.ActivityType.watching, name=".help"),
@@ -1734,7 +1730,9 @@ async def _startup():
         raise ConnectionError("MongoDB failed — check MONGO_URI.")
     logger.info("Connected.")
 
-    # Pass shared http client to rotator for max performance
+    # FIX: Initialize HTTP client BEFORE passing it to KeyRotator
+    bot.http_client = httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0))
+
     rotator          = KeyRotator(groq_keys, bot.http_client)
     bot.db           = db
     bot.ai           = AIEngine(rotator)
