@@ -1,7 +1,7 @@
 """
 LXTE's Assistant — built by AJ
 httpx · MongoDB · discord.py
-v7.2.1 — Polished, smarter, owner-first
+v8.0.0 — Engineered, social-aware, owner-first
 """
 
 import io
@@ -13,6 +13,7 @@ import random
 import asyncio
 import logging
 import itertools
+from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote
@@ -26,8 +27,7 @@ from discord.ext import commands
 from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
-print("✅ LXTE's Assistant v7.2.1 — loaded")
-print("model has landed")
+print("✅ LXTE's Assistant v8.0 — loaded")
 print("Pollinations token loaded:", bool(os.environ.get("POLLINATIONS_TOKEN")))
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
@@ -159,6 +159,26 @@ WEB_TRIGGERS = [
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  SOCIAL CONTEXT CACHE (In-memory recent speakers)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SocialCache:
+    def __init__(self, size: int = 20):
+        self._cache: dict[int, deque] = {}
+
+    def add(self, channel_id: int, user_id: int):
+        if channel_id not in self._cache:
+            self._cache[channel_id] = deque(maxlen=size)
+        if self._cache[channel_id][-1] != user_id:
+            self._cache[channel_id].append(user_id)
+
+    def get_recent(self, channel_id: int) -> set[int]:
+        return set(self._cache.get(channel_id, []))
+
+social_cache = SocialCache()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  LEVEL MATH
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -186,66 +206,20 @@ def progress_bar(current: int, needed: int, length: int = 15) -> str:
     filled = int(length * current / needed)
     return "█" * filled + "░" * (length - filled)
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  POST-PROCESSING
 # ═══════════════════════════════════════════════════════════════════════════════
-
-# Matches @Name patterns — allows spaces/special chars up to 32 chars, stops at space/end
-_MENTION_RE = re.compile(r'(?<![A-Za-z0-9])@(.{1,32})(?=\s|$)')
-
 
 def strip_bold(text: str) -> str:
     """Remove **bold** markdown from AI responses. Keep *italic* and `code`."""
     return re.sub(r'\*\*(.+?)\*\*', r'\1', text)
 
 
-def _resolve_mention(raw: str, guild: discord.Guild):
-    """Try to resolve an @name to a member or role. Returns (member, role)."""
-    # Block Discord system pings and invalid strings (emails/urls)
-    if raw.lower() in ('everyone', 'here') or '@' in raw or ':' in raw or '/' in raw:
-        return None, None
-
-    member = discord.utils.find(
-        lambda mem: mem.display_name.lower() == raw.lower()
-                    or mem.name.lower() == raw.lower(),
-        guild.members,
-    )
-    if member:
-        return member, None
-
-    role = discord.utils.find(
-        lambda r: r.name.lower() == raw.lower(),
-        guild.roles,
-    )
-    if role:
-        return None, role
-
-    return None, None
-
-
-def format_mentions(text: str, guild: Optional[discord.Guild]) -> str:
-    """
-    Convert @name patterns into clickable profile links INSIDE the embed.
-    Discord doesn't allow native <@id> pills in embeds, so we use hyperlinks.
-    """
-    if not guild:
-        return text
-
-    def replace_mention(m):
-        raw = m.group(1).strip()
-        member, role = _resolve_mention(raw, guild)
-        if member:
-            # Clickable profile link that renders cleanly inside the embed
-            return f"[@{member.display_name}](https://discord.com/users/{member.id})"
-        if role:
-            return f"@{role.name}"
-        return f"@{raw}"
-
-    return _MENTION_RE.sub(replace_mention, text)
-
-
-def format_timestamps(text: str) -> str:
-    """Convert [timestamp:YYYY-MM-DD HH:MM] into Discord <t:unix:R>."""
+def clean_ai_response(text: str, guild: Optional[discord.Guild] = None) -> str:
+    """Strip bold, format timestamps, and NEUTRALIZE raw pings."""
+    text = strip_bold(text)
+    
     def replace_ts(m):
         raw = m.group(1).strip()
         try:
@@ -253,29 +227,31 @@ def format_timestamps(text: str) -> str:
             return f"<t:{int(dt.timestamp())}:R>"
         except ValueError:
             return raw
-    return re.sub(r'\[timestamp:([^\]]+)\]', replace_ts, text)
-
-
-def clean_ai_response(text: str, guild: Optional[discord.Guild] = None) -> str:
-    """Full pipeline: strip bold → format timestamps → format mentions."""
-    text = strip_bold(text)
-    text = format_timestamps(text)
+            
+    text = re.sub(r'\[timestamp:([^\]]+)\]', replace_ts, text)
+    
+    # Crucial safety: Destroy any raw <@id> or <@&id> the AI might accidentally output
+    # Guarantees ZERO actual Discord notifications, just leaves plain text
     if guild:
-        text = format_mentions(text, guild)
+        text = re.sub(r'<@!?\d+>', lambda m: f"@{m.group(0)}", text)
+        text = re.sub(r'<@&\d+>', lambda m: f"@{m.group(0)}", text)
+        
     return text
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  API KEY ROTATOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class KeyRotator:
-    def __init__(self, keys: list[str]):
+    def __init__(self, keys: list[str], client: httpx.AsyncClient):
         if not keys:
             raise ValueError("At least one API key is required.")
         self._keys    = keys
         self._cycle   = itertools.cycle(range(len(keys)))
         self._current = next(self._cycle)
         self._count   = len(keys)
+        self._client  = client
         logger.info("Loaded %d API key(s)", self._count)
 
     def get(self) -> str:
@@ -290,25 +266,24 @@ class KeyRotator:
             try:
                 key = self.get()
                 self.rotate()
-                async with httpx.AsyncClient(timeout=30) as client:
-                    resp = await client.post(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {key}",
-                            "Content-Type": "application/json",
-                        },
-                        json=kwargs,
-                    )
-                    if resp.status_code == 429:
-                        logger.warning("Rate limit — rotating key")
-                        await asyncio.sleep(0.5)
-                        continue
-                    resp.raise_for_status()
-                    data    = resp.json()
-                    content = data["choices"][0]["message"]["content"]
-                    if isinstance(content, list):
-                        return "".join(b.get("text", "") for b in content).strip()
-                    return (content or "").strip()
+                kwargs["headers"] = {
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                }
+                resp = await self._client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    json=kwargs,
+                )
+                if resp.status_code == 429:
+                    logger.warning("Rate limit — rotating key")
+                    await asyncio.sleep(0.5)
+                    continue
+                resp.raise_for_status()
+                data    = resp.json()
+                content = data["choices"][0]["message"]["content"]
+                if isinstance(content, list):
+                    return "".join(b.get("text", "") for b in content).strip()
+                return (content or "").strip()
             except Exception as e:
                 last_exc = e
                 self.rotate()
@@ -490,25 +465,28 @@ def build_context(ctx: commands.Context) -> str:
         roles_list = ', '.join(r.name for r in guild.roles if r.name != '@everyone')
         lines.append(f"Roles         : {roles_list}")
 
-        # ── Capped member list — sorted: online first, then by join date ──
+        # ── Smart Capped Member List: Prioritize Active Chatters + Online ──
+        recent_ids = social_cache.get_recent(ctx.channel.id)
         non_bots = [m for m in guild.members if not m.bot]
-        status_priority = {
-            discord.Status.online: 0,
-            discord.Status.idle: 1,
-            discord.Status.dnd: 1,
-            discord.Status.offline: 2,
-        }
-        non_bots.sort(key=lambda m: (status_priority.get(m.status, 3), m.joined_at or datetime.min))
+        
+        def sort_key(m):
+            is_recent = m.id in recent_ids
+            is_online = m.status != discord.Status.offline
+            priority = 0 if is_recent and is_online else 1 if is_recent else 2 if is_online else 3
+            return (priority, m.joined_at or datetime.min)
+
+        non_bots.sort(key=sort_key)
         shown = non_bots[:MAX_CONTEXT_MEMBERS]
 
         lines.append(f"\n=== MEMBERS (showing {len(shown)}/{len(non_bots)} non-bot) ===")
         lines.append("Format: display_name | username | user_id | top_role | admin | status | joined")
         for m in shown:
             joined = m.joined_at.strftime('%Y-%m-%d') if m.joined_at else 'unknown'
+            tag = " ⭐" if m.id in recent_ids else ""
             lines.append(
                 f"  {m.display_name} | {m.name} | {m.id} | "
                 f"{m.top_role.name} | admin:{m.guild_permissions.administrator} | "
-                f"{str(m.status)} | joined:{joined}"
+                f"{str(m.status)} | joined:{joined}{tag}"
             )
 
         if ctx.message.mentions:
@@ -576,10 +554,8 @@ def get_avatar(user=None) -> Optional[str]:
         return user.display_avatar.url
     return None
 
-
 def make_embed(color: int) -> discord.Embed:
     return discord.Embed(color=color, timestamp=datetime.now(timezone.utc))
-
 
 def ai_embed(answer: str, ctx: commands.Context, guild: Optional[discord.Guild] = None) -> discord.Embed:
     answer = clean_ai_response(answer, guild)
@@ -597,14 +573,12 @@ def ai_embed(answer: str, ctx: commands.Context, guild: Optional[discord.Guild] 
     e.timestamp = datetime.now(timezone.utc)
     return e
 
-
 def error_embed(title: str, desc: str, user=None) -> discord.Embed:
     e = make_embed(C_ERROR)
     e.title       = f"⛔ {title}"
     e.description = desc
     e.set_footer(text="LXTE's Assistant", icon_url=get_avatar(user))
     return e
-
 
 def success_embed(title: str, desc: str, user=None) -> discord.Embed:
     e = make_embed(C_SUCCESS)
@@ -613,14 +587,12 @@ def success_embed(title: str, desc: str, user=None) -> discord.Embed:
     e.set_footer(text="LXTE's Assistant", icon_url=get_avatar(user))
     return e
 
-
 def info_embed(title: str, desc: str, color: int = C_INFO, user=None) -> discord.Embed:
     e = make_embed(color)
     e.title       = title
     e.description = desc
     e.set_footer(text="LXTE's Assistant", icon_url=get_avatar(user))
     return e
-
 
 def format_uptime(start: Optional[datetime]) -> str:
     if not start:
@@ -1139,6 +1111,11 @@ class LXTEBot(commands.Bot):
         self.ai:           AIEngine           = None  # type: ignore
         self.owner_id_int: int                = 0
         self.start_time:   Optional[datetime] = None
+        self.http_client:  httpx.AsyncClient  = None  # type: ignore
+
+    async def setup_hook(self):
+        # Persistent HTTP client used by Groq rotator and Image Gen
+        self.http_client = httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0))
 
     async def on_ready(self):
         await self.change_presence(
@@ -1165,6 +1142,9 @@ class LXTEBot(commands.Bot):
 
         content    = message.content.strip()
         is_mention = self.user in message.mentions
+
+        # Feed social cache
+        social_cache.add(message.channel.id, message.author.id)
 
         # ── @mention → .ask ───────────────────────────────────────────────────
         if is_mention:
@@ -1244,6 +1224,13 @@ class LXTEBot(commands.Bot):
         else:
             await ctx.send(embed=error_embed("Error", f"```{str(error)[:400]}```", ctx.bot.user))
             logger.error("Unhandled: %s", error, exc_info=error)
+
+    async def close(self):
+        if self.http_client:
+            await self.http_client.aclose()
+        if self.db:
+            await self.db.close()
+        await super().close()
 
 
 bot = LXTEBot()
@@ -1326,7 +1313,7 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
                 use_web      = web_enabled and any(t in question.lower() for t in WEB_TRIGGERS)
 
             try:
-                await ctx.message.remove_reaction("👀", ctx.bot.user)
+                await ctx.message.remove_reaction("👀", bot.user)
                 await ctx.message.add_reaction("⏳")
             except Exception:
                 pass
@@ -1349,16 +1336,24 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
             await ctx.send(embed=error_embed("Error", f"```{str(exc)[:300]}```", ctx.bot.user))
             return
 
-    # ── Clean embed only — clickable hyperlinks for mentions ──
-    embed = ai_embed(answer, ctx, guild=ctx.guild)
-
-    await ctx.reply(
-        embed=embed,
-        mention_author=False,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
+    # ── Send as plain text. If AI ignores 1800 limit and hits 2000, fallback to embed ──
+    clean_text = clean_ai_response(answer, ctx.guild)
+    
+    if len(clean_text) > 2000:
+        await ctx.reply(
+            embed=ai_embed(answer, ctx, guild=ctx.guild), 
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    else:
+        await ctx.reply(
+            content=clean_text, 
+            mention_author=False,
+            allowed_mentions=discord.AllowedMentions.none(), 
+        )
+        
     try:
-        await ctx.message.remove_reaction("⏳", ctx.bot.user)
+        await ctx.message.remove_reaction("⏳", bot.user)
     except Exception:
         pass
 
@@ -1431,20 +1426,20 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
                 f"?model=flux&width=1024&height=1024&seed={seed}"
             )
 
-            headers = {"User-Agent": "LXTEBot/7.2"}
+            headers = {"User-Agent": "LXTEBot/8.0"}
             if POLLINATIONS_TOKEN:
                 headers["Authorization"] = f"Bearer {POLLINATIONS_TOKEN}"
 
             try:
-                await ctx.message.remove_reaction("👀", ctx.bot.user)
+                await ctx.message.remove_reaction("👀", bot.user)
                 await ctx.message.add_reaction("⏳")
             except Exception:
                 pass
 
-            async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0)) as client:
-                resp = await client.get(img_url, headers=headers, follow_redirects=True)
-                resp.raise_for_status()
-                img_bytes = resp.content
+            # Use shared persistent httpx client
+            resp = await bot.http_client.get(img_url, headers=headers, follow_redirects=True)
+            resp.raise_for_status()
+            img_bytes = resp.content
 
             if len(img_bytes) < 5000:
                 await status_msg.delete()
@@ -1470,15 +1465,15 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
             await ctx.reply(file=file, embed=e, mention_author=False)
             await bot.db.increment_stat(ctx.author.id, "images_generated")
             try:
-                await ctx.message.remove_reaction("⏳", ctx.bot.user)
+                await ctx.message.remove_reaction("⏳", bot.user)
             except Exception:
                 pass
 
         except httpx.HTTPStatusError as exc:
             await status_msg.delete()
             try:
-                await ctx.message.remove_reaction("👀", ctx.bot.user)
-                await ctx.message.remove_reaction("⏳", ctx.bot.user)
+                await ctx.message.remove_reaction("👀", bot.user)
+                await ctx.message.remove_reaction("⏳", bot.user)
             except Exception:
                 pass
             code = exc.response.status_code
@@ -1493,8 +1488,8 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
         except httpx.TimeoutException:
             await status_msg.delete()
             try:
-                await ctx.message.remove_reaction("👀", ctx.bot.user)
-                await ctx.message.remove_reaction("⏳", ctx.bot.user)
+                await ctx.message.remove_reaction("👀", bot.user)
+                await ctx.message.remove_reaction("⏳", bot.user)
             except Exception:
                 pass
             await ctx.send(embed=error_embed(
@@ -1507,8 +1502,8 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
             logger.error("Image gen error: %s", exc, exc_info=exc)
             await status_msg.delete()
             try:
-                await ctx.message.remove_reaction("👀", ctx.bot.user)
-                await ctx.message.remove_reaction("⏳", ctx.bot.user)
+                await ctx.message.remove_reaction("👀", bot.user)
+                await ctx.message.remove_reaction("⏳", bot.user)
             except Exception:
                 pass
             await ctx.send(embed=error_embed("Error", "Something went wrong generating that image.", ctx.bot.user))
@@ -1739,7 +1734,8 @@ async def _startup():
         raise ConnectionError("MongoDB failed — check MONGO_URI.")
     logger.info("Connected.")
 
-    rotator          = KeyRotator(groq_keys)
+    # Pass shared http client to rotator for max performance
+    rotator          = KeyRotator(groq_keys, bot.http_client)
     bot.db           = db
     bot.ai           = AIEngine(rotator)
     bot.owner_id_int = int(owner_id)
@@ -1752,8 +1748,6 @@ async def _startup():
         logger.critical("Bad token.")
     except Exception as exc:
         logger.critical("Fatal: %s", exc, exc_info=exc)
-    finally:
-        await db.close()
 
 
 def main():
