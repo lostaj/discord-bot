@@ -1,12 +1,13 @@
 """
 LXTE's Assistant — built by AJ
 httpx · MongoDB · discord.py
-v7.0.0 — Smarter, cleaner, owner-first
+v7.1.0 — Polished, smarter, owner-first
 """
 
 import sys, types
 sys.modules['audioop'] = types.ModuleType('audioop')
 
+import io
 import os
 import re
 import math
@@ -16,6 +17,7 @@ import logging
 import itertools
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 import psutil
@@ -26,7 +28,7 @@ from discord.ext import commands
 from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
-print("✅ LXTE's Assistant v7.0 — loaded")
+print("✅ LXTE's Assistant v7.1 — loaded")
 print("Pollinations token loaded:", bool(os.environ.get("POLLINATIONS_TOKEN")))
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
@@ -53,26 +55,24 @@ TEMPERATURE       = 0.65
 MAX_HISTORY_TURNS = 30
 HISTORY_TTL_DAYS  = 14
 
-# ─── Pollinations ────────────────────────────────────────────────────────────
-# Get a FREE token at https://auth.pollinations.ai (sign in with Discord, 30s)
-# Then add POLLINATIONS_TOKEN=your_token to your .env — no payment needed.
+# ─── Pollinations ─────────────────────────────────────────────────────────────
 POLLINATIONS_TOKEN = os.environ.get("POLLINATIONS_TOKEN", "")
 
-# ─── Rate limit ──────────────────────────────────────────────────────────────
-USER_COOLDOWN_SECS    = 5.0    # non-owners only — for .ask
-GEN_COOLDOWN_SECS     = 15.0   # separate cooldown for image generation
+# ─── Rate limits ──────────────────────────────────────────────────────────────
+USER_COOLDOWN_SECS = 5.0
+GEN_COOLDOWN_SECS  = 15.0
 _last_used:     dict[int, float] = {}
 _last_gen_used: dict[int, float] = {}
 
-# ─── Member Count ────────────────────────────────────────────────────────────
+# ─── Member Count ─────────────────────────────────────────────────────────────
 MEMBER_COUNT_CHANNEL_ID = 1508204390677352629
 MEMBER_COUNT_FORMAT     = "🌸 | • Members: {count}"
 
-# ─── Leveling ────────────────────────────────────────────────────────────────
+# ─── Leveling ─────────────────────────────────────────────────────────────────
 XP_COOLDOWN_SEC = 30
 _xp_cooldowns: dict[int, float] = {}
 
-# ─── Safety ──────────────────────────────────────────────────────────────────
+# ─── Safety ───────────────────────────────────────────────────────────────────
 BLOCKED_PATTERNS = [
     r"ignore (your|all|previous|prior) (instructions?|rules?|prompt|system)",
     r"you are now", r"pretend (you are|to be|you're)", r"act as (if you are|a|an)",
@@ -82,7 +82,7 @@ BLOCKED_PATTERNS = [
     r"new personality", r"you have no (rules?|restrictions?|limits?)",
 ]
 
-# ─── System Prompt ───────────────────────────────────────────────────────────
+# ─── System Prompt ────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
 You are LXTE's Assistant — built from scratch by AJ for the LXTE Discord server. You live in this server. You know these people.
 
@@ -112,11 +112,13 @@ You are a chill, funny, genuinely social Discord bot. You're like that one perso
 - Under 1800 characters.
 - Reply in the language the user used.
 
-## Mentioning users
-- Write @displayname (e.g. @vikky) to visually reference someone — it renders in the embed.
-- Never use **@name** syntax.
-- Use EXACT display name from context. Display name ≠ username.
-- Verify the member exists in the context member list before referencing them.
+## Mentioning users & roles
+- To mention a user visually (no ping): write @displayname — e.g. @vikky
+- To mention a role visually (no ping): write @rolename — e.g. @Moderator
+- To show a timestamp: write [timestamp:YYYY-MM-DD HH:MM] — e.g. [timestamp:2025-01-15 14:30]
+- NEVER use Discord's raw <@id> or <@&id> syntax — the post-processor handles rendering.
+- Use EXACT display names and role names from the live context.
+- Verify the member/role exists in the context before referencing them.
 
 ## Using server context
 - Live context is injected every message — use it actively.
@@ -182,7 +184,7 @@ def progress_bar(current: int, needed: int, length: int = 15) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  POST-PROCESSING — strip bold from AI responses
+#  POST-PROCESSING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def strip_bold(text: str) -> str:
@@ -190,34 +192,63 @@ def strip_bold(text: str) -> str:
     return re.sub(r'\*\*(.+?)\*\*', r'\1', text)
 
 
-def format_fake_ping(text: str, guild: Optional[discord.Guild]) -> str:
+def format_mentions(text: str, guild: Optional[discord.Guild]) -> str:
     """
-    Convert @displayname patterns from AI into styled non-pinging text.
-    Shows as '@name' in italic inside the embed but does NOT actually ping.
-    If guild is available, tries to resolve actual display names.
+    Convert @name patterns from AI into visual non-pinging styled text.
+    Tries to match members first, then roles.
+    Falls back to plain @name if nothing found.
     """
     if not guild:
         return text
 
     def replace_mention(m):
-        raw_name = m.group(1).strip()
+        raw = m.group(1).strip()
+
+        # Try member match first
         member = discord.utils.find(
-            lambda mem: mem.display_name.lower() == raw_name.lower()
-                        or mem.name.lower() == raw_name.lower(),
+            lambda mem: mem.display_name.lower() == raw.lower()
+                        or mem.name.lower() == raw.lower(),
             guild.members,
         )
         if member:
             return f"@{member.display_name}"
-        return f"@{raw_name}"
 
-    return re.sub(r'@([A-Za-z0-9_\.\- ]{1,32})', replace_mention, text)
+        # Try role match
+        role = discord.utils.find(
+            lambda r: r.name.lower() == raw.lower(),
+            guild.roles,
+        )
+        if role:
+            return f"@{role.name}"
+
+        return f"@{raw}"
+
+    return re.sub(r'@([A-Za-z0-9_\.\- ]{1,64})', replace_mention, text)
+
+
+def format_timestamps(text: str) -> str:
+    """
+    Convert [timestamp:YYYY-MM-DD HH:MM] patterns into Discord relative timestamps.
+    The AI can use this syntax to embed live countdowns/relative times.
+    """
+    def replace_ts(m):
+        raw = m.group(1).strip()
+        try:
+            dt = datetime.strptime(raw, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+            unix = int(dt.timestamp())
+            return f"<t:{unix}:R>"
+        except ValueError:
+            return raw
+
+    return re.sub(r'\[timestamp:([^\]]+)\]', replace_ts, text)
 
 
 def clean_ai_response(text: str, guild: Optional[discord.Guild] = None) -> str:
-    """Full pipeline: strip bold, format fake pings."""
+    """Full pipeline: strip bold → format mentions (members + roles) → format timestamps."""
     text = strip_bold(text)
+    text = format_timestamps(text)
     if guild:
-        text = format_fake_ping(text, guild)
+        text = format_mentions(text, guild)
     return text
 
 
@@ -315,7 +346,7 @@ class Database:
     async def close(self):
         self._client.close()
 
-    # ── History ──────────────────────────────────────────────────────────────
+    # ── History ───────────────────────────────────────────────────────────────
 
     async def get_history(self, user_id: int, channel_id: int) -> list[dict]:
         doc = await self.history.find_one({"user_id": user_id, "channel_id": channel_id})
@@ -335,7 +366,7 @@ class Database:
         r = await self.history.delete_many({"user_id": user_id})
         logger.info("Cleared history for %d (%d docs)", user_id, r.deleted_count)
 
-    # ── Stats ────────────────────────────────────────────────────────────────
+    # ── Stats ─────────────────────────────────────────────────────────────────
 
     async def increment_stat(self, user_id: int, field: str):
         now = datetime.now(timezone.utc)
@@ -356,7 +387,7 @@ class Database:
             results.append(doc)
         return results[0] if results else {}
 
-    # ── Config ───────────────────────────────────────────────────────────────
+    # ── Config ────────────────────────────────────────────────────────────────
 
     async def get_config(self, guild_id: int) -> dict:
         return await self.config.find_one({"guild_id": guild_id}) or {}
@@ -368,7 +399,7 @@ class Database:
             upsert=True,
         )
 
-    # ── Levels ───────────────────────────────────────────────────────────────
+    # ── Levels ────────────────────────────────────────────────────────────────
 
     async def get_level_data(self, user_id: int, guild_id: int) -> dict:
         return await self.levels.find_one({"user_id": user_id, "guild_id": guild_id}) or {}
@@ -452,7 +483,7 @@ def build_context(ctx: commands.Context) -> str:
         for m in guild.members:
             if m.bot:
                 continue
-            joined  = m.joined_at.strftime('%Y-%m-%d') if m.joined_at else 'unknown'
+            joined = m.joined_at.strftime('%Y-%m-%d') if m.joined_at else 'unknown'
             lines.append(
                 f"  {m.display_name} | {m.name} | {m.id} | "
                 f"{m.top_role.name} | admin:{m.guild_permissions.administrator} | "
@@ -537,10 +568,7 @@ def ai_embed(answer: str, ctx: commands.Context, guild: Optional[discord.Guild] 
     color = 0x9B59B6 if len(answer) < 200 else 0x7289DA
 
     e = discord.Embed(description=answer, color=color)
-    e.set_author(
-        name="LXTE's Assistant",
-        icon_url=get_avatar(ctx.bot.user),
-    )
+    e.set_author(name="LXTE's Assistant", icon_url=get_avatar(ctx.bot.user))
     e.set_footer(
         text=f"asked by {ctx.author.display_name}",
         icon_url=ctx.author.display_avatar.url,
@@ -915,8 +943,8 @@ def mc_settings_embed(config: dict, guild: Optional[discord.Guild], user=None) -
     channel_str = channel.mention if channel else f"`{MEMBER_COUNT_CHANNEL_ID}`"
     e = make_embed(C_INFO)
     e.title = "📊 Member Count"
-    e.add_field(name="Channel", value=channel_str,                                               inline=True)
-    e.add_field(name="Count",   value=f"`{guild.member_count if guild else '?'}`",              inline=True)
+    e.add_field(name="Channel", value=channel_str,                                                inline=True)
+    e.add_field(name="Count",   value=f"`{guild.member_count if guild else '?'}`",               inline=True)
     e.add_field(name="Status",  value="✅" if config.get("member_count_enabled", True) else "❌", inline=True)
     e.set_footer(text="Saves instantly", icon_url=get_avatar(user))
     return e
@@ -983,7 +1011,7 @@ def ar_settings_embed(config: dict, guild: Optional[discord.Guild], user=None) -
     role_str = role.mention if role else (f"`{role_id}`" if role_id else "`Off`")
     e = make_embed(C_SUCCESS)
     e.title = "🎭 Auto-Role"
-    e.add_field(name="Role",   value=role_str,             inline=True)
+    e.add_field(name="Role",   value=role_str,                inline=True)
     e.add_field(name="Status", value="✅" if role_id else "❌", inline=True)
     e.set_footer(text="Saves instantly", icon_url=get_avatar(user))
     return e
@@ -1117,14 +1145,14 @@ class LXTEBot(commands.Bot):
         content    = message.content.strip()
         is_mention = self.user in message.mentions
 
-        # ── @mention → .ask ──────────────────────────────────────────────────
+        # ── @mention → .ask ───────────────────────────────────────────────────
         if is_mention:
             cleaned = content.replace(f"<@{self.user.id}>", "").replace(f"<@!{self.user.id}>", "").strip()
             message.content = f".ask {cleaned}" if cleaned else ".ask hi"
             await self.process_commands(message)
             return
 
-        # ── Reply to bot → .ask ──────────────────────────────────────────────
+        # ── Reply to bot → .ask ───────────────────────────────────────────────
         if message.reference and not content.startswith(".") and message.guild:
             try:
                 ref = message.reference.resolved or await message.channel.fetch_message(message.reference.message_id)
@@ -1135,7 +1163,7 @@ class LXTEBot(commands.Bot):
             except Exception:
                 pass
 
-        # ── Ascend XP ────────────────────────────────────────────────────────
+        # ── Ascend XP ─────────────────────────────────────────────────────────
         if message.guild and not content.startswith(".") and len(content) >= 2:
             now          = asyncio.get_event_loop().time()
             last_xp_time = _xp_cooldowns.get(message.author.id, 0)
@@ -1215,15 +1243,15 @@ async def cmd_help(ctx: commands.Context):
 async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this image?"):
     is_owner = ctx.author.id == bot.owner_id_int
 
-    # ── Rate limit (owner is completely exempt) ───────────────────────────────
     if not is_owner:
-        now_ts = time.monotonic()
-        last   = _last_used.get(ctx.author.id, 0.0)
+        now_ts    = time.monotonic()
+        last      = _last_used.get(ctx.author.id, 0.0)
         remaining = USER_COOLDOWN_SECS - (now_ts - last)
         if remaining > 0:
+            ready_at = int(time.time() + remaining)
             await ctx.send(
-                embed=error_embed("Slow down", f"Wait {remaining:.1f}s before asking again.", ctx.bot.user),
-                delete_after=4,
+                embed=error_embed("Slow down", f"You can ask again <t:{ready_at}:R>.", ctx.bot.user),
+                delete_after=6,
             )
             return
         _last_used[ctx.author.id] = now_ts
@@ -1240,14 +1268,12 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
 
     owner_mode_active = is_owner and config.get("owner_mode_enabled", True)
 
-    # Safety check (skipped for owner)
     if not owner_mode_active:
         safe, _ = is_safe(question)
         if not safe:
             await ctx.send(embed=error_embed("Nice try 😐", "Not happening.", ctx.bot.user))
             return
 
-    # 👀 — bot saw the message
     try:
         await ctx.message.add_reaction("👀")
     except Exception:
@@ -1278,7 +1304,6 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
                 model        = GROQ_MODEL_TEXT
                 use_web      = web_enabled and any(t in question.lower() for t in WEB_TRIGGERS)
 
-            # 👀 → ⏳
             try:
                 await ctx.message.remove_reaction("👀", ctx.bot.user)
                 await ctx.message.add_reaction("⏳")
@@ -1293,8 +1318,8 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
                 custom_system=custom_system,
             )
 
-            history.append({"role": "user",      "content": question})
-            history.append({"role": "assistant",  "content": answer})
+            history.append({"role": "user",     "content": question})
+            history.append({"role": "assistant", "content": answer})
             await bot.db.save_history(ctx.author.id, ctx.channel.id, history)
             await bot.db.increment_stat(ctx.author.id, "questions")
 
@@ -1308,16 +1333,17 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
         mention_author=False,
         allowed_mentions=discord.AllowedMentions.none(),
     )
-    # Remove ⏳ once reply is sent
     try:
         await ctx.message.remove_reaction("⏳", ctx.bot.user)
     except Exception:
         pass
 
-# ─── Image Generation ────────────────────────────────────────────────────────
+
+# ─── Image Generation ─────────────────────────────────────────────────────────
+
 @bot.command(name="generate", aliases=["gen"])
 async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
-    """Generate an image using Pollinations.ai Flux — free, no key needed."""
+    """Generate an image using Pollinations.ai Flux."""
     if not prompt:
         await ctx.send(embed=error_embed(
             "Missing prompt",
@@ -1328,18 +1354,25 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
 
     is_owner = ctx.author.id == bot.owner_id_int
 
+    # ── Rate limit ────────────────────────────────────────────────────────────
     if not is_owner:
         now_ts    = time.monotonic()
         last      = _last_gen_used.get(ctx.author.id, 0.0)
         remaining = GEN_COOLDOWN_SECS - (now_ts - last)
         if remaining > 0:
+            ready_at = int(time.time() + remaining)
             await ctx.send(
-                embed=error_embed("Slow down", f"Wait {remaining:.1f}s before generating again.", ctx.bot.user),
-                delete_after=5,
+                embed=error_embed(
+                    "Slow down",
+                    f"Image generation has a **15s cooldown**.\nYou can generate again <t:{ready_at}:R>.",
+                    ctx.bot.user,
+                ),
+                delete_after=16,
             )
             return
         _last_gen_used[ctx.author.id] = now_ts
 
+    # ── Safety check ──────────────────────────────────────────────────────────
     if not is_owner:
         safe, _ = is_safe(prompt)
         if not safe:
@@ -1351,9 +1384,10 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
     except Exception:
         pass
 
+    # ── Status embed ──────────────────────────────────────────────────────────
     wait_embed = discord.Embed(
         description="🎨 Generating your image...\n⏱️ Estimated wait: **10–25 seconds**",
-        color=0x9B59B6,
+        color=C_AI,
         timestamp=datetime.now(timezone.utc),
     )
     wait_embed.set_footer(
@@ -1365,9 +1399,6 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
 
     async with ctx.typing():
         try:
-            import io
-            from urllib.parse import quote
-
             encoded = quote(prompt, safe="")
             seed    = abs(hash(f"{ctx.author.id}{prompt}")) % 99999
 
@@ -1376,7 +1407,7 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
                 f"?model=flux&width=1024&height=1024&seed={seed}"
             )
 
-            headers = {"User-Agent": "LXTEBot/7.0"}
+            headers = {"User-Agent": "LXTEBot/7.1"}
             if POLLINATIONS_TOKEN:
                 headers["Authorization"] = f"Bearer {POLLINATIONS_TOKEN}"
 
@@ -1395,7 +1426,7 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
                 await status_msg.delete()
                 await ctx.send(embed=error_embed(
                     "Generation failed",
-                    "Got a bad response from Pollinations. Try a different prompt.",
+                    "Got a bad response from Pollinations. Try rephrasing your prompt.",
                     ctx.bot.user,
                 ))
                 return
@@ -1403,7 +1434,7 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
             elapsed = time.monotonic() - gen_start
             file    = discord.File(fp=io.BytesIO(img_bytes), filename="generated.png")
 
-            e = discord.Embed(color=0x9B59B6, timestamp=datetime.now(timezone.utc))
+            e = discord.Embed(color=C_AI, timestamp=datetime.now(timezone.utc))
             e.set_author(name="LXTE's Assistant", icon_url=get_avatar(ctx.bot.user))
             e.set_image(url="attachment://generated.png")
             e.set_footer(
@@ -1428,12 +1459,13 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
                 pass
             code = exc.response.status_code
             if code == 402:
-                msg = "Missing Pollinations token. Owner: get a free token at auth.pollinations.ai and add POLLINATIONS_TOKEN to .env"
+                msg = "Pollinations rejected this prompt — it may contain brand names or blocked content. Try rephrasing it."
             elif code == 429:
-                msg = "Pollinations is rate-limiting us. Try again in a minute."
+                msg = "Pollinations is rate-limiting us — too many generations too fast. Wait a minute before trying again."
             else:
                 msg = f"Pollinations returned HTTP {code}. Try again shortly."
             await ctx.send(embed=error_embed("Generation failed", msg, ctx.bot.user))
+
         except httpx.TimeoutException:
             await status_msg.delete()
             try:
@@ -1446,6 +1478,7 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
                 "Pollinations took too long. Try again in a moment.",
                 ctx.bot.user,
             ))
+
         except Exception as exc:
             logger.error("Image gen error: %s", exc, exc_info=exc)
             await status_msg.delete()
@@ -1469,9 +1502,9 @@ async def cmd_level(ctx: commands.Context, target: discord.Member = None):
     e = make_embed(C_GOLD)
     e.title = f"{target.display_name}'s Level"
     e.set_thumbnail(url=target.display_avatar.url)
-    e.add_field(name="Level",    value=f"{level}",         inline=True)
-    e.add_field(name="Total XP", value=f"{total_xp:,}",    inline=True)
-    e.add_field(name="Messages", value=f"{messages:,}",    inline=True)
+    e.add_field(name="Level",    value=f"{level}",      inline=True)
+    e.add_field(name="Total XP", value=f"{total_xp:,}", inline=True)
+    e.add_field(name="Messages", value=f"{messages:,}", inline=True)
     e.add_field(name="Progress", value=f"`{bar}` {xp_in}/{xp_need}", inline=False)
     e.set_footer(text="Ascend", icon_url=get_avatar(ctx.bot.user))
     await ctx.send(embed=e)
@@ -1531,10 +1564,10 @@ async def cmd_stats(ctx: commands.Context):
     e = make_embed(C_SUCCESS)
     e.title = f"📊 {ctx.author.display_name}"
     e.set_thumbnail(url=ctx.author.display_avatar.url)
-    e.add_field(name="Questions",       value=f"`{data.get('questions', 0):,}`",         inline=True)
-    e.add_field(name="Images",          value=f"`{data.get('images_generated', 0):,}`",  inline=True)
-    e.add_field(name="First seen",      value=fmt(data.get("first_seen")),                inline=True)
-    e.add_field(name="Last active",     value=fmt(data.get("last_seen")),                 inline=True)
+    e.add_field(name="Questions",   value=f"`{data.get('questions', 0):,}`",        inline=True)
+    e.add_field(name="Images",      value=f"`{data.get('images_generated', 0):,}`", inline=True)
+    e.add_field(name="First seen",  value=fmt(data.get("first_seen")),               inline=True)
+    e.add_field(name="Last active", value=fmt(data.get("last_seen")),                inline=True)
 
     global_data = await bot.db.global_stats()
     if global_data:
@@ -1569,12 +1602,11 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
         return
 
     if action == "status":
-        global_data = await bot.db.global_stats()
-        cpu         = psutil.cpu_percent(interval=0.1)
-        mem         = psutil.virtual_memory()
-        proc        = psutil.Process(os.getpid())
-        proc_mem    = proc.memory_info().rss
-
+        global_data   = await bot.db.global_stats()
+        cpu           = psutil.cpu_percent(interval=0.1)
+        mem           = psutil.virtual_memory()
+        proc          = psutil.Process(os.getpid())
+        proc_mem      = proc.memory_info().rss
         total_members = sum(g.member_count for g in bot.guilds)
         total_humans  = sum(sum(1 for m in g.members if not m.bot) for g in bot.guilds)
         total_bots    = sum(sum(1 for m in g.members if m.bot) for g in bot.guilds)
@@ -1582,7 +1614,6 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
             sum(1 for m in g.members if not m.bot and m.status != discord.Status.offline)
             for g in bot.guilds
         )
-        uptime_str = format_uptime(bot.start_time)
 
         desc = (
             f"Guilds: {len(bot.guilds)}\n"
@@ -1595,7 +1626,7 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
             f"CPU: {cpu}%\n"
             f"RAM: {mem.percent}% ({round(mem.used / 1048576, 1)}/{round(mem.total / 1048576, 1)} MB)\n"
             f"Bot RAM: {round(proc_mem / 1048576, 1)} MB\n"
-            f"Uptime: {uptime_str}"
+            f"Uptime: {format_uptime(bot.start_time)}"
         )
         await ctx.send(embed=info_embed("🛡️ Status", desc, user=ctx.bot.user))
 
@@ -1650,9 +1681,9 @@ async def slash_level(interaction: discord.Interaction, user: discord.User = Non
     e = make_embed(C_GOLD)
     e.title = f"{target.display_name}'s Level"
     e.set_thumbnail(url=target.display_avatar.url)
-    e.add_field(name="Level",    value=f"{level}",         inline=True)
-    e.add_field(name="Total XP", value=f"{total_xp:,}",    inline=True)
-    e.add_field(name="Messages", value=f"{messages:,}",    inline=True)
+    e.add_field(name="Level",    value=f"{level}",      inline=True)
+    e.add_field(name="Total XP", value=f"{total_xp:,}", inline=True)
+    e.add_field(name="Messages", value=f"{messages:,}", inline=True)
     e.add_field(name="Progress", value=f"`{bar}` {xp_in}/{xp_need}", inline=False)
     e.set_footer(text="Ascend", icon_url=get_avatar(interaction.client.user))
     await interaction.response.send_message(embed=e)
