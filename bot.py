@@ -2591,10 +2591,9 @@ def automod_settings_embed(config, user=None):
     e.add_field(name="Automod",       value="✅" if config.get("automod_enabled", True)    else "❌", inline=True)
     e.add_field(name="No Invites",    value="✅" if config.get("automod_no_invites", True) else "❌", inline=True)
     e.add_field(name="No Links",      value="✅" if config.get("automod_no_links", True)   else "❌", inline=True)
-    e.add_field(name="Anti-Malicious","✅ Always on",                                                  inline=True)
+    e.add_field(name="Anti-Malicious", value="✅ Always on", inline=True)
     e.set_footer(text="LXTE's AI", icon_url=get_avatar(user))
     return e
-
 
 class AutomodSettingsView(discord.ui.View):
     def __init__(self, owner_id, guild_id, message=None):
