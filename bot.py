@@ -1,7 +1,7 @@
 """
 LXTE's Assistant — built by AJ
 httpx · MongoDB · discord.py
-v7.2.0 — Polished, smarter, owner-first
+v7.2.1 — Polished, smarter, owner-first
 """
 
 import io
@@ -26,7 +26,8 @@ from discord.ext import commands
 from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
-print("new version loaded.")
+print("✅ LXTE's Assistant v7.2.1 — loaded")
+print("sigma rizz")
 print("Pollinations token loaded:", bool(os.environ.get("POLLINATIONS_TOKEN")))
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
@@ -201,11 +202,6 @@ def strip_bold(text: str) -> str:
 
 def _resolve_mention(raw: str, guild: discord.Guild):
     """Try to resolve an @name to a member or role. Returns (member, role)."""
-    if not raw or '@' in raw or ':' in raw or '/' in raw or ' ' not in raw and '.' in raw and '@' not in raw:
-        # Skip anything that looks like an email, URL, or has invalid chars
-        # But allow single-word names that happen to have a dot (like "Dr. Doom")
-        pass
-
     member = discord.utils.find(
         lambda mem: mem.display_name.lower() == raw.lower()
                     or mem.name.lower() == raw.lower(),
@@ -269,7 +265,7 @@ def clean_ai_response(text: str, guild: Optional[discord.Guild] = None) -> str:
 
 def extract_pings(answer: str, guild: Optional[discord.Guild]) -> tuple[str, str]:
     """
-    Extract @name patterns and convert to real <@id>/<@&id> for message.content
+    Extract @name patterns and convert to real <@id>/<@&id> for message content
     so Discord renders them as highlighted pills visually.
 
     With allowed_mentions=none() on the reply, NO actual notifications fire —
@@ -528,7 +524,6 @@ def build_context(ctx: commands.Context) -> str:
 
         # ── Capped member list — sorted: online first, then by join date ──
         non_bots = [m for m in guild.members if not m.bot]
-        # Priority: online > idle/dnd > offline, then by join date
         status_priority = {
             discord.Status.online: 0,
             discord.Status.idle: 1,
@@ -1386,15 +1381,17 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
             await ctx.send(embed=error_embed("Error", f"```{str(exc)[:300]}```", ctx.bot.user))
             return
 
-    # ── Visual pings: extract <@id> for message content, clean text for embed ─
+    # ── Tiny mention pills via -# small text trick ──
     ping_content, cleaned_answer = extract_pings(answer, ctx.guild)
     embed = ai_embed(cleaned_answer, ctx, guild=ctx.guild)
 
+    content_str = f"-# {ping_content}" if ping_content else None
+
     await ctx.reply(
-        content=ping_content or None,       # highlighted pills render here (no notification)
-        embed=embed,                        # readable @displayname text in embed
+        content=content_str,               # tiny pills render here
+        embed=embed,                        # readable @name in embed
         mention_author=False,
-        allowed_mentions=discord.AllowedMentions.none(),
+        allowed_mentions=discord.AllowedMentions.none(), # still no notifications
     )
     try:
         await ctx.message.remove_reaction("⏳", ctx.bot.user)
@@ -1463,7 +1460,7 @@ async def cmd_generate(ctx: commands.Context, *, prompt: str = None):
     async with ctx.typing():
         try:
             encoded = quote(prompt, safe="")
-            seed    = random.randint(0, 99999)  # ✅ true randomness — same prompt = different image
+            seed    = random.randint(0, 99999)
 
             img_url = (
                 f"https://image.pollinations.ai/prompt/{encoded}"
