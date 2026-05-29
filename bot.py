@@ -191,7 +191,7 @@ WIKIPEDIA_API = "https://en.wikipedia.org/api/rest_v1/page/summary/"
 
 # ─── Config Cache ─────────────────────────────────────────────────────────────
 _config_cache: dict[int, tuple[dict, float]] = {}
-CONFIG_CACHE_TTL = 5.0  # Reduced from 30 — invalidation handles updates
+CONFIG_CACHE_TTL = 5.0
 
 # ─── AFK ──────────────────────────────────────────────────────────────────────
 _afk_users: dict[int, tuple[str, float]] = {}
@@ -2237,7 +2237,8 @@ def roles_settings_embed(config, guild, user=None):
     dxp_lines  = []
     for entry in autoroles:
         role = guild.get_role(entry.get("role_id")) if guild else None
-        ar_lines.append(f"• {role.mention if role else f'`{entry.get(\"role_id\")}` (deleted?)'}")
+        rid = entry.get("role_id")
+        ar_lines.append(f"• {role.mention if role else f'`{rid}` (deleted?)'}")
     for rid in dxp_roles:
         role = guild.get_role(rid) if guild else None
         dxp_lines.append(f"• {role.mention if role else f'`{rid}`'}")
@@ -2720,6 +2721,10 @@ class RemoveReactionRoleModal(discord.ui.Modal, title="Remove Reaction Role"):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class LXTEBot(commands.Bot):
+    def __init__(self):
+        super().__init__(
+            command_prefix=".", intents=discord.Intents.all(),
+          class LXTEBot(commands.Bot):
     def __init__(self):
         super().__init__(
             command_prefix=".", intents=discord.Intents.all(),
@@ -3230,7 +3235,6 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
             ]
             model      = GROQ_MODEL_VISION
             source_ctx = ""
-            # No web search for vision
             web_enabled = False
         else:
             user_content = question
