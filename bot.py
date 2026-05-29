@@ -2722,7 +2722,7 @@ class RemoveReactionRoleModal(discord.ui.Modal, title="Remove Reaction Role"):
 
 class LXTEBot(commands.Bot):
     def __init__(self):
-        super().__init__(
+        super().__init__()
             command_prefix=".", intents=discord.Intents.all(),
           class LXTEBot(commands.Bot):
     def __init__(self):
