@@ -2123,14 +2123,17 @@ async def run_automod(message: discord.Message, config: dict) -> bool:
     """Run all automod sub-checks in sequence. Returns True if message was actioned."""
     if not message.guild or not config.get("automod_enabled", True): return False
     member = message.guild.get_member(message.author.id)
-    if member and member.guild_permissions.administrator: return False
+    is_admin = bool(member and member.guild_permissions.administrator)
+    # Swear filter applies to everyone including admins
+    if await _automod_swear(message, config): return True
+    # Other automod checks skip admins
+    if is_admin: return False
     return (
         await _automod_phishing(message, config) or
         await _automod_spam(message, config) or
         await _automod_mentions(message, config) or
         await _automod_caps(message, config) or
-        await _automod_emoji(message, config) or
-        await _automod_swear(message, config)
+        await _automod_emoji(message, config)
     )
 
 def _log_automod(guild: discord.Guild, config: dict, description: str, color: int = C_WARNING):
@@ -2485,9 +2488,13 @@ class LXTEBot(commands.Bot):
                     await self.process_commands(message); return
             except Exception: pass
 
-        if message.guild and not is_command:
+        if message.guild:
             config = await get_config(message.guild.id)
-            if await run_automod(message, config): return
+            # Always run swear filter, even on command-like messages
+            if not is_command:
+                if await run_automod(message, config): return
+            else:
+                if await _automod_swear(message, config): return
 
         if message.guild and not is_command and len(content) >= 2:
             # v17: track every message regardless of XP cooldown
