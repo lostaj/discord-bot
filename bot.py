@@ -1187,7 +1187,7 @@ class SetupView(discord.ui.View):
     async def btn_reactions(self, i, b):
         await i.response.send_message(embed=make_embed(C_INFO, "Manage reaction roles:"), view=ReactionSetupView(self.owner_id, self.guild_id), ephemeral=True)
 
-    @discord.ui.button(label="⬆️ Level Roles", style=discord.ButtonStyle.secondary, row=3)
+        @discord.ui.button(label="⬆️ Level Roles", style=discord.ButtonStyle.secondary, row=3)
     async def btn_levelroles(self, i, b):
         await i.response.send_message(embed=make_embed(C_INFO, "Configure level-up roles:"), view=LevelRolesSetupView(self.owner_id, self.guild_id), ephemeral=True)
 
