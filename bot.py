@@ -156,6 +156,10 @@ def get_invite_lock(gid: int) -> asyncio.Lock:
         _invite_locks[gid] = asyncio.Lock()
     return _invite_locks[gid]
 
+# ─── Double XP events ────────────────────────────────────────────────────────
+# guild_id -> monotonic timestamp when the event expires (or 0 = inactive)
+_doublexp_until: dict[int, float] = {}
+
 # ─── AFK ──────────────────────────────────────────────────────────────────────
 _afk_users: dict[int, tuple[str, float]] = {}
 
@@ -2426,6 +2430,22 @@ class LXTEBot(commands.Bot):
         self.ticket_autoclose_task.start()
         self.giveaway_task.start()
         self.spam_persist_task.start()
+        # Restore double-XP events that were active before restart
+        now_utc = datetime.now(timezone.utc)
+        for guild in self.guilds:
+            cfg = await self.db.get_config(guild.id)
+            until_str = cfg.get("doublexp_until")
+            if until_str:
+                try:
+                    until_dt = datetime.fromisoformat(until_str)
+                    remaining = (until_dt - now_utc).total_seconds()
+                    if remaining > 0:
+                        _doublexp_until[guild.id] = time.monotonic() + remaining
+                        logger.info("Restored 2XP event for %s (%.0fs left)", guild.name, remaining)
+                    else:
+                        await self.db.update_config(guild.id, "doublexp_until", None)
+                except Exception:
+                    pass
         for guild in self.guilds:
             try: await self.tree.sync(guild=discord.Object(id=guild.id))
             except Exception as e: logger.warning("Slash sync %s: %s", guild.name, e)
@@ -2480,7 +2500,9 @@ class LXTEBot(commands.Bot):
                 config      = await get_config(message.guild.id)
                 dxp_ids     = set(config.get("double_xp_roles", []))
                 member      = message.guild.get_member(message.author.id)
-                multiplier  = 2.0 if (member and dxp_ids and {r.id for r in member.roles} & dxp_ids) else 1.0
+                event_active = time.monotonic() < _doublexp_until.get(message.guild.id, 0)
+                role_2x      = bool(member and dxp_ids and {r.id for r in member.roles} & dxp_ids)
+                multiplier   = 2.0 if (event_active or role_2x) else 1.0
                 xp_gain     = xp_from_length(content, multiplier)
                 try:
                     result = await self.db.add_xp(message.author.id, message.guild.id, xp_gain)
@@ -3658,6 +3680,60 @@ async def cmd_glist(ctx: commands.Context):
         lines.append(f"• **{g['prize']}** — ends <t:{ends_ts}:R> in {ch.mention if ch else '?'} ({len(g.get('entrants',[]))} entries)")
     e = make_embed(C_GOLD, "\n".join(lines))
     e.title = "🎉 Active Giveaways"
+    await ctx.send(embed=e)
+
+
+# ─── Double XP event command ─────────────────────────────────────────────────
+
+@bot.command(name="doublexp", aliases=["2xp", "xpevent"])
+@commands.has_permissions(administrator=True)
+async def cmd_doublexp(ctx: commands.Context, duration: str = ""):
+    """Start or stop a server-wide double XP event. Usage: !doublexp 2h | !doublexp off"""
+    gid = ctx.guild.id
+
+    # !doublexp off — cancel active event
+    if duration.lower() in ("off", "stop", "end", "cancel"):
+        _doublexp_until[gid] = 0
+        await bot.db.update_config(gid, "doublexp_until", None)
+        e = make_embed(C_INFO, "Double XP event ended.")
+        e.title = "⚡ Double XP Off"
+        await ctx.send(embed=e)
+        return
+
+    # !doublexp with no argument — show current status
+    if not duration:
+        remaining = _doublexp_until.get(gid, 0) - time.monotonic()
+        if remaining > 0:
+            m, s = divmod(int(remaining), 60)
+            h, m = divmod(m, 60)
+            parts = []
+            if h: parts.append(f"{h}h")
+            if m: parts.append(f"{m}m")
+            parts.append(f"{s}s")
+            await ctx.send(embed=make_embed(C_GOLD, f"⚡ Double XP active — **{' '.join(parts)}** remaining."))
+        else:
+            await ctx.send(embed=make_embed(C_INFO, "No active double XP event.\nUsage: `!doublexp 2h` or `!doublexp 30m`"))
+        return
+
+    secs = parse_duration(duration)
+    if not secs or secs <= 0:
+        await ctx.send(embed=err("Invalid duration. Examples: `!doublexp 1h`, `!doublexp 30m`, `!doublexp 2h30m`"))
+        return
+    if secs > 86400:
+        await ctx.send(embed=err("Max event duration is 24 hours."))
+        return
+
+    _doublexp_until[gid] = time.monotonic() + secs
+    until_dt = datetime.now(timezone.utc) + timedelta(seconds=secs)
+    await bot.db.update_config(gid, "doublexp_until", until_dt.isoformat())
+    m, s = divmod(secs, 60)
+    h, m = divmod(m, 60)
+    parts = []
+    if h: parts.append(f"{h}h")
+    if m: parts.append(f"{m}m")
+    if s: parts.append(f"{s}s")
+    e = make_embed(C_GOLD, f"All members earn **2× XP** for the next **{' '.join(parts)}**! 🚀")
+    e.title = "⚡ Double XP Event Started!"
     await ctx.send(embed=e)
 
 
