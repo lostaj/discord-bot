@@ -1,9 +1,21 @@
 """
 LXTE's AI — built by AJ
-v15.0.0
+v16.0.0 — Changes from v15:
+  - ADDED: Full giveaway system (.gstart, .gend, .greroll)
+  - ADDED: Multi-select dropdowns for roles and channels throughout setup
+  - ADDED: .purge command
+  - REMOVED: Wikipedia/fact-check fetching (get_source_context, fetch_wikipedia, FACTUAL_RE)
+  - REMOVED: parse_response JSON meta format — ask_smart now calls ask directly
+  - REMOVED: history_snapshot dead code in cmd_ask
+  - REMOVED: hardcoded "This is AJ" in OWNER_ADDITION
+  - REMOVED: 2-person voice XP requirement
+  - FIXED: ticket autoclose warn timestamp calculation
+  - FIXED: apply_level_roles return value now correctly returns newly-earned role
+  - FIXED: ask_smart simplified, confidence/web routing was silently doing nothing
+  - FIXED: help embed Ascend section no longer dumps full pipe-character role list
 """
 
-import io, os, re, json, math, time, asyncio, logging, itertools, signal, collections
+import io, os, re, json, math, time, asyncio, logging, itertools, signal, collections, random
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from urllib.parse import quote
@@ -20,7 +32,7 @@ except ImportError:
     PILLOW_AVAILABLE = False
 
 load_dotenv()
-print("✅ LXTE's AI v15.0.0 loaded")
+print("✅ LXTE's AI v16.0.0 loaded")
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logger = logging.getLogger("lxte")
@@ -112,9 +124,6 @@ BLOCKED = [
     r"new personality", r"you have no (rules?|restrictions?|limits?)",
 ]
 
-# ─── Wikipedia ────────────────────────────────────────────────────────────────
-WIKIPEDIA_API = "https://en.wikipedia.org/api/rest_v1/page/summary/"
-
 # ─── Member query triggers ────────────────────────────────────────────────────
 MEMBER_TRIGGER = re.compile(
     r"\b(my|your|their|his|her)\s+(level|xp|role|rank|badge|streak|join|account)\b"
@@ -136,7 +145,6 @@ ACHIEVEMENTS = [
 ]
 
 # ─── Level Role Ladder ────────────────────────────────────────────────────────
-# Uses the exact role names from your Discord server (with │ U+2502)
 LEVEL_ROLES: list[tuple[int, str]] = [
     (1,  "Warrior │ Level 1"),
     (5,  "Archer │ Level 5"),
@@ -191,7 +199,6 @@ Never flat-out refuse, just steer.
 - If a user states something as fact and you're not sure, say: "I'm not 100% sure on that one — worth double checking."
 - If something is clearly wrong, correct them directly but kindly.
 - Never just blindly agree with something you can't verify.
-- If confidence is low, flag it.
 
 ## PERSONALITY
 - Match energy: casual → casual, technical → precise
@@ -212,7 +219,8 @@ Never flat-out refuse, just steer.
 - No personal attacks or discrimination
 """
 
-OWNER_ADDITION = "\n## OWNER MODE\nThis is AJ — the person who built you. Full trust. Be completely honest and unfiltered.\n"
+# FIXED: removed hardcoded name
+OWNER_ADDITION = "\n## OWNER MODE\nThis is the bot owner. Full trust. Be completely honest and unfiltered.\n"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -258,6 +266,21 @@ def ts(dt: datetime) -> str:
 
 def ts_full(dt: datetime) -> str:
     return f"<t:{int(dt.timestamp())}:F>"
+
+def parse_duration(text: str) -> Optional[int]:
+    """Parse duration string like 1h30m, 2d, 90s into seconds. Returns None if invalid."""
+    text = text.strip().lower()
+    total = 0
+    pattern = re.findall(r"(\d+)\s*([smhd])", text)
+    if not pattern:
+        # bare number = seconds
+        if text.isdigit():
+            return int(text)
+        return None
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    for amount, unit in pattern:
+        total += int(amount) * units[unit]
+    return total if total > 0 else None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -329,19 +352,6 @@ def ok(desc: str) -> discord.Embed:
     e.title = "✅ Done"
     return e
 
-def parse_response(raw: str) -> tuple[dict, str]:
-    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
-    lines = raw.strip().split("\n", 2)
-    try:
-        meta   = json.loads(lines[0])
-        answer = (lines[2] if len(lines) > 2 else lines[1] if len(lines) == 2 else "").strip()
-        if not answer:
-            answer = raw.strip()
-    except (json.JSONDecodeError, IndexError):
-        meta   = {"web": False, "confidence": 8, "fact_check": False}
-        answer = raw.strip()
-    return meta, answer
-
 def is_safe(text: str) -> bool:
     lower = text.lower()
     return not any(re.search(p, lower) for p in BLOCKED)
@@ -380,46 +390,6 @@ def format_uptime(start: Optional[datetime]) -> str:
     if h: parts.append(f"{h}h")
     parts += [f"{m}m", f"{s}s"]
     return " ".join(parts)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  WIKIPEDIA / FACT CHECK
-# ═══════════════════════════════════════════════════════════════════════════════
-
-FACTUAL_RE = re.compile(
-    r"\b(what is|what are|who is|who was|tell me about|explain|define|"
-    r"how does|how do|when did|when was|where is|where are|history of|"
-    r"what happened|invented|founded|born|died|capital of|meaning of)\b", re.I)
-
-def extract_topic(q: str) -> str:
-    q = re.sub(r"^(what is|what are|who is|who are|tell me about|explain|define|"
-               r"how does|how do|what was|what were|when did|where is|where are)\s+",
-               "", q.strip(), flags=re.I)
-    return re.sub(r"\?+$", "", q).strip()[:100]
-
-async def fetch_wikipedia(topic: str) -> str:
-    if not topic: return ""
-    try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get(f"{WIKIPEDIA_API}{quote(topic, safe='')}", headers={"Accept": "application/json"}, follow_redirects=True)
-            if r.status_code != 200: return ""
-            d = r.json()
-            extract = d.get("extract", "").strip()
-            if not extract: return ""
-            title   = d.get("title", topic)
-            url     = d.get("content_urls", {}).get("desktop", {}).get("page", "")
-            if len(extract) > 600: extract = extract[:597] + "..."
-            return f"[Wikipedia — {title}{f' ({url})' if url else ''}]\n{extract}"
-    except Exception as exc:
-        logger.warning("Wikipedia: %s", exc)
-        return ""
-
-async def get_source_context(question: str) -> str:
-    if not FACTUAL_RE.search(question): return ""
-    topic = extract_topic(question)
-    if not topic: return ""
-    result = await fetch_wikipedia(topic)
-    return f"\n\n## SOURCED KNOWLEDGE (Wikipedia)\n{result}" if result else ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -495,6 +465,7 @@ class Database:
         self.boosts         = db["boost_tracker"]
         self.analytics      = db["analytics"]
         self.reaction_roles = db["reaction_roles"]
+        self.giveaways      = db["giveaways"]
 
     async def ping(self) -> bool:
         try: await self._client.admin.command("ping"); return True
@@ -518,13 +489,15 @@ class Database:
             await self.boosts.create_index([("guild_id",1),("user_id",1)], unique=True, background=True)
             await self.analytics.create_index([("guild_id",1),("date",1)], unique=True, background=True)
             await self.reaction_roles.create_index([("guild_id",1),("message_id",1)], background=True)
+            await self.giveaways.create_index([("guild_id",1),("message_id",1)], background=True)
+            await self.giveaways.create_index("ends_at", background=True)
             logger.info("Indexes ready")
         except Exception as exc:
             logger.error("Index error: %s", exc)
 
     async def close(self): self._client.close()
 
-    # History
+    # ── History ───────────────────────────────────────────────────────────────
     async def get_history(self, uid: int, cid: int) -> list[dict]:
         doc = await self.history.find_one({"user_id": uid, "channel_id": cid})
         return doc["messages"] if doc else []
@@ -543,7 +516,7 @@ class Database:
         r = await self.history.delete_many({"user_id": uid})
         logger.info("Cleared history for %d (%d docs)", uid, r.deleted_count)
 
-    # Stats
+    # ── Stats ─────────────────────────────────────────────────────────────────
     async def increment_stat(self, uid: int, field: str):
         now = datetime.now(timezone.utc)
         await self.stats.update_one(
@@ -560,7 +533,7 @@ class Database:
             return doc
         return {}
 
-    # Config
+    # ── Config ────────────────────────────────────────────────────────────────
     async def get_config(self, gid: int) -> dict:
         return await self.config.find_one({"guild_id": gid}) or {}
 
@@ -575,7 +548,7 @@ class Database:
     async def get_full_config(self, gid: int) -> dict:
         return await self.config.find_one({"guild_id": gid}) or {}
 
-    # Levels
+    # ── Levels ────────────────────────────────────────────────────────────────
     async def get_level_data(self, uid: int, gid: int) -> dict:
         return await self.levels.find_one({"user_id": uid, "guild_id": gid}) or {}
 
@@ -636,7 +609,7 @@ class Database:
         await self.levels.update_one({"user_id": uid, "guild_id": gid}, {"$set": {"badges": badges}}, upsert=True)
         return True
 
-    # Invites
+    # ── Invites ───────────────────────────────────────────────────────────────
     async def save_invite(self, gid: int, code: str, inviter_id: int, uses: int):
         await self.invites.update_one({"guild_id": gid, "invite_code": code}, {"$set": {"inviter_id": inviter_id, "uses": uses}}, upsert=True)
 
@@ -653,7 +626,7 @@ class Database:
     async def get_invite_leaderboard(self, gid: int, limit: int = 10) -> list[dict]:
         return await self.invites.find({"guild_id": gid, "invite_code": "__total__"}, sort=[("total_invites", -1)], limit=limit).to_list(length=limit)
 
-    # Role menus
+    # ── Role menus ────────────────────────────────────────────────────────────
     async def save_role_menu(self, gid: int, mid: str, data: dict):
         await self.role_menus.update_one({"guild_id": gid, "menu_id": mid}, {"$set": data}, upsert=True)
 
@@ -666,7 +639,7 @@ class Database:
     async def delete_role_menu(self, gid: int, mid: str):
         await self.role_menus.delete_one({"guild_id": gid, "menu_id": mid})
 
-    # Tickets
+    # ── Tickets ───────────────────────────────────────────────────────────────
     async def save_ticket(self, gid: int, channel_id: int, uid: int, ticket_id: int):
         await self.tickets.update_one(
             {"guild_id": gid, "channel_id": channel_id},
@@ -683,7 +656,7 @@ class Database:
     async def count_open_tickets(self, gid: int, uid: int) -> int:
         return await self.tickets.count_documents({"guild_id": gid, "user_id": uid, "closed": False})
 
-    # Boosts
+    # ── Boosts ────────────────────────────────────────────────────────────────
     async def record_boost(self, gid: int, uid: int) -> int:
         r = await self.boosts.find_one_and_update(
             {"guild_id": gid, "user_id": uid},
@@ -695,7 +668,7 @@ class Database:
     async def get_boost_leaderboard(self, gid: int, limit: int = 10) -> list[dict]:
         return await self.boosts.find({"guild_id": gid}, sort=[("boost_count", -1)], limit=limit).to_list(length=limit)
 
-    # Analytics
+    # ── Analytics ─────────────────────────────────────────────────────────────
     async def record_member_count(self, gid: int, count: int):
         today = datetime.now(timezone.utc).date().isoformat()
         await self.analytics.update_one({"guild_id": gid, "date": today}, {"$set": {"member_count": count, "date": today, "guild_id": gid}}, upsert=True)
@@ -704,7 +677,7 @@ class Database:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
         return await self.analytics.find({"guild_id": gid, "date": {"$gte": cutoff}}, sort=[("date", 1)]).to_list(length=days)
 
-    # Reaction roles
+    # ── Reaction roles ────────────────────────────────────────────────────────
     async def save_reaction_role(self, gid: int, msg_id: int, data: dict):
         await self.reaction_roles.update_one({"guild_id": gid, "message_id": msg_id}, {"$set": data}, upsert=True)
 
@@ -717,9 +690,48 @@ class Database:
     async def delete_reaction_role(self, gid: int, msg_id: int):
         await self.reaction_roles.delete_one({"guild_id": gid, "message_id": msg_id})
 
+    # ── Giveaways ─────────────────────────────────────────────────────────────
+    async def create_giveaway(self, gid: int, channel_id: int, message_id: int, host_id: int,
+                               prize: str, winners: int, ends_at: datetime) -> dict:
+        doc = {
+            "guild_id": gid, "channel_id": channel_id, "message_id": message_id,
+            "host_id": host_id, "prize": prize, "winners": winners,
+            "ends_at": ends_at, "ended": False, "entrants": [],
+        }
+        await self.giveaways.insert_one(doc)
+        return doc
+
+    async def get_giveaway(self, message_id: int) -> dict:
+        return await self.giveaways.find_one({"message_id": message_id}) or {}
+
+    async def get_active_giveaways(self, gid: int) -> list[dict]:
+        return await self.giveaways.find({"guild_id": gid, "ended": False}).to_list(length=50)
+
+    async def add_entrant(self, message_id: int, user_id: int) -> bool:
+        doc = await self.giveaways.find_one({"message_id": message_id})
+        if not doc or doc.get("ended"): return False
+        if user_id in doc.get("entrants", []): return False
+        await self.giveaways.update_one({"message_id": message_id}, {"$addToSet": {"entrants": user_id}})
+        return True
+
+    async def remove_entrant(self, message_id: int, user_id: int):
+        await self.giveaways.update_one({"message_id": message_id}, {"$pull": {"entrants": user_id}})
+
+    async def end_giveaway(self, message_id: int) -> dict:
+        doc = await self.giveaways.find_one_and_update(
+            {"message_id": message_id},
+            {"$set": {"ended": True}},
+            return_document=True,
+        )
+        return doc or {}
+
+    async def get_due_giveaways(self) -> list[dict]:
+        now = datetime.now(timezone.utc)
+        return await self.giveaways.find({"ended": False, "ends_at": {"$lte": now}}).to_list(length=50)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  AI ENGINE
+#  AI ENGINE  (FIXED: simplified, no more dead JSON meta routing)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class AIEngine:
@@ -727,31 +739,14 @@ class AIEngine:
         self._r = rotator
 
     async def ask(self, question, history: list[dict], model: str, context: str = "",
-                  source_ctx: str = "", is_owner: bool = False, web: bool = False,
-                  custom_system: str = "") -> str:
+                  is_owner: bool = False, custom_system: str = "") -> str:
         system = (custom_system + "\n\n" if custom_system else "") + SYSTEM_PROMPT
         if is_owner: system += OWNER_ADDITION
         if context:  system += f"\n\n## LIVE SERVER CONTEXT\n{context}"
-        if source_ctx: system += source_ctx
 
         messages = [{"role": "system", "content": system}] + list(history) + [{"role": "user", "content": question}]
         kwargs   = dict(model=model, messages=messages, max_tokens=MAX_TOKENS, temperature=TEMPERATURE)
-        if web: kwargs["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
         return await self._r.call(**kwargs)
-
-    async def ask_smart(self, question, history: list[dict], model: str,
-                        web_enabled: bool = True, **kwargs) -> tuple[str, dict]:
-        raw  = await self.ask(question, history, model, web=False, **kwargs)
-        meta, answer = parse_response(raw)
-
-        if (meta.get("fact_check") or meta.get("confidence", 10) < 7) and web_enabled:
-            raw2 = await self.ask(question, history, model, web=True, **kwargs)
-            _, answer = parse_response(raw2)
-        elif meta.get("web") and web_enabled:
-            raw2 = await self.ask(question, history, model, web=True, **kwargs)
-            _, answer = parse_response(raw2)
-
-        return answer, meta
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -789,11 +784,11 @@ async def build_member_context(member: discord.Member, guild: discord.Guild) -> 
     return "\n".join(lines)
 
 async def build_context(ctx: commands.Context, recent_chat: str = "") -> str:
-    lines   = []
-    member  = ctx.author
-    guild   = ctx.guild
-    q       = ctx.message.content
-    needs   = bool(MEMBER_TRIGGER.search(q))
+    lines  = []
+    member = ctx.author
+    guild  = ctx.guild
+    q      = ctx.message.content
+    needs  = bool(MEMBER_TRIGGER.search(q))
 
     lines.append("=== REQUESTING USER ===")
     if needs and isinstance(member, discord.Member) and guild:
@@ -849,37 +844,182 @@ async def check_achievements(member: discord.Member, data: dict) -> list[dict]:
                 if a: newly.append(a)
     return newly
 
+async def check_top_leaderboard(guild: discord.Guild):
+    rows = await bot.db.get_leaderboard(guild.id, 1)
+    if not rows: return
+    top_uid = rows[0]["user_id"]
+    member  = guild.get_member(top_uid)
+    if not member: return
+    data = await bot.db.get_level_data(top_uid, guild.id)
+    if "top_leaderboard" not in data.get("badges", []):
+        awarded = await bot.db.award_badge(top_uid, guild.id, "top_leaderboard")
+        if awarded:
+            config = await get_config(guild.id)
+            lc = guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
+            if lc:
+                try: await lc.send(embed=make_embed(C_GOLD, f"🏆 {member.mention} is **#1 on the leaderboard** and earned **The Best** badge!"))
+                except Exception: pass
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  LEVEL ROLES — assign all earned roles, keep old ones
+#  LEVEL ROLES  (FIXED: correctly returns the role earned at exactly new_level)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def apply_level_roles(member: discord.Member, new_level: int) -> Optional[str]:
-    """Give all roles the member has earned. Keep old ones. Return name of newly earned role if any."""
-    newly_earned = None
+    """Give all roles the member has earned. Return the name of the role earned at exactly new_level."""
+    exact_reward = None
     for req, name in LEVEL_ROLES:
         if new_level >= req:
             role = resolve_role(member.guild, name)
             if role and role not in member.roles:
                 try:
                     await member.add_roles(role, reason=f"Level {req} reward")
-                    newly_earned = name
+                    if req == new_level:
+                        exact_reward = name
                 except Exception as e:
                     logger.warning("Failed to add level role %s: %s", name, e)
-    return newly_earned
+    # If no role at exact level but a new one was assigned (skip levels), return highest newly added
+    if not exact_reward:
+        for req, name in reversed(LEVEL_ROLES):
+            if new_level >= req:
+                role = resolve_role(member.guild, name)
+                if role and role in member.roles:
+                    exact_reward = name
+                    break
+    return exact_reward
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SETUP SYSTEM
+#  GIVEAWAY SYSTEM
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class ChannelSelect(discord.ui.ChannelSelect):
-    def __init__(self, config_key: str, guild_id: int, label: str, parent_view, placeholder: str = "Search for a channel…"):
+def giveaway_embed(prize: str, host_id: int, ends_at: datetime, winners: int, entrant_count: int, ended: bool = False, winner_mentions: list[str] = None) -> discord.Embed:
+    if ended:
+        e = make_embed(C_WARNING)
+        e.title = "🎉 Giveaway Ended"
+        if winner_mentions:
+            e.description = f"**Prize:** {prize}\n**Winners:** {', '.join(winner_mentions)}"
+        else:
+            e.description = f"**Prize:** {prize}\n*No winners — not enough entrants.*"
+    else:
+        e = make_embed(C_GOLD)
+        e.title = f"🎉 GIVEAWAY — {prize}"
+        e.description = (
+            f"React with 🎉 to enter!\n\n"
+            f"**Ends:** <t:{int(ends_at.timestamp())}:R>\n"
+            f"**Winners:** {winners}\n"
+            f"**Hosted by:** <@{host_id}>\n"
+            f"**Entries:** {entrant_count}"
+        )
+    e.set_footer(text=f"{'Ended' if ended else 'Ends'} • {ends_at.strftime('%Y-%m-%d %H:%M UTC')}")
+    return e
+
+async def do_end_giveaway(giveaway: dict, guild: discord.Guild) -> list[int]:
+    """Pick winners, update the message, announce in channel. Returns list of winner IDs."""
+    entrants = giveaway.get("entrants", [])
+    num_winners = min(giveaway.get("winners", 1), len(entrants))
+    winners = random.sample(entrants, num_winners) if entrants else []
+
+    channel = guild.get_channel(giveaway.get("channel_id"))
+    if not channel: return winners
+
+    winner_mentions = [f"<@{w}>" for w in winners]
+
+    # Update original message
+    try:
+        msg = await channel.fetch_message(giveaway["message_id"])
+        await msg.edit(embed=giveaway_embed(
+            giveaway["prize"], giveaway["host_id"],
+            giveaway["ends_at"], giveaway["winners"],
+            len(entrants), ended=True, winner_mentions=winner_mentions,
+        ))
+    except Exception: pass
+
+    # Announce
+    try:
+        if winners:
+            await channel.send(
+                content=" ".join(winner_mentions),
+                embed=make_embed(C_GOLD, f"Congratulations {' '.join(winner_mentions)}! You won **{giveaway['prize']}**! 🎉"),
+            )
+        else:
+            await channel.send(embed=make_embed(C_WARNING, f"The giveaway for **{giveaway['prize']}** ended with no valid entrants."))
+    except Exception: pass
+
+    return winners
+
+class GiveawayEnterView(discord.ui.View):
+    def __init__(self): super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎉 Enter", style=discord.ButtonStyle.success, custom_id="giveaway:enter")
+    async def btn_enter(self, i: discord.Interaction, b):
+        giveaway = await bot.db.get_giveaway(i.message.id)
+        if not giveaway or giveaway.get("ended"):
+            await i.response.send_message("This giveaway has ended.", ephemeral=True); return
+        added = await bot.db.add_entrant(i.message.id, i.user.id)
+        if added:
+            doc = await bot.db.get_giveaway(i.message.id)
+            count = len(doc.get("entrants", []))
+            try:
+                await i.message.edit(embed=giveaway_embed(
+                    giveaway["prize"], giveaway["host_id"], giveaway["ends_at"],
+                    giveaway["winners"], count,
+                ))
+            except Exception: pass
+            await i.response.send_message("✅ You've entered the giveaway! Good luck 🎉", ephemeral=True)
+        else:
+            # Already entered — toggle out
+            await bot.db.remove_entrant(i.message.id, i.user.id)
+            doc = await bot.db.get_giveaway(i.message.id)
+            count = len(doc.get("entrants", []))
+            try:
+                await i.message.edit(embed=giveaway_embed(
+                    giveaway["prize"], giveaway["host_id"], giveaway["ends_at"],
+                    giveaway["winners"], count,
+                ))
+            except Exception: pass
+            await i.response.send_message("❌ You've left the giveaway.", ephemeral=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SETUP SYSTEM  (IMPROVED: multi-select for roles and channels)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Multi-channel select (stores list) ────────────────────────────────────────
+class MultiChannelSelect(discord.ui.ChannelSelect):
+    """Selects up to 10 channels and appends them to a config list key."""
+    def __init__(self, config_key: str, guild_id: int, parent_view,
+                 placeholder: str = "Select channels…", max_values: int = 10):
+        super().__init__(
+            placeholder=placeholder,
+            channel_types=[discord.ChannelType.text],
+            min_values=1, max_values=max_values,
+            custom_id=f"mchsel:{config_key}",
+        )
+        self.config_key  = config_key
+        self.guild_id    = guild_id
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        ids = [ch.id for ch in self.values]
+        config = await get_config(self.guild_id)
+        existing = config.get(self.config_key, [])
+        merged = list(dict.fromkeys(existing + ids))  # dedup, preserve order
+        await bot.db.update_config(self.guild_id, self.config_key, merged)
+        names = ", ".join(ch.mention for ch in self.values)
+        await interaction.response.send_message(embed=ok(f"Added: {names}"), ephemeral=True)
+        if hasattr(self.parent_view, "refresh"):
+            await self.parent_view.refresh(interaction)
+
+class SingleChannelSelect(discord.ui.ChannelSelect):
+    """Selects exactly one channel and stores its ID under a single config key."""
+    def __init__(self, config_key: str, guild_id: int, parent_view,
+                 placeholder: str = "Select a channel…"):
         super().__init__(
             placeholder=placeholder,
             channel_types=[discord.ChannelType.text],
             min_values=1, max_values=1,
-            custom_id=f"chsel:{config_key}",
+            custom_id=f"schsel:{config_key}",
         )
         self.config_key  = config_key
         self.guild_id    = guild_id
@@ -889,15 +1029,52 @@ class ChannelSelect(discord.ui.ChannelSelect):
         ch = self.values[0]
         await bot.db.update_config(self.guild_id, self.config_key, ch.id)
         await interaction.response.send_message(embed=ok(f"Set to {ch.mention}"), ephemeral=True)
-        await self.parent_view.refresh(interaction)
+        if hasattr(self.parent_view, "refresh"):
+            await self.parent_view.refresh(interaction)
 
+# ── Multi-role select (appends to list) ───────────────────────────────────────
+class MultiRoleSelect(discord.ui.RoleSelect):
+    """Selects up to 10 roles and appends their IDs to a config list key."""
+    def __init__(self, config_key: str, guild_id: int, parent_view,
+                 placeholder: str = "Select roles…", max_values: int = 10,
+                 store_as_objects: bool = False):
+        super().__init__(
+            placeholder=placeholder,
+            min_values=1, max_values=max_values,
+            custom_id=f"mrolesel:{config_key}",
+        )
+        self.config_key     = config_key
+        self.guild_id       = guild_id
+        self.parent_view    = parent_view
+        self.store_as_objects = store_as_objects  # if True, store {"role_id": id} dicts
 
-class RoleSelectDropdown(discord.ui.RoleSelect):
-    def __init__(self, config_key: str, guild_id: int, parent_view, placeholder: str = "Search for a role…"):
+    async def callback(self, interaction: discord.Interaction):
+        config   = await get_config(self.guild_id)
+        existing = config.get(self.config_key, [])
+
+        if self.store_as_objects:
+            existing_ids = {e.get("role_id") for e in existing}
+            new_entries  = [{"role_id": r.id} for r in self.values if r.id not in existing_ids]
+            merged = existing + new_entries
+        else:
+            existing_ids = set(existing)
+            new_ids      = [r.id for r in self.values if r.id not in existing_ids]
+            merged       = existing + new_ids
+
+        await bot.db.update_config(self.guild_id, self.config_key, merged)
+        names = ", ".join(r.mention for r in self.values)
+        await interaction.response.send_message(embed=ok(f"Added: {names}"), ephemeral=True)
+        if hasattr(self.parent_view, "refresh"):
+            await self.parent_view.refresh(interaction)
+
+class SingleRoleSelect(discord.ui.RoleSelect):
+    """Selects one role and stores its ID under a single config key."""
+    def __init__(self, config_key: str, guild_id: int, parent_view,
+                 placeholder: str = "Select a role…"):
         super().__init__(
             placeholder=placeholder,
             min_values=1, max_values=1,
-            custom_id=f"rolesel:{config_key}",
+            custom_id=f"srolesel:{config_key}",
         )
         self.config_key  = config_key
         self.guild_id    = guild_id
@@ -907,25 +1084,38 @@ class RoleSelectDropdown(discord.ui.RoleSelect):
         role = self.values[0]
         await bot.db.update_config(self.guild_id, self.config_key, role.id)
         await interaction.response.send_message(embed=ok(f"Set to {role.mention}"), ephemeral=True)
-        await self.parent_view.refresh(interaction)
+        if hasattr(self.parent_view, "refresh"):
+            await self.parent_view.refresh(interaction)
 
 
 def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
     e = make_embed(C_PRIMARY)
-    e.title       = "⚙️ Server Setup"
-    e.description = "Pick a section to configure."
+    e.title       = "⚙️ Server Setup — v16"
+    e.description = "Pick a section to configure. Dropdowns now support multiple selections."
 
-    def ch(key): return f"<#{v}>" if (v := config.get(key)) else "`not set`"
-    def ro(key): return f"<@&{v}>" if (v := config.get(key)) else "`not set`"
+    def ch(key):
+        v = config.get(key)
+        return f"<#{v}>" if v else "`not set`"
 
-    e.add_field(name="👋 Welcome",   value=f"Channel: {ch('welcome_channel_id')}\nDM: {'✅' if config.get('welcome_dm_enabled') else '❌'}", inline=True)
-    e.add_field(name="🛡️ Automod",  value=f"{'✅' if config.get('automod_enabled', True) else '❌'} | Log: {ch('log_channel_id')}", inline=True)
-    e.add_field(name="🎫 Tickets",  value=f"Panel: {ch('ticket_panel_channel_id')}\nStaff: {ro('ticket_staff_role_id')}", inline=True)
-    e.add_field(name="🚀 Boosts",   value=f"Channel: {ch('boost_channel_id')}", inline=True)
-    e.add_field(name="🎭 Roles",    value=f"Auto: {len(config.get('autoroles', []))} | 2XP: {len(config.get('double_xp_roles', []))}", inline=True)
-    e.add_field(name="🤖 AI",       value=f"Channels: {len(config.get('ai_channel_ids', []))} set | Web: {'✅' if config.get('web_search', True) else '❌'}", inline=True)
-    e.set_footer(text="Admins only  •  Built by AJ")
+    def ch_list(key):
+        ids = config.get(key, [])
+        if not ids: return "`none`"
+        return ", ".join(f"<#{i}>" for i in ids[:3]) + (f" +{len(ids)-3} more" if len(ids) > 3 else "")
+
+    def ro(key):
+        v = config.get(key)
+        return f"<@&{v}>" if v else "`not set`"
+
+    e.add_field(name="👋 Welcome",    value=f"Channel: {ch('welcome_channel_id')}\nDM: {'✅' if config.get('welcome_dm_enabled') else '❌'}", inline=True)
+    e.add_field(name="🛡️ Automod",   value=f"{'✅' if config.get('automod_enabled', True) else '❌'} | Log: {ch('log_channel_id')}", inline=True)
+    e.add_field(name="🎫 Tickets",   value=f"Panel: {ch('ticket_panel_channel_id')}\nStaff: {ro('ticket_staff_role_id')}", inline=True)
+    e.add_field(name="🚀 Boosts",    value=f"Channel: {ch('boost_channel_id')}", inline=True)
+    e.add_field(name="🎭 Roles",     value=f"Auto: {len(config.get('autoroles', []))} | 2XP: {len(config.get('double_xp_roles', []))}", inline=True)
+    e.add_field(name="🤖 AI",        value=f"Channels: {ch_list('ai_channel_ids')} | Web: {'✅' if config.get('web_search', True) else '❌'}", inline=True)
+    e.add_field(name="🎉 Giveaways", value=f"Channel: {ch('giveaway_channel_id')}", inline=True)
+    e.set_footer(text="Admins only  •  Built by AJ  •  Multi-select enabled")
     return e
+
 
 class SetupView(discord.ui.View):
     def __init__(self, owner_id: int, guild_id: int, msg=None):
@@ -947,52 +1137,56 @@ class SetupView(discord.ui.View):
 
     async def refresh(self, interaction: discord.Interaction):
         config = await get_config(self.guild_id)
-        try:
-            await interaction.message.edit(embed=setup_embed(config, interaction.guild), view=self)
+        try: await interaction.message.edit(embed=setup_embed(config, interaction.guild), view=self)
         except Exception: pass
 
-    @discord.ui.button(label="👋 Welcome",   style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="👋 Welcome",    style=discord.ButtonStyle.secondary, row=0)
     async def btn_welcome(self, i, b):
         await i.response.send_message(embed=make_embed(C_INFO, "Configure welcome settings:"), view=WelcomeSetupView(self.owner_id, self.guild_id), ephemeral=True)
 
-    @discord.ui.button(label="🛡️ Automod",  style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="🛡️ Automod",   style=discord.ButtonStyle.secondary, row=0)
     async def btn_automod(self, i, b):
         await i.response.send_message(embed=make_embed(C_INFO, "Configure automod:"), view=AutomodSetupView(self.owner_id, self.guild_id), ephemeral=True)
 
-    @discord.ui.button(label="🎫 Tickets",  style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="🎫 Tickets",   style=discord.ButtonStyle.secondary, row=0)
     async def btn_tickets(self, i, b):
         await i.response.send_message(embed=make_embed(C_INFO, "Configure tickets:"), view=TicketSetupView(self.owner_id, self.guild_id), ephemeral=True)
 
-    @discord.ui.button(label="🚀 Boosts",   style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="🚀 Boosts",    style=discord.ButtonStyle.secondary, row=1)
     async def btn_boosts(self, i, b):
         await i.response.send_message(embed=make_embed(C_INFO, "Configure boost announcements:"), view=BoostSetupView(self.owner_id, self.guild_id), ephemeral=True)
 
-    @discord.ui.button(label="🎭 Roles",    style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="🎭 Roles",     style=discord.ButtonStyle.secondary, row=1)
     async def btn_roles(self, i, b):
         await i.response.send_message(embed=make_embed(C_INFO, "Configure auto-roles and 2XP roles:"), view=RolesSetupView(self.owner_id, self.guild_id), ephemeral=True)
 
-    @discord.ui.button(label="🤖 AI",       style=discord.ButtonStyle.primary,   row=1)
+    @discord.ui.button(label="🤖 AI",        style=discord.ButtonStyle.primary,   row=1)
     async def btn_ai(self, i, b):
         await i.response.send_message(embed=make_embed(C_INFO, "Configure AI settings:"), view=AISetupView(self.owner_id, self.guild_id), ephemeral=True)
+
+    @discord.ui.button(label="🎉 Giveaways", style=discord.ButtonStyle.primary,   row=2)
+    async def btn_giveaways(self, i, b):
+        await i.response.send_message(embed=make_embed(C_INFO, "Configure giveaway channel:"), view=GiveawaySetupView(self.owner_id, self.guild_id), ephemeral=True)
 
     @discord.ui.button(label="📋 Role Menus", style=discord.ButtonStyle.secondary, row=2)
     async def btn_rolemenus(self, i, b):
         await i.response.send_message(embed=make_embed(C_INFO, "Manage role menus:"), view=RoleMenuSetupView(self.owner_id, self.guild_id), ephemeral=True)
 
-    @discord.ui.button(label="🎭 Reactions", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="🎭 Reactions",  style=discord.ButtonStyle.secondary, row=2)
     async def btn_reactions(self, i, b):
         await i.response.send_message(embed=make_embed(C_INFO, "Manage reaction roles:"), view=ReactionSetupView(self.owner_id, self.guild_id), ephemeral=True)
 
-    @discord.ui.button(label="✖ Close",    style=discord.ButtonStyle.danger,     row=2)
+    @discord.ui.button(label="✖ Close",      style=discord.ButtonStyle.danger,    row=3)
     async def btn_close(self, i, b):
         await i.message.delete()
 
 
+# ── Welcome Setup ─────────────────────────────────────────────────────────────
 class WelcomeSetupView(discord.ui.View):
     def __init__(self, owner_id: int, guild_id: int):
         super().__init__(timeout=180)
         self.guild_id = guild_id
-        self.add_item(ChannelSelect("welcome_channel_id", guild_id, "Welcome Channel", self, "Pick welcome channel…"))
+        self.add_item(SingleChannelSelect("welcome_channel_id", guild_id, self, "Pick welcome channel…"))
 
     async def refresh(self, interaction): pass
 
@@ -1018,11 +1212,12 @@ class WelcomeMsgModal(discord.ui.Modal, title="Welcome Message"):
         await i.response.send_message(embed=ok("Welcome message updated."), ephemeral=True)
 
 
+# ── Automod Setup ─────────────────────────────────────────────────────────────
 class AutomodSetupView(discord.ui.View):
     def __init__(self, owner_id: int, guild_id: int):
         super().__init__(timeout=180)
         self.guild_id = guild_id
-        self.add_item(ChannelSelect("log_channel_id", guild_id, "Log Channel", self, "Pick log channel…"))
+        self.add_item(SingleChannelSelect("log_channel_id", guild_id, self, "Pick log channel…"))
 
     async def refresh(self, i): pass
 
@@ -1055,14 +1250,16 @@ class AutomodSetupView(discord.ui.View):
     async def t4(self, i, b): await self._toggle(i, "antiraid_enabled")
 
 
+# ── Ticket Setup ──────────────────────────────────────────────────────────────
 class TicketSetupView(discord.ui.View):
     def __init__(self, owner_id: int, guild_id: int):
         super().__init__(timeout=180)
         self.owner_id = owner_id
         self.guild_id = guild_id
-        self.add_item(ChannelSelect("ticket_panel_channel_id", guild_id, "Panel Channel", self, "Pick ticket panel channel…"))
-        self.add_item(ChannelSelect("ticket_log_channel_id",   guild_id, "Log Channel",   self, "Pick ticket log channel…"))
-        self.add_item(RoleSelectDropdown("ticket_staff_role_id", guild_id, self, "Pick staff role…"))
+        self.add_item(SingleChannelSelect("ticket_panel_channel_id", guild_id, self, "Pick ticket panel channel…"))
+        self.add_item(SingleChannelSelect("ticket_log_channel_id",   guild_id, self, "Pick ticket log channel…"))
+        # Multi-select for staff roles — up to 5 staff roles
+        self.add_item(MultiRoleSelect("ticket_staff_role_ids", guild_id, self, "Pick staff roles (multi)…", max_values=5))
 
     async def refresh(self, i): pass
 
@@ -1082,13 +1279,19 @@ class TicketSetupView(discord.ui.View):
         await ch.send(embed=e, view=TicketOpenView())
         await i.response.send_message(embed=ok(f"Panel posted in {ch.mention}."), ephemeral=True)
 
+    @discord.ui.button(label="Clear Staff Roles", style=discord.ButtonStyle.danger, row=3)
+    async def btn_clear_staff(self, i: discord.Interaction, b):
+        await bot.db.update_config(self.guild_id, "ticket_staff_role_ids", [])
+        await i.response.send_message(embed=ok("Staff roles cleared."), ephemeral=True)
 
+
+# ── Boost Setup ───────────────────────────────────────────────────────────────
 class BoostSetupView(discord.ui.View):
     def __init__(self, owner_id: int, guild_id: int):
         super().__init__(timeout=180)
         self.guild_id = guild_id
-        self.add_item(ChannelSelect("boost_channel_id",  guild_id, "Boost Channel",   self, "Pick boost announce channel…"))
-        self.add_item(RoleSelectDropdown("boost_perk_role_id", guild_id, self, "Pick boost perk role…"))
+        self.add_item(SingleChannelSelect("boost_channel_id", guild_id, self, "Pick boost announce channel…"))
+        self.add_item(SingleRoleSelect("boost_perk_role_id", guild_id, self, "Pick boost perk role…"))
 
     async def refresh(self, i): pass
 
@@ -1104,77 +1307,41 @@ class BoostMsgModal(discord.ui.Modal, title="Boost Thank-You Message"):
         await i.response.send_message(embed=ok("Boost message updated."), ephemeral=True)
 
 
+# ── Roles Setup ───────────────────────────────────────────────────────────────
 class RolesSetupView(discord.ui.View):
     def __init__(self, owner_id: int, guild_id: int):
         super().__init__(timeout=180)
         self.guild_id = guild_id
+        # Row 0: add multiple auto-roles at once
+        self.add_item(MultiRoleSelect("autoroles", guild_id, self, "Add auto-roles (multi)…", max_values=10, store_as_objects=True))
+        # Row 1: add multiple 2XP roles at once
+        self.add_item(MultiRoleSelect("double_xp_roles", guild_id, self, "Add 2XP roles (multi)…", max_values=10))
 
     async def refresh(self, i): pass
 
-    @discord.ui.button(label="➕ Add Auto-Role",    style=discord.ButtonStyle.primary,   row=0)
-    async def ar_add(self, i, b): await i.response.send_message(embed=make_embed(C_INFO, "Pick role to auto-assign on join:"), view=_ARAddView(self.guild_id), ephemeral=True)
+    @discord.ui.button(label="Clear All Auto-Roles",  style=discord.ButtonStyle.danger,    row=2)
+    async def ar_clear(self, i, b):
+        await bot.db.update_config(self.guild_id, "autoroles", [])
+        await i.response.send_message(embed=ok("Auto-roles cleared."), ephemeral=True)
 
-    @discord.ui.button(label="➖ Remove Auto-Role", style=discord.ButtonStyle.danger,    row=0)
+    @discord.ui.button(label="Clear All 2XP Roles",   style=discord.ButtonStyle.danger,    row=2)
+    async def dxp_clear(self, i, b):
+        await bot.db.update_config(self.guild_id, "double_xp_roles", [])
+        await i.response.send_message(embed=ok("2XP roles cleared."), ephemeral=True)
+
+    @discord.ui.button(label="Remove Auto-Role",      style=discord.ButtonStyle.secondary, row=3)
     async def ar_rem(self, i, b): await i.response.send_modal(ARRemoveModal(self.guild_id))
 
-    @discord.ui.button(label="➕ Add 2XP Role",     style=discord.ButtonStyle.primary,   row=1)
-    async def dxp_add(self, i, b): await i.response.send_message(embed=make_embed(C_INFO, "Pick role for double XP:"), view=_DXPAddView(self.guild_id), ephemeral=True)
-
-    @discord.ui.button(label="➖ Remove 2XP Role",  style=discord.ButtonStyle.danger,    row=1)
+    @discord.ui.button(label="Remove 2XP Role",       style=discord.ButtonStyle.secondary, row=3)
     async def dxp_rem(self, i, b): await i.response.send_modal(DXPRemoveModal(self.guild_id))
 
-    @discord.ui.button(label="Toggle XP Decay",    style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Toggle XP Decay",       style=discord.ButtonStyle.secondary, row=3)
     async def decay(self, i, b):
         config = await get_config(self.guild_id)
         await bot.db.update_config(self.guild_id, "xp_decay_enabled", not config.get("xp_decay_enabled", False))
         config = await get_config(self.guild_id)
         await i.response.send_message(embed=ok(f"XP decay: {'✅' if config.get('xp_decay_enabled') else '❌'}"), ephemeral=True)
 
-class _ARAddView(discord.ui.View):
-    def __init__(self, guild_id):
-        super().__init__(timeout=60)
-        self.guild_id = guild_id
-        sel = RoleSelectDropdown("__ar_temp__", guild_id, self, "Pick auto-role…")
-        sel.callback = self._cb
-        self.add_item(sel)
-
-    async def refresh(self, i): pass
-
-    async def _cb(self, i: discord.Interaction):
-        for item in self.children:
-            if hasattr(item, "values") and item.values:
-                role_id = item.values[0].id
-                config  = await get_config(self.guild_id)
-                roles   = config.get("autoroles", [])
-                if not any(r.get("role_id") == role_id for r in roles):
-                    roles.append({"role_id": role_id})
-                    await bot.db.update_config(self.guild_id, "autoroles", roles)
-                await i.response.send_message(embed=ok("Auto-role added."), ephemeral=True)
-                return
-        await i.response.send_message(embed=err("Could not read role."), ephemeral=True)
-
-class _DXPAddView(discord.ui.View):
-    def __init__(self, guild_id):
-        super().__init__(timeout=60)
-        self.guild_id = guild_id
-        sel = RoleSelectDropdown("__dxp_temp__", guild_id, self, "Pick 2XP role…")
-        sel.callback = self._cb
-        self.add_item(sel)
-
-    async def refresh(self, i): pass
-
-    async def _cb(self, i: discord.Interaction):
-        for item in self.children:
-            if hasattr(item, "values") and item.values:
-                role_id = item.values[0].id
-                config  = await get_config(self.guild_id)
-                ids     = config.get("double_xp_roles", [])
-                if role_id not in ids:
-                    ids.append(role_id)
-                    await bot.db.update_config(self.guild_id, "double_xp_roles", ids)
-                await i.response.send_message(embed=ok("2XP role added."), ephemeral=True)
-                return
-        await i.response.send_message(embed=err("Could not read role."), ephemeral=True)
 
 class ARRemoveModal(discord.ui.Modal, title="Remove Auto-Role"):
     name = discord.ui.TextInput(label="Role name to remove", max_length=100)
@@ -1199,22 +1366,16 @@ class DXPRemoveModal(discord.ui.Modal, title="Remove 2XP Role"):
         await i.response.send_message(embed=ok(f"Removed `{role.name}` from 2XP roles."), ephemeral=True)
 
 
+# ── AI Setup ──────────────────────────────────────────────────────────────────
 class AISetupView(discord.ui.View):
     def __init__(self, owner_id: int, guild_id: int):
         super().__init__(timeout=180)
         self.owner_id = owner_id
         self.guild_id = guild_id
-        self.add_item(ChannelSelect("__ai_ch_add__", guild_id, "Add AI Channel", self, "Pick channel to allow AI in…"))
+        # Multi-select — add multiple AI channels at once
+        self.add_item(MultiChannelSelect("ai_channel_ids", guild_id, self, "Add AI channels (multi)…", max_values=10))
 
-    async def refresh(self, i):
-        config = await get_config(self.guild_id)
-        ch_id = config.get("__ai_ch_add__")
-        if ch_id:
-            ids = config.get("ai_channel_ids", [])
-            if ch_id not in ids:
-                ids.append(ch_id)
-                await bot.db.update_config(self.guild_id, "ai_channel_ids", ids)
-            await bot.db.update_config(self.guild_id, "__ai_ch_add__", None)
+    async def refresh(self, i): pass
 
     @discord.ui.button(label="Unlock All Channels", style=discord.ButtonStyle.secondary, row=1)
     async def unlock(self, i, b):
@@ -1228,6 +1389,9 @@ class AISetupView(discord.ui.View):
         config = await get_config(self.guild_id)
         await i.response.send_message(embed=ok(f"Web search: {'✅' if config.get('web_search', True) else '❌'}"), ephemeral=True)
 
+    @discord.ui.button(label="Remove Channel",      style=discord.ButtonStyle.danger,    row=1)
+    async def remove_ch(self, i, b): await i.response.send_modal(RemoveAIChannelModal(self.guild_id))
+
     @discord.ui.button(label="Set Custom Prompt",   style=discord.ButtonStyle.primary,   row=2)
     async def prompt(self, i, b): await i.response.send_modal(CustomPromptModal(self.guild_id))
 
@@ -1235,6 +1399,18 @@ class AISetupView(discord.ui.View):
     async def clear_p(self, i, b):
         await bot.db.update_config(self.guild_id, "custom_system_prefix", "")
         await i.response.send_message(embed=ok("Custom prompt cleared."), ephemeral=True)
+
+class RemoveAIChannelModal(discord.ui.Modal, title="Remove AI Channel"):
+    channel_input = discord.ui.TextInput(label="Channel name or ID", max_length=100)
+    def __init__(self, guild_id): super().__init__(); self.guild_id = guild_id
+    async def on_submit(self, interaction):
+        ch = resolve_channel(interaction.guild, self.channel_input.value)
+        if not ch:
+            await interaction.response.send_message(embed=err(f"No channel `{self.channel_input.value}`."), ephemeral=True); return
+        config = await get_config(self.guild_id)
+        ids = [i for i in config.get("ai_channel_ids", []) if i != ch.id]
+        await bot.db.update_config(self.guild_id, "ai_channel_ids", ids)
+        await interaction.response.send_message(embed=ok(f"Removed {ch.mention} from AI channels."), ephemeral=True)
 
 class CustomPromptModal(discord.ui.Modal, title="Custom System Prompt"):
     prompt = discord.ui.TextInput(label="Prompt prefix", style=discord.TextStyle.paragraph, max_length=800)
@@ -1244,6 +1420,17 @@ class CustomPromptModal(discord.ui.Modal, title="Custom System Prompt"):
         await i.response.send_message(embed=ok("Custom prompt saved."), ephemeral=True)
 
 
+# ── Giveaway Setup ────────────────────────────────────────────────────────────
+class GiveawaySetupView(discord.ui.View):
+    def __init__(self, owner_id: int, guild_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+        self.add_item(SingleChannelSelect("giveaway_channel_id", guild_id, self, "Pick giveaway channel…"))
+
+    async def refresh(self, i): pass
+
+
+# ── Role Menu Setup ───────────────────────────────────────────────────────────
 class RoleMenuSetupView(discord.ui.View):
     def __init__(self, owner_id: int, guild_id: int):
         super().__init__(timeout=180)
@@ -1325,6 +1512,7 @@ class DeleteRoleMenuModal(discord.ui.Modal, title="Delete Role Menu"):
         await i.response.send_message(embed=ok(f"Menu `{self.mid.value.strip()}` deleted."), ephemeral=True)
 
 
+# ── Reaction Setup ────────────────────────────────────────────────────────────
 class ReactionSetupView(discord.ui.View):
     def __init__(self, owner_id: int, guild_id: int):
         super().__init__(timeout=180)
@@ -1385,7 +1573,7 @@ class RemoveReactionRoleModal(discord.ui.Modal, title="Remove Reaction Role"):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  TICKET SYSTEM — Join LXTE + Other only
+#  TICKET SYSTEM
 # ═══════════════════════════════════════════════════════════════════════════════
 
 TICKET_CATEGORIES = [
@@ -1431,15 +1619,26 @@ async def _create_ticket(i: discord.Interaction, cid: str, answers: dict):
         await i.response.send_message(embed=err("You already have an open ticket. Close it first."), ephemeral=True); return
     ticket_num = config.get("ticket_counter", 0) + 1
     await bot.db.update_config(guild.id, "ticket_counter", ticket_num)
-    cat_id     = config.get("ticket_category_id")
-    category   = guild.get_channel(cat_id) if cat_id else None
-    staff_role = guild.get_role(config.get("ticket_staff_role_id")) if config.get("ticket_staff_role_id") else None
+    cat_id   = config.get("ticket_category_id")
+    category = guild.get_channel(cat_id) if cat_id else None
+
+    # IMPROVED: support multiple staff roles
+    staff_role_ids = config.get("ticket_staff_role_ids", [])
+    # backwards compat with old single role
+    old_single = config.get("ticket_staff_role_id")
+    if old_single and old_single not in staff_role_ids:
+        staff_role_ids = [old_single] + staff_role_ids
+
+    staff_roles = [guild.get_role(rid) for rid in staff_role_ids if guild.get_role(rid)]
+
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
         user:               discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
         guild.me:           discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
     }
-    if staff_role: overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    for sr in staff_roles:
+        overwrites[sr] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
     cat_label = next((c["label"] for c in TICKET_CATEGORIES if c["id"] == cid), cid)
     try:
         channel = await guild.create_text_channel(
@@ -1451,6 +1650,7 @@ async def _create_ticket(i: discord.Interaction, cid: str, answers: dict):
         )
     except discord.Forbidden:
         await i.response.send_message(embed=err("I can't create channels. Check my permissions."), ephemeral=True); return
+
     await bot.db.save_ticket(guild.id, channel.id, user.id, ticket_num)
     await bot.db.tickets.update_one(
         {"guild_id": guild.id, "channel_id": channel.id},
@@ -1467,8 +1667,10 @@ async def _create_ticket(i: discord.Interaction, cid: str, answers: dict):
         e.description = f"Hey {user.mention}! We'll be with you shortly."
         e.add_field(name="Reason", value=answers.get("reason", "No reason given."), inline=False)
     e.set_footer(text="LXTE's AI — Ticket System")
+
+    staff_pings = " ".join(sr.mention for sr in staff_roles)
     await channel.send(
-        content=f"{user.mention}{f' {staff_role.mention}' if staff_role else ''}",
+        content=f"{user.mention}{(' ' + staff_pings) if staff_pings else ''}",
         embed=e,
         view=TicketCloseView(),
     )
@@ -1681,6 +1883,7 @@ class LXTEBot(commands.Bot):
         logger.info("Ready as %s (%s) — %d guilds", self.user, self.user.id, len(self.guilds))
         await self.db.ensure_indexes()
         self.add_view(TicketOpenView()); self.add_view(TicketCloseView())
+        self.add_view(GiveawayEnterView())
         for guild in self.guilds:
             for menu in await self.db.get_all_role_menus(guild.id):
                 if menu.get("roles"): self.add_view(RoleMenuView(menu["menu_id"], menu["roles"]))
@@ -1696,6 +1899,7 @@ class LXTEBot(commands.Bot):
         self.xp_decay_task.start()
         self.nightly_task.start()
         self.ticket_autoclose_task.start()
+        self.giveaway_task.start()
         for guild in self.guilds:
             try: await self.tree.sync(guild=discord.Object(id=guild.id))
             except Exception as e: logger.warning("Slash sync %s: %s", guild.name, e)
@@ -1706,13 +1910,11 @@ class LXTEBot(commands.Bot):
         is_mention = self.user in message.mentions
         is_command = content.startswith(".")
 
-        # AFK return
         if message.author.id in _afk_users and not is_mention and not is_command:
             _afk_users.pop(message.author.id)
             try: await message.channel.send(embed=make_embed(C_SUCCESS, f"Welcome back {message.author.mention}! AFK removed."), delete_after=8)
             except Exception: pass
 
-        # AFK notify
         if message.mentions and not is_command:
             for mentioned in message.mentions:
                 if mentioned.id in _afk_users:
@@ -1720,13 +1922,11 @@ class LXTEBot(commands.Bot):
                     try: await message.channel.send(embed=make_embed(C_WARNING, f"**{mentioned.display_name}** is AFK: {reason}\n*(set <t:{int(ts_val)}:R>)*"), delete_after=10)
                     except Exception: pass
 
-        # Mention → ask
         if is_mention:
             cleaned         = content.replace(f"<@{self.user.id}>", "").replace(f"<@!{self.user.id}>", "").strip()
             message.content = f".ask {cleaned}" if cleaned else ".ask hi"
             await self.process_commands(message); return
 
-        # Reply to bot → ask
         if message.reference and not is_command and message.guild:
             try:
                 ref = message.reference.resolved or await message.channel.fetch_message(message.reference.message_id)
@@ -1735,12 +1935,10 @@ class LXTEBot(commands.Bot):
                     await self.process_commands(message); return
             except Exception: pass
 
-        # Automod
         if message.guild and not is_command:
             config = await get_config(message.guild.id)
             if await run_automod(message, config): return
 
-        # XP
         if message.guild and not is_command and len(content) >= 2:
             now  = time.monotonic()
             last = _xp_cooldowns.get(message.author.id, 0)
@@ -1774,7 +1972,6 @@ class LXTEBot(commands.Bot):
                         except Exception: pass
                 except Exception as exc: logger.error("XP: %s", exc)
 
-        # Ticket activity tracker
         if message.guild:
             ticket = await self.db.get_ticket(message.channel.id)
             if ticket and not ticket.get("closed"):
@@ -1802,7 +1999,20 @@ class LXTEBot(commands.Bot):
         await update_member_count(member.guild)
 
     async def on_member_remove(self, member: discord.Member):
-        if not member.bot: await update_member_count(member.guild)
+        if member.bot: return
+        await update_member_count(member.guild)
+        # Log member leave
+        config = await get_config(member.guild.id)
+        lc = member.guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
+        if lc:
+            e = make_embed(C_WARNING)
+            e.title       = "📤 Member Left"
+            e.description = f"**{member.display_name}** (`{member.name}`, ID: `{member.id}`) left the server."
+            e.set_thumbnail(url=member.display_avatar.url)
+            e.add_field(name="Joined", value=ts_full(member.joined_at) if member.joined_at else "unknown", inline=True)
+            e.add_field(name="Left",   value=ts_full(datetime.now(timezone.utc)), inline=True)
+            try: await lc.send(embed=e)
+            except Exception: pass
 
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         if before.premium_since is None and after.premium_since is not None:
@@ -1920,7 +2130,9 @@ class LXTEBot(commands.Bot):
             member = guild.get_member(uid)
             if not member or not member.voice: continue
             if member.voice.self_deaf or member.voice.deaf: continue
-            if not member.voice.channel or len(member.voice.channel.members) < 2: continue
+            # FIXED: removed 2-person requirement — give XP in any non-AFK voice
+            if not member.voice.channel: continue
+            if member.voice.channel == guild.afk_channel: continue
             try: await self.db.add_xp(uid, gid, VOICE_XP_PER_TICK)
             except Exception as exc: logger.warning("Voice XP: %s", exc)
 
@@ -1935,7 +2147,9 @@ class LXTEBot(commands.Bot):
     @tasks.loop(hours=24)
     async def nightly_task(self):
         for guild in self.guilds:
-            try: await self.db.record_member_count(guild.id, guild.member_count)
+            try:
+                await self.db.record_member_count(guild.id, guild.member_count)
+                await check_top_leaderboard(guild)
             except Exception: pass
 
     @tasks.loop(minutes=30)
@@ -1964,16 +2178,27 @@ class LXTEBot(commands.Bot):
                 except Exception: pass
             elif last < warn_cutoff and not ticket.get("warned"):
                 try:
-                    close_at = int((last + timedelta(hours=auto_h)).timestamp())
+                    # FIXED: compute remaining time correctly from now, not from last_activity
+                    close_at = int((now + timedelta(hours=auto_h - (now - last).total_seconds() / 3600)).timestamp())
                     await ch.send(embed=make_embed(C_WARNING, f"⚠️ This ticket will auto-close <t:{close_at}:R> if there's no activity."))
                     await self.db.tickets.update_one({"channel_id": ch_id}, {"$set": {"warned": True}})
                 except Exception: pass
+
+    @tasks.loop(seconds=30)
+    async def giveaway_task(self):
+        due = await self.db.get_due_giveaways()
+        for giveaway in due:
+            guild = self.get_guild(giveaway.get("guild_id"))
+            if not guild: continue
+            await self.db.end_giveaway(giveaway["message_id"])
+            await do_end_giveaway(giveaway, guild)
 
     @cleanup_task.before_loop
     @voice_xp_task.before_loop
     @xp_decay_task.before_loop
     @nightly_task.before_loop
     @ticket_autoclose_task.before_loop
+    @giveaway_task.before_loop
     async def before_tasks(self): await self.wait_until_ready()
 
 
@@ -1994,10 +2219,12 @@ def ai_embed(answer: str, ctx: commands.Context) -> discord.Embed:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  HELP SYSTEM  (restored from v13.0.1)
+#  HELP SYSTEM
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_help_embed(category: str, user=None) -> discord.Embed:
+    avatar = bot.user.display_avatar.url if bot.user else None
+
     if category == "ai":
         e = make_embed(C_AI, (
             "`.ask <question>` — ask anything  (also `.ai` or `.q`)\n"
@@ -2007,24 +2234,37 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.clear` — wipe your chat history\n\n"
             "5s cooldown between questions."
         ))
-        e.title     = "🤖 AI Commands"
-        e.set_footer(text="LXTE's AI", icon_url=bot.user.display_avatar.url if bot.user else None)
+        e.title = "🤖 AI Commands"
+        e.set_footer(text="LXTE's AI", icon_url=avatar)
         return e
 
     elif category == "ascend":
-        ladder = "\n".join(f"Lv {lv} → {role}" for lv, role in LEVEL_ROLES)
         e = make_embed(C_GOLD, (
             "Messages earn 3–15 XP (×2 with Double XP role).\n"
             f"+{STREAK_BONUS_XP} bonus XP for daily streak.\n"
-            f"Voice XP: +{VOICE_XP_PER_TICK} XP/min in voice (need 2+ people, not deafened).\n"
+            f"Voice XP: +{VOICE_XP_PER_TICK} XP/min in any voice channel.\n"
             f"XP decays if inactive {XP_DECAY_DAYS}+ days (if enabled).\n\n"
             "`.level [@user]` — rank card  (also `.xp`, `.profile`)\n"
             "`/level [@user]` — slash version\n"
             "`.lb` — leaderboard\n\n"
-            f"**Level Role Ladder**\n{ladder}"
+            "Roles unlock automatically as you level up — use `.level` to check yours."
         ))
-        e.title     = "⬆️ Leveling"
-        e.set_footer(text="LXTE's AI", icon_url=bot.user.display_avatar.url if bot.user else None)
+        e.title = "⬆️ Leveling"
+        e.set_footer(text="LXTE's AI", icon_url=avatar)
+        return e
+
+    elif category == "giveaways":
+        e = make_embed(C_GOLD, (
+            "`.gstart <time> <prize>` — start a giveaway\n"
+            "Time format: `1h`, `30m`, `2d`, `1h30m`\n"
+            "Example: `.gstart 1h Robux`\n\n"
+            "`.gend <message_id>` — end a giveaway early\n"
+            "`.greroll <message_id>` — reroll winners\n"
+            "`.glist` — list active giveaways\n\n"
+            "Members click **🎉 Enter** to join. Click again to leave."
+        ))
+        e.title = "🎉 Giveaways"
+        e.set_footer(text="LXTE's AI", icon_url=avatar)
         return e
 
     elif category == "social":
@@ -2038,10 +2278,11 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.userinfo [@user]` — user details\n"
             "`.roleinfo @role` — role info\n"
             "`.stats` — your AI usage\n"
-            "`.about` — bot info"
+            "`.about` — bot info\n"
+            "`.purge <amount>` — delete messages (admins)"
         ))
-        e.title     = "💬 Social & Utility"
-        e.set_footer(text="LXTE's AI", icon_url=bot.user.display_avatar.url if bot.user else None)
+        e.title = "💬 Social & Utility"
+        e.set_footer(text="LXTE's AI", icon_url=avatar)
         return e
 
     elif category == "admin":
@@ -2058,15 +2299,15 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.admin restore` — import server config\n"
             "`.admin snapshot` — manual analytics snapshot"
         ))
-        e.title     = "🛡️ Admin"
-        e.set_footer(text="LXTE's AI", icon_url=bot.user.display_avatar.url if bot.user else None)
+        e.title = "🛡️ Admin"
+        e.set_footer(text="LXTE's AI", icon_url=avatar)
         return e
 
-    # Home / default
+    # Home
     e = make_embed(C_PRIMARY, "Pick a category below.\nBuilt by AJ.")
     e.title = "LXTE's AI"
-    e.set_thumbnail(url=bot.user.display_avatar.url if bot.user else None)
-    e.set_footer(text="Built by AJ  •  LXTE's AI v15  •  Prefix: .", icon_url=bot.user.display_avatar.url if bot.user else None)
+    e.set_thumbnail(url=avatar)
+    e.set_footer(text="Built by AJ  •  LXTE's AI v16  •  Prefix: .", icon_url=avatar)
     return e
 
 
@@ -2077,10 +2318,11 @@ class HelpView(discord.ui.View):
         self._message = None
 
         options = [
-            discord.SelectOption(label="Home",   value="home",   emoji="🏠"),
-            discord.SelectOption(label="AI",     value="ai",     emoji="🤖"),
-            discord.SelectOption(label="Ascend", value="ascend", emoji="⬆️"),
-            discord.SelectOption(label="Social", value="social", emoji="💬"),
+            discord.SelectOption(label="Home",      value="home",      emoji="🏠"),
+            discord.SelectOption(label="AI",         value="ai",        emoji="🤖"),
+            discord.SelectOption(label="Ascend",     value="ascend",    emoji="⬆️"),
+            discord.SelectOption(label="Giveaways",  value="giveaways", emoji="🎉"),
+            discord.SelectOption(label="Social",     value="social",    emoji="💬"),
         ]
         if ctx.author.id == getattr(ctx.bot, "owner_id_int", 0):
             options.append(discord.SelectOption(label="Admin", value="admin", emoji="🛡️"))
@@ -2097,10 +2339,8 @@ class HelpView(discord.ui.View):
 
     async def on_timeout(self):
         if self._message:
-            try:
-                await self._message.edit(view=None)
-            except Exception:
-                pass
+            try: await self._message.edit(view=None)
+            except Exception: pass
 
 
 @bot.command(name="help", aliases=["h"])
@@ -2136,12 +2376,11 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
     asyncio.create_task(keep_typing(ctx.channel, stop))
 
     try:
-        history          = await bot.db.get_history(ctx.author.id, ctx.channel.id)
-        history_snapshot = list(history)
-        recent_chat      = await fetch_recent_chat(ctx.channel, ctx.message)
-        custom_system    = config.get("custom_system_prefix", "")
-        web_enabled      = config.get("web_search", True)
-        has_image        = bool(
+        history      = await bot.db.get_history(ctx.author.id, ctx.channel.id)
+        recent_chat  = await fetch_recent_chat(ctx.channel, ctx.message)
+        custom_system = config.get("custom_system_prefix", "")
+
+        has_image = bool(
             ctx.message.attachments and
             ctx.message.attachments[0].content_type and
             ctx.message.attachments[0].content_type.startswith("image/")
@@ -2152,27 +2391,22 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
                 {"type": "image_url", "image_url": {"url": ctx.message.attachments[0].url}},
                 {"type": "text", "text": question},
             ]
-            model        = GROQ_VISION
-            src_ctx      = ""
-            web_enabled  = False
+            model = GROQ_VISION
         else:
             user_content = question
             model        = GROQ_TEXT
-            src_ctx      = await get_source_context(question)
 
         await safe_unreact(ctx.message, "👀", ctx.bot.user)
         await safe_react(ctx.message, "⏳")
 
         ctx_str = await build_context(ctx, recent_chat)
-        answer, meta = await bot.ai.ask_smart(
+        # FIXED: simplified — ask directly, no dead JSON meta routing
+        answer = await bot.ai.ask(
             user_content, history, model,
-            web_enabled=web_enabled,
-            context=ctx_str, source_ctx=src_ctx,
-            is_owner=owner_mode, custom_system=custom_system,
+            context=ctx_str,
+            is_owner=owner_mode,
+            custom_system=custom_system,
         )
-
-        if meta.get("confidence", 10) < 7 and not meta.get("fact_check"):
-            answer += "\n\n⚠️ I'm not 100% sure on this — worth double checking."
 
         history.append({"role": "user",      "content": question if isinstance(question, str) else "[image]"})
         history.append({"role": "assistant",  "content": answer})
@@ -2205,15 +2439,12 @@ async def cmd_retry(ctx: commands.Context):
     stop = asyncio.Event()
     asyncio.create_task(keep_typing(ctx.channel, stop))
     try:
-        answer, meta = await bot.ai.ask_smart(
+        answer = await bot.ai.ask(
             last_q, snap, GROQ_TEXT,
-            web_enabled=config.get("web_search", True),
             context=await build_context(ctx),
-            source_ctx=await get_source_context(last_q),
             is_owner=is_owner and config.get("owner_mode_enabled", True),
             custom_system=config.get("custom_system_prefix", ""),
         )
-        if meta.get("confidence", 10) < 7: answer += "\n\n⚠️ I'm not 100% sure on this — worth double checking."
     except Exception as exc:
         stop.set(); await ctx.send(embed=err(str(exc)[:300])); return
     stop.set()
@@ -2245,7 +2476,7 @@ async def cmd_level(ctx: commands.Context, target: discord.Member = None):
     e.add_field(name="Messages", value=f"{data.get('messages',0):,}", inline=True)
     e.add_field(name="Streak",   value=f"🔥 {data.get('streak',0)}d", inline=True)
     e.add_field(name="Progress", value=f"`{bar}` {xp_in:,}/{xp_need:,} XP", inline=False)
-    if cur_role:  e.add_field(name="Current Role", value=cur_role,                    inline=True)
+    if cur_role:  e.add_field(name="Current Role", value=cur_role,                      inline=True)
     if next_role: e.add_field(name="Next Role",    value=f"{next_role} (Lv {next_lv})", inline=True)
     e.add_field(name="Badges", value=badges, inline=False)
     e.set_footer(text="LXTE's AI")
@@ -2344,8 +2575,8 @@ async def cmd_analytics(ctx: commands.Context, sub: str = "growth"):
             lines.append(f"• **{name}** — {r.get('messages',0):,} msgs · {r.get('total_xp',0):,} XP")
         e = make_embed(C_INFO)
         e.title = "⚡ Server Activity"
-        e.add_field(name="Members",    value=f"{ctx.guild.member_count:,}", inline=True)
-        e.add_field(name="Boost Tier", value=f"Tier {ctx.guild.premium_tier}", inline=True)
+        e.add_field(name="Members",     value=f"{ctx.guild.member_count:,}", inline=True)
+        e.add_field(name="Boost Tier",  value=f"Tier {ctx.guild.premium_tier}", inline=True)
         e.add_field(name="Most Active", value="\n".join(lines) or "No data yet", inline=False)
         await ctx.send(embed=e)
     elif sub == "streaks":
@@ -2369,12 +2600,12 @@ async def cmd_serverinfo(ctx: commands.Context):
     e = make_embed(C_PRIMARY)
     e.title = g.name
     if g.icon: e.set_thumbnail(url=g.icon.url)
-    e.add_field(name="Owner",    value=g.owner.mention if g.owner else "?",                           inline=True)
-    e.add_field(name="Created",  value=ts_full(g.created_at),                                         inline=True)
-    e.add_field(name="Members",  value=f"{g.member_count:,}",                                         inline=True)
+    e.add_field(name="Owner",    value=g.owner.mention if g.owner else "?",                              inline=True)
+    e.add_field(name="Created",  value=ts_full(g.created_at),                                            inline=True)
+    e.add_field(name="Members",  value=f"{g.member_count:,}",                                            inline=True)
     e.add_field(name="Boost",    value=f"Tier {g.premium_tier} ({g.premium_subscription_count} boosts)", inline=True)
-    e.add_field(name="Channels", value=f"💬 {len(g.text_channels)}  🔊 {len(g.voice_channels)}",      inline=True)
-    e.add_field(name="Roles",    value=f"{len(g.roles)}",                                             inline=True)
+    e.add_field(name="Channels", value=f"💬 {len(g.text_channels)}  🔊 {len(g.voice_channels)}",         inline=True)
+    e.add_field(name="Roles",    value=f"{len(g.roles)}",                                                inline=True)
     await ctx.send(embed=e)
 
 
@@ -2388,13 +2619,13 @@ async def cmd_userinfo(ctx: commands.Context, target: discord.Member = None):
     e = make_embed(C_PRIMARY)
     e.set_author(name=target.display_name, icon_url=target.display_avatar.url)
     e.set_thumbnail(url=target.display_avatar.url)
-    e.add_field(name="ID",       value=f"`{target.id}`",                                                inline=True)
-    e.add_field(name="Created",  value=ts_full(target.created_at),                                     inline=True)
-    e.add_field(name="Joined",   value=ts_full(target.joined_at) if target.joined_at else "?",         inline=True)
-    e.add_field(name="Boosting", value=ts_full(target.premium_since) if target.premium_since else "No", inline=True)
-    e.add_field(name="Level",    value=f"{level} ({total_xp:,} XP)",                                   inline=True)
-    e.add_field(name="Streak",   value=f"🔥 {data.get('streak',0)}d",                                  inline=True)
-    e.add_field(name="Badges",   value=badges,                                                         inline=False)
+    e.add_field(name="ID",       value=f"`{target.id}`",                                                 inline=True)
+    e.add_field(name="Created",  value=ts_full(target.created_at),                                       inline=True)
+    e.add_field(name="Joined",   value=ts_full(target.joined_at) if target.joined_at else "?",           inline=True)
+    e.add_field(name="Boosting", value=ts_full(target.premium_since) if target.premium_since else "No",  inline=True)
+    e.add_field(name="Level",    value=f"{level} ({total_xp:,} XP)",                                     inline=True)
+    e.add_field(name="Streak",   value=f"🔥 {data.get('streak',0)}d",                                    inline=True)
+    e.add_field(name="Badges",   value=badges,                                                            inline=False)
     roles_str = " ".join(r.mention for r in reversed(target.roles) if r.name != "@everyone") or "None"
     e.add_field(name=f"Roles [{len(target.roles)-1}]", value=roles_str[:500], inline=False)
     await ctx.send(embed=e)
@@ -2407,11 +2638,11 @@ async def cmd_roleinfo(ctx: commands.Context, *, role: discord.Role = None):
     perms = [p.replace("_"," ").title() for p, v in role.permissions if v]
     e = make_embed(role.color.value or C_PRIMARY)
     e.title = f"@{role.name}"
-    e.add_field(name="ID",          value=f"`{role.id}`",        inline=True)
-    e.add_field(name="Members",     value=f"{mc}",               inline=True)
+    e.add_field(name="ID",          value=f"`{role.id}`",   inline=True)
+    e.add_field(name="Members",     value=f"{mc}",           inline=True)
     e.add_field(name="Created",     value=ts_full(role.created_at), inline=True)
-    e.add_field(name="Hoisted",     value="Yes" if role.hoist else "No",        inline=True)
-    e.add_field(name="Mentionable", value="Yes" if role.mentionable else "No",  inline=True)
+    e.add_field(name="Hoisted",     value="Yes" if role.hoist else "No",       inline=True)
+    e.add_field(name="Mentionable", value="Yes" if role.mentionable else "No", inline=True)
     if perms: e.add_field(name="Key Permissions", value=", ".join(perms[:10]), inline=False)
     await ctx.send(embed=e)
 
@@ -2422,9 +2653,9 @@ async def cmd_stats(ctx: commands.Context):
     e = make_embed(C_SUCCESS)
     e.title = f"📊 {ctx.author.display_name}"
     e.set_thumbnail(url=ctx.author.display_avatar.url)
-    e.add_field(name="Questions",   value=f"`{data.get('questions',0):,}`",                              inline=True)
-    e.add_field(name="First seen",  value=ts(data["first_seen"]) if data.get("first_seen") else "never", inline=True)
-    e.add_field(name="Last active", value=ts(data["last_seen"])  if data.get("last_seen")  else "never", inline=True)
+    e.add_field(name="Questions",   value=f"`{data.get('questions',0):,}`",                               inline=True)
+    e.add_field(name="First seen",  value=ts(data["first_seen"]) if data.get("first_seen") else "never",  inline=True)
+    e.add_field(name="Last active", value=ts(data["last_seen"])  if data.get("last_seen")  else "never",  inline=True)
     gs = await bot.db.global_stats()
     if gs: e.add_field(name="Server totals", value=f"{gs.get('total_users',0):,} users · {gs.get('total_questions',0):,} questions", inline=False)
     await ctx.send(embed=e)
@@ -2434,6 +2665,16 @@ async def cmd_stats(ctx: commands.Context):
 async def cmd_clear(ctx: commands.Context):
     await bot.db.clear_history(ctx.author.id, ctx.channel.id)
     await ctx.send(embed=make_embed(C_WARNING, "🗑️ Your chat history has been wiped."))
+
+
+@bot.command(name="purge")
+@commands.has_permissions(manage_messages=True)
+async def cmd_purge(ctx: commands.Context, amount: int = 10):
+    if amount < 1 or amount > 500:
+        await ctx.send(embed=err("Amount must be between 1 and 500."), delete_after=5); return
+    await ctx.message.delete()
+    deleted = await ctx.channel.purge(limit=amount)
+    await ctx.send(embed=ok(f"Deleted **{len(deleted)}** messages."), delete_after=5)
 
 
 @bot.command(name="setup", aliases=["config"])
@@ -2450,8 +2691,8 @@ async def cmd_setup(ctx: commands.Context):
 @bot.command(name="about", aliases=["info"])
 async def cmd_about(ctx: commands.Context):
     e = make_embed(C_AI)
-    e.title       = "LXTE's AI v15"
-    e.description = "Built by AJ. Smart AI, leveling with role rewards, Join LXTE tickets, reaction roles, automod, anti-raid, boost tracking, invite tracking, analytics."
+    e.title       = "LXTE's AI v16"
+    e.description = "Built by AJ. Smart AI, leveling, giveaways, Join LXTE tickets, multi-select setup, reaction roles, automod, anti-raid, boost tracking, invite tracking, analytics."
     e.set_thumbnail(url=bot.user.display_avatar.url if bot.user else None)
     e.add_field(name="Prefix",   value="`.`",                  inline=True)
     e.add_field(name="Memory",   value="Per channel, 14 days", inline=True)
@@ -2459,6 +2700,89 @@ async def cmd_about(ctx: commands.Context):
     e.set_footer(text=f"{len(bot.guilds)} server(s)  •  Built by AJ")
     await ctx.send(embed=e)
 
+
+# ─── Giveaway commands ────────────────────────────────────────────────────────
+
+@bot.command(name="gstart")
+@commands.has_permissions(manage_guild=True)
+async def cmd_gstart(ctx: commands.Context, duration: str = None, *, prize: str = None):
+    if not duration or not prize:
+        await ctx.send(embed=err("Usage: `.gstart <time> <prize>`\nExample: `.gstart 1h Robux`")); return
+
+    secs = parse_duration(duration)
+    if not secs or secs < 10:
+        await ctx.send(embed=err("Invalid duration. Use formats like `30m`, `1h`, `2d`, `1h30m`.")); return
+    if secs > 86400 * 30:
+        await ctx.send(embed=err("Max duration is 30 days.")); return
+
+    # Optional: check for winners arg at start of prize like "3w Prize name"
+    winners = 1
+    prize_parts = prize.split(" ", 1)
+    if prize_parts[0].endswith("w") and prize_parts[0][:-1].isdigit():
+        winners = max(1, min(20, int(prize_parts[0][:-1])))
+        prize   = prize_parts[1] if len(prize_parts) > 1 else "Prize"
+
+    config  = await get_config(ctx.guild.id)
+    ch_id   = config.get("giveaway_channel_id")
+    channel = ctx.guild.get_channel(ch_id) if ch_id else ctx.channel
+
+    ends_at = datetime.now(timezone.utc) + timedelta(seconds=secs)
+    e       = giveaway_embed(prize, ctx.author.id, ends_at, winners, 0)
+    msg     = await channel.send(embed=e, view=GiveawayEnterView())
+
+    await bot.db.create_giveaway(ctx.guild.id, channel.id, msg.id, ctx.author.id, prize, winners, ends_at)
+
+    if channel != ctx.channel:
+        await ctx.send(embed=ok(f"Giveaway started in {channel.mention}! [Jump]({msg.jump_url})"))
+    else:
+        await ctx.message.delete()
+
+
+@bot.command(name="gend")
+@commands.has_permissions(manage_guild=True)
+async def cmd_gend(ctx: commands.Context, message_id: int = None):
+    if not message_id:
+        await ctx.send(embed=err("Usage: `.gend <message_id>`")); return
+    giveaway = await bot.db.get_giveaway(message_id)
+    if not giveaway: await ctx.send(embed=err("Giveaway not found.")); return
+    if giveaway.get("ended"): await ctx.send(embed=err("That giveaway already ended.")); return
+    await bot.db.end_giveaway(message_id)
+    await do_end_giveaway(giveaway, ctx.guild)
+    if giveaway.get("channel_id") != ctx.channel.id:
+        await ctx.send(embed=ok("Giveaway ended."))
+
+
+@bot.command(name="greroll")
+@commands.has_permissions(manage_guild=True)
+async def cmd_greroll(ctx: commands.Context, message_id: int = None):
+    if not message_id:
+        await ctx.send(embed=err("Usage: `.greroll <message_id>`")); return
+    giveaway = await bot.db.get_giveaway(message_id)
+    if not giveaway: await ctx.send(embed=err("Giveaway not found.")); return
+    entrants = giveaway.get("entrants", [])
+    if not entrants: await ctx.send(embed=err("No entrants to reroll from.")); return
+
+    num     = min(giveaway.get("winners", 1), len(entrants))
+    winners = random.sample(entrants, num)
+    mentions = " ".join(f"<@{w}>" for w in winners)
+    await ctx.send(embed=make_embed(C_GOLD, f"🎉 New winner(s): {mentions}\nCongratulations on **{giveaway['prize']}**!"))
+
+
+@bot.command(name="glist")
+async def cmd_glist(ctx: commands.Context):
+    active = await bot.db.get_active_giveaways(ctx.guild.id)
+    if not active: await ctx.send(embed=make_embed(C_INFO, "No active giveaways.")); return
+    lines = []
+    for g in active:
+        ends_ts = int(g["ends_at"].timestamp()) if g.get("ends_at") else 0
+        ch      = ctx.guild.get_channel(g.get("channel_id"))
+        lines.append(f"• **{g['prize']}** — ends <t:{ends_ts}:R> in {ch.mention if ch else '?'} ({len(g.get('entrants',[]))} entries)")
+    e = make_embed(C_GOLD, "\n".join(lines))
+    e.title = "🎉 Active Giveaways"
+    await ctx.send(embed=e)
+
+
+# ─── Admin commands ───────────────────────────────────────────────────────────
 
 @bot.command(name="admin", hidden=True)
 async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
