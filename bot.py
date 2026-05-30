@@ -2406,7 +2406,7 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.stats` — your AI usage\n"
             "`.about` — bot info\n"
             "`.purge <amount>` — delete messages (admins)"
-            "`.syncroles` — sync auto-roles and level roles for all members (admins)"
+            "`.syncroles` — sync auto-roles and level roles for all members (admins)"
         ))
         e.title = "💬 Social & Utility"
         e.set_footer(text="LXTE's AI", icon_url=avatar)
