@@ -33,7 +33,7 @@ except ImportError:
 
 load_dotenv()
 print("✅ LXTE's AI v16.0.0 loaded")
-
+print("Tester v1 Loaded")
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logger = logging.getLogger("lxte")
 logger.setLevel(logging.INFO)
