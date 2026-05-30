@@ -41,11 +41,13 @@ try:
         "piss", "pissed", "bullshit", "motherfucker", "motherfucking",
         "fucking", "shitting", "bitching", "jackass", "douchebag",
     ]
-    _profanity_checker.load_censor_words()           # load full built-in list (includes slurs)
-    _profanity_checker.add_censor_words(_SWEAR_WORDS)  # layer custom words on top
+    _profanity_checker.load_censor_words()
+    _profanity_checker.add_censor_words(_SWEAR_WORDS)
     PROFANITY_AVAILABLE = True
+    print("✅ better-profanity loaded — swear filter active")
 except ImportError:
     PROFANITY_AVAILABLE = False
+    print("❌ better-profanity NOT installed — swear filter disabled! Run: pip install better-profanity==0.6.1")
 
 load_dotenv()
 print("✅ LXTE's AI v18.0.0 loaded")
@@ -1357,6 +1359,7 @@ class AutomodSetupView(discord.ui.View):
             f"No Invites: {'✅' if config.get('automod_no_invites', True) else '❌'}\n"
             f"No Links: {'✅' if config.get('automod_no_links', True) else '❌'}\n"
             f"Anti-Raid: {'✅' if config.get('antiraid_enabled', True) else '❌'}\n"
+            f"Swear Filter: {'✅' if config.get('anti_swear_enabled', True) else '❌'}\n"
             f"Log: {lc}"
         )
 
