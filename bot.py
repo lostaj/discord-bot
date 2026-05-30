@@ -60,7 +60,8 @@ TEMPERATURE = 0.55
 MAX_HISTORY_TURNS  = 30
 HISTORY_TTL_DAYS   = 14
 USER_COOLDOWN_SECS = 5.0
-_last_used: dict[int, float] = {}
+_last_used:       dict[int, float] = {}
+_cmd_cooldowns:   dict[int, float] = {}
 
 # ─── Member Count ─────────────────────────────────────────────────────────────
 MEMBER_COUNT_CHANNEL_ID = 1508204390677352629
@@ -2117,7 +2118,7 @@ class LXTEBot(commands.Bot):
     @tasks.loop(hours=1)
     async def cleanup_task(self):
         cutoff = time.monotonic() - 3600
-        for d in (_last_used, _xp_cooldowns):
+        for d in (_last_used, _xp_cooldowns, _cmd_cooldowns):
             for k in [k for k, v in d.items() if v < cutoff]: del d[k]
 
     @tasks.loop(seconds=VOICE_XP_INTERVAL)
@@ -2203,7 +2204,23 @@ class LXTEBot(commands.Bot):
 
 
 bot = LXTEBot()
-
+@bot.check
+async def global_cmd_cooldown(ctx: commands.Context) -> bool:
+    """5-second cooldown on every command for non-owners."""
+    if ctx.author.id == bot.owner_id_int:
+        return True
+    now = time.monotonic()
+    last = _cmd_cooldowns.get(ctx.author.id, 0.0)
+    remaining = USER_COOLDOWN_SECS - (now - last)
+    if remaining > 0:
+        ready_at = int(time.time() + remaining)
+        await ctx.send(
+            embed=err(f"Slow down — you can use commands again <t:{ready_at}:R>."),
+            delete_after=6,
+        )
+        return False
+    _cmd_cooldowns[ctx.author.id] = now
+    return True
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  COMMANDS
