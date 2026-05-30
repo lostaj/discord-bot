@@ -3,7 +3,7 @@ LXTE's AI — built by AJ
 v16.0.0 — Changes from v15:
   - ADDED: Full giveaway system (.gstart, .gend, .greroll)
   - ADDED: Multi-select dropdowns for roles and channels throughout setup
-  - ADDED: .purge command
+  - ADDED: .purge command 
   - REMOVED: Wikipedia/fact-check fetching (get_source_context, fetch_wikipedia, FACTUAL_RE)
   - REMOVED: parse_response JSON meta format — ask_smart now calls ask directly
   - REMOVED: history_snapshot dead code in cmd_ask
