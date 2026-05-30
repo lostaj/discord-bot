@@ -2406,6 +2406,7 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.stats` — your AI usage\n"
             "`.about` — bot info\n"
             "`.purge <amount>` — delete messages (admins)"
+            "`.syncroles` — sync auto-roles and level roles for all members (admins)"
         ))
         e.title = "💬 Social & Utility"
         e.set_footer(text="LXTE's AI", icon_url=avatar)
@@ -2558,6 +2559,34 @@ async def cmd_roles(ctx: commands.Context):
     e = make_embed(C_PRIMARY, "\n".join(roles) or "No roles.")
     e.title = f"Roles [{len(roles)}]"
     await ctx.send(embed=e)
+
+@bot.command(name="syncroles")
+@commands.has_permissions(administrator=True)
+async def cmd_syncroles(ctx: commands.Context):
+    msg = await ctx.send(embed=make_embed(C_INFO, "⏳ Syncing roles for all members…"))
+    config = await get_config(ctx.guild.id)
+    autoroles = config.get("autoroles", [])
+    fixed = 0
+    errors = 0
+    for member in ctx.guild.members:
+        if member.bot: continue
+        try:
+            # Auto-roles
+            for entry in autoroles:
+                role = ctx.guild.get_role(entry.get("role_id"))
+                if role and role not in member.roles:
+                    await member.add_roles(role, reason="syncroles")
+                    fixed += 1
+            # Level roles
+            data = await bot.db.get_level_data(member.id, ctx.guild.id)
+            level = data.get("level", 0)
+            if level > 0:
+                await apply_level_roles(member, level)
+                fixed += 1
+        except Exception:
+            errors += 1
+    e = ok(f"Sync complete.\n**Members checked:** {len(ctx.guild.members)}\n**Role assignments made:** {fixed}\n**Errors:** {errors}")
+    await msg.edit(embed=e)
   
 @bot.command(name="retry")
 async def cmd_retry(ctx: commands.Context):
