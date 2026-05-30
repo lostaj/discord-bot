@@ -2552,7 +2552,13 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
-
+@bot.command(name="roles")
+async def cmd_roles(ctx: commands.Context):
+    roles = [r.name for r in sorted(ctx.guild.roles, key=lambda r: r.position, reverse=True) if r.name != "@everyone"]
+    e = make_embed(C_PRIMARY, "\n".join(roles) or "No roles.")
+    e.title = f"Roles [{len(roles)}]"
+    await ctx.send(embed=e)
+  
 @bot.command(name="retry")
 async def cmd_retry(ctx: commands.Context):
     history = await bot.db.get_history(ctx.author.id, ctx.channel.id)
