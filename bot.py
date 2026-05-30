@@ -782,12 +782,13 @@ class Database:
     async def track_message(self, uid: int, gid: int, channel_id: int):
         """Increment total message count and per-channel count for a user."""
         chan_key = f"channels.{channel_id}"
+        now = datetime.now(timezone.utc)
         await self.msg_tracking.update_one(
             {"guild_id": gid, "user_id": uid},
             {
                 "$inc": {"total_messages": 1, chan_key: 1},
-                "$set":  {"last_message": datetime.now(timezone.utc)},
-                "$setOnInsert": {"first_message": datetime.now(timezone.utc)},
+                "$set": {"last_message": now},
+                "$min": {"first_message": now},   # keeps earliest timestamp; safe on upsert
             },
             upsert=True,
         )
@@ -2262,6 +2263,13 @@ class LXTEBot(commands.Bot):
             if await run_automod(message, config): return
 
         if message.guild and not is_command and len(content) >= 2:
+            # v17: track every message regardless of XP cooldown
+            if message.guild:
+                try:
+                    await self.db.track_message(message.author.id, message.guild.id, message.channel.id)
+                except Exception as exc:
+                    logger.warning("track_message: %s", exc)
+
             now  = time.monotonic()
             last = _xp_cooldowns.get(message.author.id, 0)
             if now - last >= XP_COOLDOWN_SEC:
@@ -2273,8 +2281,6 @@ class LXTEBot(commands.Bot):
                 xp_gain     = xp_from_length(content, multiplier)
                 try:
                     result = await self.db.add_xp(message.author.id, message.guild.id, xp_gain)
-                    # v17: track this message for the leaderboard (always, regardless of XP cooldown result)
-                    await self.db.track_message(message.author.id, message.guild.id, message.channel.id)
                     if member:
                         data = await self.db.get_level_data(member.id, message.guild.id)
                         for ach in await check_achievements(member, data):
@@ -3020,34 +3026,50 @@ async def cmd_msgcheck(ctx: commands.Context, target: discord.Member = None):
 
 @bot.command(name="msgsync", aliases=["synccmessages", "syncmsg"])
 @commands.has_permissions(administrator=True)
-async def cmd_msgsync(ctx: commands.Context, limit: int = 500):
+async def cmd_msgsync(ctx: commands.Context, limit: int = 500, *, flags: str = ""):
     """
     Backfill message counts for all existing members by scanning channel histories.
-    Usage: .msgsync [limit_per_channel]
-    limit = max messages to read per channel (default 500, max 10000).
-    Owner can go higher. Admins capped at 10000.
-    This can take a while — a progress message updates every 5 channels.
+    Usage: .msgsync [limit] [--reset]
+      limit   = max messages per channel (default 500, admin max 10000, owner unlimited)
+      --reset = wipe existing msg_tracking data for this server before syncing
+                (use this to avoid double-counting if you've run msgsync before)
     """
-    is_owner = ctx.author.id == bot.owner_id_int
+    is_owner  = ctx.author.id == bot.owner_id_int
+    do_reset  = "--reset" in flags.lower()
     max_limit = 100_000 if is_owner else 10_000
-    limit = max(50, min(limit, max_limit))
+    limit     = max(50, min(limit, max_limit))
 
     channels = [ch for ch in ctx.guild.text_channels
                 if ch.permissions_for(ctx.guild.me).read_message_history]
 
+    # Warn if data already exists and --reset not passed
+    existing_count = await bot.db.msg_tracking.count_documents({"guild_id": ctx.guild.id})
+    if existing_count > 0 and not do_reset:
+        warn = await ctx.send(embed=make_embed(C_WARNING,
+            f"⚠️ **{existing_count} users** already have message data in this server.\n\n"
+            f"Running sync without `--reset` will **add** to existing counts, which will **double-count** "
+            f"any messages already tracked.\n\n"
+            f"To wipe and resync cleanly: `.msgsync {limit} --reset`\n"
+            f"To add on top of existing data anyway: `.msgsync {limit} --force`\n\n"
+            f"*(Tip: use `--reset` for a first-time historical backfill, skip it for incremental top-ups)*"
+        ))
+        return
+
+    if do_reset:
+        await bot.db.msg_tracking.delete_many({"guild_id": ctx.guild.id})
+
     status_msg = await ctx.send(embed=make_embed(C_INFO,
-        f"⏳ Starting message sync…\n"
+        f"{'🗑️ Wiped existing data. ' if do_reset else ''}⏳ Starting message sync…\n"
         f"Scanning **{len(channels)}** channels · **{limit:,}** msgs/channel\n"
         f"This may take a few minutes."
     ))
 
     # counts[user_id][channel_id] = count
     counts: dict[int, dict[int, int]] = collections.defaultdict(lambda: collections.defaultdict(int))
-    # Track first/last message timestamps per user
     first_seen: dict[int, datetime] = {}
     last_seen:  dict[int, datetime] = {}
 
-    total_scanned = 0
+    total_scanned     = 0
     total_channels_done = 0
 
     for ch in channels:
@@ -3069,7 +3091,6 @@ async def cmd_msgsync(ctx: commands.Context, limit: int = 500):
             logger.warning("msgsync channel %s: %s", ch.name, exc)
 
         total_channels_done += 1
-        # Update status every 5 channels
         if total_channels_done % 5 == 0 or total_channels_done == len(channels):
             try:
                 await status_msg.edit(embed=make_embed(C_INFO,
@@ -3079,24 +3100,22 @@ async def cmd_msgsync(ctx: commands.Context, limit: int = 500):
             except Exception:
                 pass
 
-    # Write to DB — upsert each user, adding to existing counts
+    # Write to DB
     written = 0
     for uid, chan_map in counts.items():
         total_for_user = sum(chan_map.values())
-        # Build $inc payload for per-channel counts
         chan_inc = {f"channels.{cid}": cnt for cid, cnt in chan_map.items()}
         chan_inc["total_messages"] = total_for_user
 
-        set_payload: dict = {}
+        update: dict = {
+            "$inc": chan_inc,
+            "$min": {"first_message": first_seen[uid]} if uid in first_seen else {},
+        }
         if uid in last_seen:
-            set_payload["last_message"] = last_seen[uid]
-
-        update: dict = {"$inc": chan_inc}
-        if set_payload:
-            update["$set"] = set_payload
-        # Only set first_message if it doesn't exist yet (don't overwrite a newer stored value)
-        if uid in first_seen:
-            update["$min"] = {"first_message": first_seen[uid]}
+            update["$set"] = {"last_message": last_seen[uid]}
+        # Remove empty $min if no first_seen (shouldn't happen, but be safe)
+        if not update["$min"]:
+            del update["$min"]
 
         try:
             await bot.db.msg_tracking.update_one(
