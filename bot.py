@@ -867,25 +867,35 @@ async def check_top_leaderboard(guild: discord.Guild):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def apply_level_roles(member: discord.Member, new_level: int) -> Optional[str]:
-    """Give all roles the member has earned. Return the name of the role earned at exactly new_level."""
+    """Give all roles the member has earned. Return the name of the role earned at exactly new_level.
+    Uses guild config level_roles if set, otherwise falls back to hardcoded LEVEL_ROLES."""
+    config      = await get_config(member.guild.id)
+    config_rows = config.get("level_roles", [])
+
+    # Build ladder: list of (req_level, role_id_or_name, is_id)
+    if config_rows:
+        ladder = [(entry["level"], entry["role_id"], True) for entry in config_rows]
+    else:
+        ladder = [(req, name, False) for req, name in LEVEL_ROLES]
+
     exact_reward = None
-    for req, name in LEVEL_ROLES:
+    for req, ref, is_id in sorted(ladder, key=lambda x: x[0]):
         if new_level >= req:
-            role = resolve_role(member.guild, name)
+            role = member.guild.get_role(ref) if is_id else resolve_role(member.guild, ref)
             if role and role not in member.roles:
                 try:
                     await member.add_roles(role, reason=f"Level {req} reward")
                     if req == new_level:
-                        exact_reward = name
+                        exact_reward = role.name
                 except Exception as e:
-                    logger.warning("Failed to add level role %s: %s", name, e)
-    # If no role at exact level but a new one was assigned (skip levels), return highest newly added
+                    logger.warning("Failed to add level role %s: %s", ref, e)
+
     if not exact_reward:
-        for req, name in reversed(LEVEL_ROLES):
+        for req, ref, is_id in sorted(ladder, key=lambda x: x[0], reverse=True):
             if new_level >= req:
-                role = resolve_role(member.guild, name)
+                role = member.guild.get_role(ref) if is_id else resolve_role(member.guild, ref)
                 if role and role in member.roles:
-                    exact_reward = name
+                    exact_reward = role.name
                     break
     return exact_reward
 
@@ -1111,7 +1121,7 @@ def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
     e.add_field(name="🛡️ Automod",   value=f"{'✅' if config.get('automod_enabled', True) else '❌'} | Log: {ch('log_channel_id')}", inline=True)
     e.add_field(name="🎫 Tickets",   value=f"Panel: {ch('ticket_panel_channel_id')}\nStaff: {ro('ticket_staff_role_id')}", inline=True)
     e.add_field(name="🚀 Boosts",    value=f"Channel: {ch('boost_channel_id')}", inline=True)
-    e.add_field(name="🎭 Roles",     value=f"Auto: {len(config.get('autoroles', []))} | 2XP: {len(config.get('double_xp_roles', []))}", inline=True)
+    e.add_field(name="🎭 Roles",     value=f"Auto: {len(config.get('autoroles', []))} | 2XP: {len(config.get('double_xp_roles', []))} | LvlRoles: {len(config.get('level_roles', []))}", inline=True)
     e.add_field(name="🤖 AI",        value=f"Channels: {ch_list('ai_channel_ids')} | Web: {'✅' if config.get('web_search', True) else '❌'}", inline=True)
     e.add_field(name="🎉 Giveaways", value=f"Channel: {ch('giveaway_channel_id')}", inline=True)
     e.set_footer(text="Admins only  •  Built by AJ  •  Multi-select enabled")
@@ -1176,6 +1186,10 @@ class SetupView(discord.ui.View):
     @discord.ui.button(label="🎭 Reactions",  style=discord.ButtonStyle.secondary, row=2)
     async def btn_reactions(self, i, b):
         await i.response.send_message(embed=make_embed(C_INFO, "Manage reaction roles:"), view=ReactionSetupView(self.owner_id, self.guild_id), ephemeral=True)
+
+@discord.ui.button(label="⬆️ Level Roles", style=discord.ButtonStyle.secondary, row=3)
+    async def btn_levelroles(self, i, b):
+        await i.response.send_message(embed=make_embed(C_INFO, "Configure level-up roles:"), view=LevelRolesSetupView(self.owner_id, self.guild_id), ephemeral=True)
 
     @discord.ui.button(label="✖ Close",      style=discord.ButtonStyle.danger,    row=3)
     async def btn_close(self, i, b):
@@ -1572,7 +1586,102 @@ class RemoveReactionRoleModal(discord.ui.Modal, title="Remove Reaction Role"):
         else:        await bot.db.delete_reaction_role(self.gid, mid)
         await i.response.send_message(embed=ok("Removed."), ephemeral=True)
 
+# ── Level Roles Setup ─────────────────────────────────────────────────────────
+class LevelRolesSetupView(discord.ui.View):
+    def __init__(self, owner_id: int, guild_id: int):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
 
+    async def refresh(self, i): pass
+
+    @discord.ui.button(label="➕ Add Mapping", style=discord.ButtonStyle.success, row=0)
+    async def btn_add(self, i: discord.Interaction, b):
+        await i.response.send_modal(AddLevelRoleModal(self.guild_id))
+
+    @discord.ui.button(label="➖ Remove",      style=discord.ButtonStyle.danger,   row=0)
+    async def btn_remove(self, i: discord.Interaction, b):
+        await i.response.send_modal(RemoveLevelRoleModal(self.guild_id))
+
+    @discord.ui.button(label="📋 List",        style=discord.ButtonStyle.secondary, row=0)
+    async def btn_list(self, i: discord.Interaction, b):
+        config = await get_config(self.guild_id)
+        rows   = sorted(config.get("level_roles", []), key=lambda x: x["level"])
+        if not rows:
+            await i.response.send_message(
+                embed=make_embed(C_INFO, "No custom level roles set.\nUsing hardcoded `LEVEL_ROLES` defaults."),
+                ephemeral=True,
+            ); return
+        lines = []
+        for entry in rows:
+            role = i.guild.get_role(entry["role_id"])
+            lines.append(f"Level **{entry['level']}** → {role.mention if role else f'`deleted role {entry[\"role_id\"]}`'}")
+        e = make_embed(C_PRIMARY, "\n".join(lines))
+        e.title = "⬆️ Level Role Mappings"
+        await i.response.send_message(embed=e, ephemeral=True)
+
+    @discord.ui.button(label="🗑️ Clear All",   style=discord.ButtonStyle.danger,   row=1)
+    async def btn_clear(self, i: discord.Interaction, b):
+        await bot.db.update_config(self.guild_id, "level_roles", [])
+        await i.response.send_message(
+            embed=ok("All custom level roles cleared. Bot will use hardcoded defaults."),
+            ephemeral=True,
+        )
+
+
+class AddLevelRoleModal(discord.ui.Modal, title="Add Level Role"):
+    level_input = discord.ui.TextInput(label="Level (number)", placeholder="e.g. 10", max_length=5)
+    role_input  = discord.ui.TextInput(label="Role name", placeholder="e.g. Builder │ Level 10", max_length=100)
+
+    def __init__(self, guild_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+
+    async def on_submit(self, i: discord.Interaction):
+        if not self.level_input.value.strip().isdigit():
+            await i.response.send_message(embed=err("Level must be a number."), ephemeral=True); return
+        level = int(self.level_input.value.strip())
+        if level < 1 or level > 9999:
+            await i.response.send_message(embed=err("Level must be between 1 and 9999."), ephemeral=True); return
+        role = resolve_role(i.guild, self.role_input.value)
+        if not role:
+            await i.response.send_message(embed=err(f"No role `{self.role_input.value}` found."), ephemeral=True); return
+        config  = await get_config(self.guild_id)
+        entries = config.get("level_roles", [])
+        entries = [e for e in entries if e["level"] != level]
+        entries.append({"level": level, "role_id": role.id})
+        entries.sort(key=lambda x: x["level"])
+        await bot.db.update_config(self.guild_id, "level_roles", entries)
+        await i.response.send_message(
+            embed=ok(f"Level **{level}** → {role.mention} saved."),
+            ephemeral=True,
+        )
+
+
+class RemoveLevelRoleModal(discord.ui.Modal, title="Remove Level Role"):
+    level_input = discord.ui.TextInput(label="Level to remove", placeholder="e.g. 10", max_length=5)
+
+    def __init__(self, guild_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+
+    async def on_submit(self, i: discord.Interaction):
+        if not self.level_input.value.strip().isdigit():
+            await i.response.send_message(embed=err("Enter a valid level number."), ephemeral=True); return
+        level   = int(self.level_input.value.strip())
+        config  = await get_config(self.guild_id)
+        entries = config.get("level_roles", [])
+        new     = [e for e in entries if e["level"] != level]
+        if len(new) == len(entries):
+            await i.response.send_message(embed=err(f"No mapping found for level {level}."), ephemeral=True); return
+        await bot.db.update_config(self.guild_id, "level_roles", new)
+        await i.response.send_message(embed=ok(f"Removed level **{level}** mapping."), ephemeral=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TICKET SYSTEM
+# ═══════════════════════════════════════════════════════════════════════════════
+  
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TICKET SYSTEM
 # ═══════════════════════════════════════════════════════════════════════════════
