@@ -41,7 +41,8 @@ try:
         "piss", "pissed", "bullshit", "motherfucker", "motherfucking",
         "fucking", "shitting", "bitching", "jackass", "douchebag",
     ]
-    _profanity_checker.load_censor_words(custom_words=_SWEAR_WORDS)
+    _profanity_checker.load_censor_words()           # load full built-in list (includes slurs)
+    _profanity_checker.add_censor_words(_SWEAR_WORDS)  # layer custom words on top
     PROFANITY_AVAILABLE = True
 except ImportError:
     PROFANITY_AVAILABLE = False
@@ -1230,7 +1231,7 @@ def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
     e.add_field(name="🤖 AI",        value=f"Channels: {ch_list('ai_channel_ids')} | Web: {'✅' if config.get('web_search', True) else '❌'}", inline=True)
     e.add_field(name="🎉 Giveaways", value=f"Channel: {ch('giveaway_channel_id')}", inline=True)
     e.add_field(name="💣 Anti-Nuke",  value=f"{'✅' if config.get('antinuke_enabled', True) else '❌'}", inline=True)
-    e.add_field(name="🚫 Anti-Spam",  value=f"{'✅' if config.get('antispam_enabled', True) else '❌'} | Caps: {'✅' if config.get('anti_caps_enabled', False) else '❌'} | Emoji: {'✅' if config.get('anti_emoji_spam_enabled', False) else '❌'} | Swear: {'✅' if config.get('anti_swear_enabled', False) else '❌'}", inline=True)
+    e.add_field(name="🚫 Anti-Spam",  value=f"{'✅' if config.get('antispam_enabled', True) else '❌'} | Caps: {'✅' if config.get('anti_caps_enabled', False) else '❌'} | Emoji: {'✅' if config.get('anti_emoji_spam_enabled', False) else '❌'} | Swear: {'✅' if config.get('anti_swear_enabled', True) else '❌'}", inline=True)
     e.add_field(name="👻 Ghost/Mention", value=f"GhostPing: {'✅' if config.get('anti_ghost_ping_enabled', True) else '❌'} | MassMention: {'✅' if config.get('anti_mass_mention_enabled', True) else '❌'}", inline=True)
     e.set_footer(text="Admins only  •  Built by AJ  •  v18")
     return e
@@ -1372,7 +1373,7 @@ class AutomodSetupView(discord.ui.View):
     async def t4(self, i, b): await self._toggle(i, "antiraid_enabled")
 
     @discord.ui.button(label="Toggle Swear Filter", style=discord.ButtonStyle.secondary, row=2)
-    async def t5(self, i, b): await self._toggle(i, "anti_swear_enabled", default=False)
+    async def t5(self, i, b): await self._toggle(i, "anti_swear_enabled", default=True)
 
 
 # ── Ticket Setup ──────────────────────────────────────────────────────────────
@@ -2101,7 +2102,7 @@ async def _automod_emoji(message: discord.Message, config: dict) -> bool:
 
 async def _automod_swear(message: discord.Message, config: dict) -> bool:
     """Swear word filter using better-profanity. Returns True if actioned."""
-    if not config.get("anti_swear_enabled", False): return False
+    if not config.get("anti_swear_enabled", True): return False
     if not PROFANITY_AVAILABLE: return False
     if not _profanity_checker.contains_profanity(message.content): return False
     try: await message.delete()
