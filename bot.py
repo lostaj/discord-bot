@@ -32,6 +32,20 @@ try:
 except ImportError:
     PILLOW_AVAILABLE = False
 
+try:
+    from better_profanity import profanity as _profanity_checker
+    _SWEAR_WORDS = [
+        "fuck", "fuk", "frick", "shit", "shite", "crap", "bitch",
+        "bastard", "asshole", "arsehole", "ass", "arse", "dick", "cock",
+        "pussy", "cunt", "damn", "damnit", "bollocks", "twat", "wanker",
+        "piss", "pissed", "bullshit", "motherfucker", "motherfucking",
+        "fucking", "shitting", "bitching", "jackass", "douchebag",
+    ]
+    _profanity_checker.load_censor_words(custom_words=_SWEAR_WORDS)
+    PROFANITY_AVAILABLE = True
+except ImportError:
+    PROFANITY_AVAILABLE = False
+
 load_dotenv()
 print("✅ LXTE's AI v18.0.0 loaded")
 print("Tester v1 Loaded")
@@ -1212,7 +1226,7 @@ def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
     e.add_field(name="🤖 AI",        value=f"Channels: {ch_list('ai_channel_ids')} | Web: {'✅' if config.get('web_search', True) else '❌'}", inline=True)
     e.add_field(name="🎉 Giveaways", value=f"Channel: {ch('giveaway_channel_id')}", inline=True)
     e.add_field(name="💣 Anti-Nuke",  value=f"{'✅' if config.get('antinuke_enabled', True) else '❌'}", inline=True)
-    e.add_field(name="🚫 Anti-Spam",  value=f"{'✅' if config.get('antispam_enabled', True) else '❌'} | Caps: {'✅' if config.get('anti_caps_enabled', False) else '❌'} | Emoji: {'✅' if config.get('anti_emoji_spam_enabled', False) else '❌'}", inline=True)
+    e.add_field(name="🚫 Anti-Spam",  value=f"{'✅' if config.get('antispam_enabled', True) else '❌'} | Caps: {'✅' if config.get('anti_caps_enabled', False) else '❌'} | Emoji: {'✅' if config.get('anti_emoji_spam_enabled', False) else '❌'} | Swear: {'✅' if config.get('anti_swear_enabled', False) else '❌'}", inline=True)
     e.add_field(name="👻 Ghost/Mention", value=f"GhostPing: {'✅' if config.get('anti_ghost_ping_enabled', True) else '❌'} | MassMention: {'✅' if config.get('anti_mass_mention_enabled', True) else '❌'}", inline=True)
     e.set_footer(text="Admins only  •  Built by AJ  •  v18")
     return e
@@ -1352,6 +1366,9 @@ class AutomodSetupView(discord.ui.View):
 
     @discord.ui.button(label="Toggle Anti-Raid",  style=discord.ButtonStyle.secondary, row=2)
     async def t4(self, i, b): await self._toggle(i, "antiraid_enabled")
+
+    @discord.ui.button(label="Toggle Swear Filter", style=discord.ButtonStyle.secondary, row=2)
+    async def t5(self, i, b): await self._toggle(i, "anti_swear_enabled", default=False)
 
 
 # ── Ticket Setup ──────────────────────────────────────────────────────────────
@@ -2078,6 +2095,22 @@ async def _automod_emoji(message: discord.Message, config: dict) -> bool:
     return False
 
 
+async def _automod_swear(message: discord.Message, config: dict) -> bool:
+    """Swear word filter using better-profanity. Returns True if actioned."""
+    if not config.get("anti_swear_enabled", False): return False
+    if not PROFANITY_AVAILABLE: return False
+    if not _profanity_checker.contains_profanity(message.content): return False
+    try: await message.delete()
+    except Exception: pass
+    try: await message.channel.send(
+        embed=err(f"{message.author.mention} watch the language."),
+        delete_after=6,
+    )
+    except Exception: pass
+    _log_automod(message.guild, config, f"🤬 **Swear filter** — {message.author.mention}", C_WARNING)
+    return True
+
+
 async def run_automod(message: discord.Message, config: dict) -> bool:
     """Run all automod sub-checks in sequence. Returns True if message was actioned."""
     if not message.guild or not config.get("automod_enabled", True): return False
@@ -2088,7 +2121,8 @@ async def run_automod(message: discord.Message, config: dict) -> bool:
         await _automod_spam(message, config) or
         await _automod_mentions(message, config) or
         await _automod_caps(message, config) or
-        await _automod_emoji(message, config)
+        await _automod_emoji(message, config) or
+        await _automod_swear(message, config)
     )
 
 def _log_automod(guild: discord.Guild, config: dict, description: str, color: int = C_WARNING):
