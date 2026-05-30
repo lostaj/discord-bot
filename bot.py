@@ -1993,37 +1993,121 @@ def ai_embed(answer: str, ctx: commands.Context) -> discord.Embed:
     return e
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HELP SYSTEM  (restored from v13.0.1)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_help_embed(category: str, user=None) -> discord.Embed:
+    if category == "ai":
+        e = make_embed(C_AI, (
+            "`.ask <question>` — ask anything  (also `.ai` or `.q`)\n"
+            "@mention or reply to the bot works too.\n"
+            "Attach an image + ask to analyze it.\n\n"
+            "`.retry` — re-run your last question fresh\n"
+            "`.clear` — wipe your chat history\n\n"
+            "5s cooldown between questions."
+        ))
+        e.title     = "🤖 AI Commands"
+        e.set_footer(text="LXTE's AI", icon_url=bot.user.display_avatar.url if bot.user else None)
+        return e
+
+    elif category == "ascend":
+        ladder = "\n".join(f"Lv {lv} → {role}" for lv, role in LEVEL_ROLES)
+        e = make_embed(C_GOLD, (
+            "Messages earn 3–15 XP (×2 with Double XP role).\n"
+            f"+{STREAK_BONUS_XP} bonus XP for daily streak.\n"
+            f"Voice XP: +{VOICE_XP_PER_TICK} XP/min in voice (need 2+ people, not deafened).\n"
+            f"XP decays if inactive {XP_DECAY_DAYS}+ days (if enabled).\n\n"
+            "`.level [@user]` — rank card  (also `.xp`, `.profile`)\n"
+            "`/level [@user]` — slash version\n"
+            "`.lb` — leaderboard\n\n"
+            f"**Level Role Ladder**\n{ladder}"
+        ))
+        e.title     = "⬆️ Leveling"
+        e.set_footer(text="LXTE's AI", icon_url=bot.user.display_avatar.url if bot.user else None)
+        return e
+
+    elif category == "social":
+        e = make_embed(C_INFO, (
+            "`.afk <reason>` — set AFK\n"
+            "`.invites [@user]` — invite count\n"
+            "`.invitelb` — top inviters\n"
+            "`.boostlb` — boost leaderboard\n"
+            "`.analytics [growth|activity|streaks]` — server stats\n"
+            "`.serverinfo` — server details\n"
+            "`.userinfo [@user]` — user details\n"
+            "`.roleinfo @role` — role info\n"
+            "`.stats` — your AI usage\n"
+            "`.about` — bot info"
+        ))
+        e.title     = "💬 Social & Utility"
+        e.set_footer(text="LXTE's AI", icon_url=bot.user.display_avatar.url if bot.user else None)
+        return e
+
+    elif category == "admin":
+        e = make_embed(C_ERROR, (
+            "`.setup` — configure everything\n\n"
+            "`.admin status` — system stats\n"
+            "`.admin health` — service health\n"
+            "`.admin keys` — API key count\n"
+            "`.admin synccount` — force member count sync\n"
+            "`.admin clearuser <id>` — wipe user history\n"
+            "`.admin unlockraid` — manual raid unlock\n"
+            "`.admin resetxp <id>` — wipe XP\n"
+            "`.admin backup` — export server config\n"
+            "`.admin restore` — import server config\n"
+            "`.admin snapshot` — manual analytics snapshot"
+        ))
+        e.title     = "🛡️ Admin"
+        e.set_footer(text="LXTE's AI", icon_url=bot.user.display_avatar.url if bot.user else None)
+        return e
+
+    # Home / default
+    e = make_embed(C_PRIMARY, "Pick a category below.\nBuilt by AJ.")
+    e.title = "LXTE's AI"
+    e.set_thumbnail(url=bot.user.display_avatar.url if bot.user else None)
+    e.set_footer(text="Built by AJ  •  LXTE's AI v15  •  Prefix: .", icon_url=bot.user.display_avatar.url if bot.user else None)
+    return e
+
+
+class HelpView(discord.ui.View):
+    def __init__(self, ctx: commands.Context):
+        super().__init__(timeout=120)
+        self.ctx      = ctx
+        self._message = None
+
+        options = [
+            discord.SelectOption(label="Home",   value="home",   emoji="🏠"),
+            discord.SelectOption(label="AI",     value="ai",     emoji="🤖"),
+            discord.SelectOption(label="Ascend", value="ascend", emoji="⬆️"),
+            discord.SelectOption(label="Social", value="social", emoji="💬"),
+        ]
+        if ctx.author.id == getattr(ctx.bot, "owner_id_int", 0):
+            options.append(discord.SelectOption(label="Admin", value="admin", emoji="🛡️"))
+
+        select          = discord.ui.Select(placeholder="Pick a category…", options=options)
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            embed=build_help_embed(interaction.data["values"][0], interaction.client.user),
+            view=self,
+        )
+
+    async def on_timeout(self):
+        if self._message:
+            try:
+                await self._message.edit(view=None)
+            except Exception:
+                pass
+
+
 @bot.command(name="help", aliases=["h"])
 async def cmd_help(ctx: commands.Context):
-    e = make_embed(C_PRIMARY)
-    e.title = "LXTE's AI — Commands"
-    e.set_thumbnail(url=bot.user.display_avatar.url if bot.user else None)
-    e.add_field(name="🤖 AI", value=(
-        "`.ask <question>` — ask anything\n"
-        "`.retry` — re-run your last question\n"
-        "`.clear` — wipe your chat history\n"
-        "Mention me or reply to my messages to chat\n"
-        "Attach an image + ask to analyze it"
-    ), inline=False)
-    e.add_field(name="⬆️ Leveling", value=(
-        "`.level [@user]` — view rank card\n"
-        "`.lb` — XP leaderboard\n"
-        "`.analytics [growth|activity|streaks]`"
-    ), inline=False)
-    e.add_field(name="💬 Social", value=(
-        "`.afk <reason>` — set yourself as AFK\n"
-        "`.invites [@user]` — invite count\n"
-        "`.invitelb` — invite leaderboard\n"
-        "`.boostlb` — boost leaderboard\n"
-        "`.userinfo [@user]` · `.serverinfo` · `.roleinfo @role` · `.stats`"
-    ), inline=False)
-    if ctx.author.id == bot.owner_id_int:
-        e.add_field(name="🛡️ Admin (Owner Only)", value=(
-            "`.setup` — configure everything\n"
-            "`.admin status|health|keys|synccount|clearuser|resetxp|unlockraid|backup|restore|snapshot`"
-        ), inline=False)
-    e.set_footer(text="Built by AJ  •  LXTE's AI v15  •  Prefix: .")
-    await ctx.send(embed=e)
+    view    = HelpView(ctx)
+    message = await ctx.send(embed=build_help_embed("home", ctx.bot.user), view=view)
+    view._message = message
 
 
 @bot.command(name="ask", aliases=["ai", "q"])
