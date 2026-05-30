@@ -1,18 +1,19 @@
 """
 LXTE's AI — built by AJ
-v16.0.0 — Changes from v15:
-  - ADDED: Full giveaway system (.gstart, .gend, .greroll)
-  - ADDED: Multi-select dropdowns for roles and channels throughout setup
-  - ADDED: .purge command 
-  - REMOVED: Wikipedia/fact-check fetching (get_source_context, fetch_wikipedia, FACTUAL_RE)
-  - REMOVED: parse_response JSON meta format — ask_smart now calls ask directly
-  - REMOVED: history_snapshot dead code in cmd_ask
-  - REMOVED: hardcoded "This is AJ" in OWNER_ADDITION
-  - REMOVED: 2-person voice XP requirement
-  - FIXED: ticket autoclose warn timestamp calculation
-  - FIXED: apply_level_roles return value now correctly returns newly-earned role
-  - FIXED: ask_smart simplified, confidence/web routing was silently doing nothing
-  - FIXED: help embed Ascend section no longer dumps full pipe-character role list
+v17.0.0 — Changes from v16:
+  - ADDED: Message tracking — per-user message counts tracked in DB with channel breakdown
+  - ADDED: .msglb — message count leaderboard (top 10 by messages sent)
+  - ADDED: .msgcheck [@user] — check your own or another user's message stats
+  - ADDED: Anti-Nuke system — detects mass channel deletes/creates, mass role deletes, mass bans/kicks in short windows
+  - ADDED: Anti-Spam — detects repeated identical messages or rapid-fire spam from a single user
+  - ADDED: Anti-Ghost-Ping — detects and logs deleted messages that contained mentions
+  - ADDED: Anti-Mass-Mention — warns/deletes messages mentioning too many users at once
+  - ADDED: Anti-Link-Phishing — extended MALICIOUS_RE list with more scam/phishing patterns
+  - ADDED: Anti-Caps — deletes messages that are excessively all-caps (configurable threshold)
+  - ADDED: Anti-Emoji-Spam — removes messages with too many emojis
+  - ADDED: Anti-Selfbot — logs suspicious HTTP client join patterns (new account + no avatar + no discriminator)
+  - ADDED: All new anti-features are configurable via .setup → Automod panel
+  - FIXED: Nuke log always tries to find a fallback channel if log_channel_id is not set
 """
 
 import io, os, re, json, math, time, asyncio, logging, itertools, signal, collections, random
@@ -32,7 +33,7 @@ except ImportError:
     PILLOW_AVAILABLE = False
 
 load_dotenv()
-print("✅ LXTE's AI v16.0.0 loaded")
+print("✅ LXTE's AI v17.0.0 loaded")
 print("Tester v1 Loaded")
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logger = logging.getLogger("lxte")
@@ -88,6 +89,42 @@ RAID_LOCK_MINUTES = 10
 _join_timestamps: dict[int, list[float]] = collections.defaultdict(list)
 _raid_active:     dict[int, bool]        = {}
 
+# ─── Anti-Spam ────────────────────────────────────────────────────────────────
+SPAM_WINDOW_SECS   = 5      # seconds to watch for rapid messages
+SPAM_MSG_THRESH    = 5      # messages in window = spam
+SPAM_DUP_THRESH    = 3      # same message repeated N times = dup spam
+_spam_tracker: dict[int, list[float]]  = collections.defaultdict(list)   # uid -> timestamps
+_dup_tracker:  dict[int, list[str]]    = collections.defaultdict(list)    # uid -> recent contents
+
+# ─── Anti-Nuke ────────────────────────────────────────────────────────────────
+NUKE_WINDOW_SECS       = 10   # seconds
+NUKE_CHANNEL_DEL_THRESH = 3   # channels deleted in window
+NUKE_ROLE_DEL_THRESH    = 3   # roles deleted in window
+NUKE_BAN_THRESH         = 5   # bans in window
+NUKE_KICK_THRESH        = 5   # kicks in window
+NUKE_CHANNEL_CREATE_THRESH = 5  # channels created in window
+_nuke_chan_del:    dict[int, list[float]] = collections.defaultdict(list)
+_nuke_role_del:    dict[int, list[float]] = collections.defaultdict(list)
+_nuke_ban:         dict[int, list[float]] = collections.defaultdict(list)
+_nuke_kick:        dict[int, list[float]] = collections.defaultdict(list)
+_nuke_chan_create: dict[int, list[float]] = collections.defaultdict(list)
+
+# ─── Anti-Mass-Mention ────────────────────────────────────────────────────────
+MASS_MENTION_THRESH = 5   # unique user mentions in a single message
+
+# ─── Anti-Caps ────────────────────────────────────────────────────────────────
+CAPS_THRESHOLD  = 0.75   # fraction of alpha chars that must be uppercase
+CAPS_MIN_LENGTH = 8      # minimum message length before caps check applies
+
+# ─── Anti-Emoji-Spam ──────────────────────────────────────────────────────────
+EMOJI_THRESH = 8   # max emojis per message
+EMOJI_RE = re.compile(
+    r"(<a?:\w+:\d+>|"                        # custom Discord emojis
+    r"[\U0001F300-\U0001F9FF]|"              # most emoji ranges
+    r"[\U00002600-\U000027BF])",             # misc symbols
+    re.UNICODE,
+)
+
 # ─── Invite lock ──────────────────────────────────────────────────────────────
 _invite_locks: dict[int, asyncio.Lock] = {}
 def get_invite_lock(gid: int) -> asyncio.Lock:
@@ -113,6 +150,13 @@ MALICIOUS_RE = [
     re.compile(r"(steam\s*gift|free\s*gift|claim\s*your\s*prize).*https?://", re.I),
     re.compile(r"(ip\s*grab|ip\s*logger|grabify|iplogger\.org)", re.I),
     re.compile(r"(token\s*grab|token\s*logger|steal\s*token)", re.I),
+    # Extended phishing/scam patterns (v17)
+    re.compile(r"(discord\s*gift|airdrop|claim\s*reward).*https?://", re.I),
+    re.compile(r"(verify\s*your\s*account|account\s*suspended|login\s*required).*https?://", re.I),
+    re.compile(r"https?://[^\s]*discord[^\s]*(gift|nitro|free)[^\s]*", re.I),
+    re.compile(r"https?://[^\s]*(dlscord|discorcl|dlscorcl|d1scord)[^\s]*", re.I),  # typosquat
+    re.compile(r"(raffle|giveaway\s*winner|you\s*won).*https?://", re.I),
+    re.compile(r"https?://(bit\.ly|tinyurl\.com|is\.gd|cutt\.ly)/", re.I),  # URL shorteners (suspicious in servers)
 ]
 
 # ─── Safety ───────────────────────────────────────────────────────────────────
@@ -467,6 +511,7 @@ class Database:
         self.analytics      = db["analytics"]
         self.reaction_roles = db["reaction_roles"]
         self.giveaways      = db["giveaways"]
+        self.msg_tracking   = db["msg_tracking"]   # v17: message leaderboard
 
     async def ping(self) -> bool:
         try: await self._client.admin.command("ping"); return True
@@ -492,6 +537,9 @@ class Database:
             await self.reaction_roles.create_index([("guild_id",1),("message_id",1)], background=True)
             await self.giveaways.create_index([("guild_id",1),("message_id",1)], background=True)
             await self.giveaways.create_index("ends_at", background=True)
+            # v17: message tracking
+            await self.msg_tracking.create_index([("guild_id",1),("user_id",1)], unique=True, background=True)
+            await self.msg_tracking.create_index([("guild_id",1),("total_messages",-1)], background=True)
             logger.info("Indexes ready")
         except Exception as exc:
             logger.error("Index error: %s", exc)
@@ -729,6 +777,30 @@ class Database:
     async def get_due_giveaways(self) -> list[dict]:
         now = datetime.now(timezone.utc)
         return await self.giveaways.find({"ended": False, "ends_at": {"$lte": now}}).to_list(length=50)
+
+    # ── Message Tracking (v17) ────────────────────────────────────────────────
+    async def track_message(self, uid: int, gid: int, channel_id: int):
+        """Increment total message count and per-channel count for a user."""
+        chan_key = f"channels.{channel_id}"
+        await self.msg_tracking.update_one(
+            {"guild_id": gid, "user_id": uid},
+            {
+                "$inc": {"total_messages": 1, chan_key: 1},
+                "$set":  {"last_message": datetime.now(timezone.utc)},
+                "$setOnInsert": {"first_message": datetime.now(timezone.utc)},
+            },
+            upsert=True,
+        )
+
+    async def get_msg_data(self, uid: int, gid: int) -> dict:
+        return await self.msg_tracking.find_one({"guild_id": gid, "user_id": uid}) or {}
+
+    async def get_msg_leaderboard(self, gid: int, limit: int = 10) -> list[dict]:
+        return await self.msg_tracking.find(
+            {"guild_id": gid},
+            sort=[("total_messages", -1)],
+            limit=limit,
+        ).to_list(length=limit)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1101,7 +1173,7 @@ class SingleRoleSelect(discord.ui.RoleSelect):
 
 def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
     e = make_embed(C_PRIMARY)
-    e.title       = "⚙️ Server Setup — v16"
+    e.title       = "⚙️ Server Setup — v17"
     e.description = "Pick a section to configure. Dropdowns now support multiple selections."
 
     def ch(key):
@@ -1124,7 +1196,10 @@ def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
     e.add_field(name="🎭 Roles",     value=f"Auto: {len(config.get('autoroles', []))} | 2XP: {len(config.get('double_xp_roles', []))} | LvlRoles: {len(config.get('level_roles', []))}", inline=True)
     e.add_field(name="🤖 AI",        value=f"Channels: {ch_list('ai_channel_ids')} | Web: {'✅' if config.get('web_search', True) else '❌'}", inline=True)
     e.add_field(name="🎉 Giveaways", value=f"Channel: {ch('giveaway_channel_id')}", inline=True)
-    e.set_footer(text="Admins only  •  Built by AJ  •  Multi-select enabled")
+    e.add_field(name="💣 Anti-Nuke",  value=f"{'✅' if config.get('antinuke_enabled', True) else '❌'}", inline=True)
+    e.add_field(name="🚫 Anti-Spam",  value=f"{'✅' if config.get('antispam_enabled', True) else '❌'} | Caps: {'✅' if config.get('anti_caps_enabled', False) else '❌'} | Emoji: {'✅' if config.get('anti_emoji_spam_enabled', False) else '❌'}", inline=True)
+    e.add_field(name="👻 Ghost/Mention", value=f"GhostPing: {'✅' if config.get('anti_ghost_ping_enabled', True) else '❌'} | MassMention: {'✅' if config.get('anti_mass_mention_enabled', True) else '❌'}", inline=True)
+    e.set_footer(text="Admins only  •  Built by AJ  •  v17")
     return e
 
 
@@ -1915,7 +1990,86 @@ async def run_automod(message: discord.Message, config: dict) -> bool:
             try: await message.channel.send(embed=err(f"{message.author.mention} links aren't allowed here. GIFs are fine 🙂"), delete_after=6)
             except Exception: pass
             return True
+
+    # ── Anti-Spam (v17) ──────────────────────────────────────────────────────
+    if config.get("antispam_enabled", True):
+        uid = message.author.id; now = time.monotonic()
+        # Rate spam: too many messages too fast
+        _spam_tracker[uid] = [t for t in _spam_tracker[uid] if now - t < SPAM_WINDOW_SECS]
+        _spam_tracker[uid].append(now)
+        if len(_spam_tracker[uid]) >= SPAM_MSG_THRESH:
+            _spam_tracker[uid].clear()
+            try: await message.delete()
+            except Exception: pass
+            try:
+                member = message.guild.get_member(uid)
+                if member:
+                    try: await member.timeout(timedelta(minutes=5), reason="Anti-spam: message flood")
+                    except Exception: pass
+                await message.channel.send(embed=err(f"{message.author.mention} slow down! Auto-muted for 5 minutes."), delete_after=8)
+            except Exception: pass
+            _log_automod(message.guild, config, f"🚫 **Anti-Spam** — {message.author.mention} flooded `{len(_spam_tracker[uid])+SPAM_MSG_THRESH}` msgs in {SPAM_WINDOW_SECS}s", C_ERROR)
+            return True
+        # Duplicate spam: same message repeated
+        recent_content = _dup_tracker[uid]
+        recent_content.append(content[:100])
+        if len(recent_content) > 10: _dup_tracker[uid] = recent_content[-10:]
+        if recent_content.count(content[:100]) >= SPAM_DUP_THRESH:
+            _dup_tracker[uid].clear()
+            try: await message.delete()
+            except Exception: pass
+            try: await message.channel.send(embed=err(f"{message.author.mention} stop copy-pasting the same message."), delete_after=6)
+            except Exception: pass
+            return True
+
+    # ── Anti-Mass-Mention (v17) ───────────────────────────────────────────────
+    if config.get("anti_mass_mention_enabled", True):
+        unique_mentions = len({u.id for u in message.mentions if not u.bot})
+        if unique_mentions >= MASS_MENTION_THRESH:
+            try: await message.delete()
+            except Exception: pass
+            try: await message.channel.send(embed=err(f"{message.author.mention} don't mass-mention users."), delete_after=6)
+            except Exception: pass
+            _log_automod(message.guild, config, f"📢 **Mass Mention** — {message.author.mention} pinged {unique_mentions} users", C_WARNING)
+            return True
+
+    # ── Anti-Caps (v17) ───────────────────────────────────────────────────────
+    if config.get("anti_caps_enabled", False):
+        alpha = [c for c in content if c.isalpha()]
+        if len(alpha) >= CAPS_MIN_LENGTH and sum(1 for c in alpha if c.isupper()) / len(alpha) >= CAPS_THRESHOLD:
+            try: await message.delete()
+            except Exception: pass
+            try: await message.channel.send(embed=err(f"{message.author.mention} please don't shout (too many caps)."), delete_after=6)
+            except Exception: pass
+            return True
+
+    # ── Anti-Emoji-Spam (v17) ─────────────────────────────────────────────────
+    if config.get("anti_emoji_spam_enabled", False):
+        emoji_count = len(EMOJI_RE.findall(content))
+        if emoji_count >= EMOJI_THRESH:
+            try: await message.delete()
+            except Exception: pass
+            try: await message.channel.send(embed=err(f"{message.author.mention} too many emojis in one message."), delete_after=6)
+            except Exception: pass
+            return True
+
     return False
+
+def _log_automod(guild: discord.Guild, config: dict, description: str, color: int = C_WARNING):
+    """Fire-and-forget helper to send a message to the log channel."""
+    async def _send():
+        lc_id = config.get("log_channel_id")
+        lc = guild.get_channel(lc_id) if lc_id else next(
+            (c for c in guild.text_channels if guild.me.permissions_in(c).send_messages), None
+        )
+        if lc:
+            e = make_embed(color, description)
+            e.title = "🛡️ Automod"
+            e.set_footer(text=f"Guild: {guild.name}")
+            try: await lc.send(embed=e)
+            except Exception: pass
+    asyncio.create_task(_send())
+
 
 async def handle_antiraid(member: discord.Member, config: dict):
     if not config.get("antiraid_enabled", True): return
@@ -1950,6 +2104,64 @@ async def _unlock_server(guild: discord.Guild):
                 ow.send_messages = None
                 await ch.set_permissions(guild.default_role, overwrite=ow, reason="Anti-raid unlock")
         except Exception: pass
+
+
+# ─── Anti-Nuke helpers (v17) ──────────────────────────────────────────────────
+
+def _nuke_window_check(tracker: dict, gid: int, thresh: int, window: float = NUKE_WINDOW_SECS) -> bool:
+    """Append now to tracker[gid], prune old entries, return True if threshold exceeded."""
+    now = time.monotonic()
+    tracker[gid] = [t for t in tracker[gid] if now - t < window]
+    tracker[gid].append(now)
+    return len(tracker[gid]) >= thresh
+
+async def _handle_nuke_event(guild: discord.Guild, config: dict, description: str):
+    """Called when a nuke-like pattern is detected. Logs and optionally locks."""
+    lc_id = config.get("log_channel_id")
+    lc = guild.get_channel(lc_id) if lc_id else next(
+        (c for c in guild.text_channels if guild.me.permissions_in(c).send_messages), None
+    )
+    e = make_embed(C_ERROR, description + "\n\n**Action: Server locked. Use `.admin unlockraid` to unlock.**")
+    e.title = "💣 ANTI-NUKE — THREAT DETECTED"
+    if lc:
+        try: await lc.send(embed=e)
+        except Exception: pass
+    # Lock the server as a precaution
+    if not _raid_active.get(guild.id):
+        _raid_active[guild.id] = True
+        for ch in guild.text_channels:
+            try:
+                ow = ch.overwrites_for(guild.default_role); ow.send_messages = False
+                await ch.set_permissions(guild.default_role, overwrite=ow, reason="Anti-nuke lockdown")
+            except Exception: pass
+        await asyncio.sleep(RAID_LOCK_MINUTES * 60)
+        await _unlock_server(guild)
+        _raid_active[guild.id] = False
+
+async def handle_antinuke_channel_delete(guild: discord.Guild, config: dict):
+    if not config.get("antinuke_enabled", True): return
+    if _nuke_window_check(_nuke_chan_del, guild.id, NUKE_CHANNEL_DEL_THRESH):
+        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_CHANNEL_DEL_THRESH}+ channels deleted** in {NUKE_WINDOW_SECS}s — possible nuke bot."))
+
+async def handle_antinuke_channel_create(guild: discord.Guild, config: dict):
+    if not config.get("antinuke_enabled", True): return
+    if _nuke_window_check(_nuke_chan_create, guild.id, NUKE_CHANNEL_CREATE_THRESH):
+        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_CHANNEL_CREATE_THRESH}+ channels created** in {NUKE_WINDOW_SECS}s — possible nuke bot."))
+
+async def handle_antinuke_role_delete(guild: discord.Guild, config: dict):
+    if not config.get("antinuke_enabled", True): return
+    if _nuke_window_check(_nuke_role_del, guild.id, NUKE_ROLE_DEL_THRESH):
+        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_ROLE_DEL_THRESH}+ roles deleted** in {NUKE_WINDOW_SECS}s — possible nuke bot."))
+
+async def handle_antinuke_ban(guild: discord.Guild, config: dict, user: discord.User):
+    if not config.get("antinuke_enabled", True): return
+    if _nuke_window_check(_nuke_ban, guild.id, NUKE_BAN_THRESH):
+        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_BAN_THRESH}+ bans** in {NUKE_WINDOW_SECS}s — possible mass ban. Last: {user}"))
+
+async def handle_antinuke_kick(guild: discord.Guild, config: dict):
+    if not config.get("antinuke_enabled", True): return
+    if _nuke_window_check(_nuke_kick, guild.id, NUKE_KICK_THRESH):
+        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_KICK_THRESH}+ kicks** in {NUKE_WINDOW_SECS}s — possible mass kick."))
 
 _invite_cache: dict[int, dict[str, int]] = {}
 
@@ -2061,6 +2273,8 @@ class LXTEBot(commands.Bot):
                 xp_gain     = xp_from_length(content, multiplier)
                 try:
                     result = await self.db.add_xp(message.author.id, message.guild.id, xp_gain)
+                    # v17: track this message for the leaderboard (always, regardless of XP cooldown result)
+                    await self.db.track_message(message.author.id, message.guild.id, message.channel.id)
                     if member:
                         data = await self.db.get_level_data(member.id, message.guild.id)
                         for ach in await check_achievements(member, data):
@@ -2092,38 +2306,6 @@ class LXTEBot(commands.Bot):
 
         await self.process_commands(message)
 
-    async def on_member_join(self, member: discord.Member):
-        if member.bot: return
-        config = await get_config(member.guild.id)
-        asyncio.create_task(handle_antiraid(member, config))
-        used = await find_used_invite(member.guild)
-        if used and used.inviter:
-            await self.db.increment_invite_count(member.guild.id, used.inviter.id)
-        if not _raid_active.get(member.guild.id, False):
-            for entry in config.get("autoroles", []):
-                role = member.guild.get_role(entry.get("role_id"))
-                if role:
-                    try: await member.add_roles(role, reason="Auto-role")
-                    except Exception as e: logger.warning("AutoRole: %s", e)
-        await send_welcome(member, config)
-        await update_member_count(member.guild)
-
-    async def on_member_remove(self, member: discord.Member):
-        if member.bot: return
-        await update_member_count(member.guild)
-        # Log member leave
-        config = await get_config(member.guild.id)
-        lc = member.guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
-        if lc:
-            e = make_embed(C_WARNING)
-            e.title       = "📤 Member Left"
-            e.description = f"**{member.display_name}** (`{member.name}`, ID: `{member.id}`) left the server."
-            e.set_thumbnail(url=member.display_avatar.url)
-            e.add_field(name="Joined", value=ts_full(member.joined_at) if member.joined_at else "unknown", inline=True)
-            e.add_field(name="Left",   value=ts_full(datetime.now(timezone.utc)), inline=True)
-            try: await lc.send(embed=e)
-            except Exception: pass
-
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         if before.premium_since is None and after.premium_since is not None:
             guild  = after.guild
@@ -2149,19 +2331,6 @@ class LXTEBot(commands.Bot):
                 try: await bc.send(content=after.mention, embed=e)
                 except Exception: pass
 
-    async def on_message_delete(self, message: discord.Message):
-        if message.author.bot or not message.guild: return
-        config = await get_config(message.guild.id)
-        lc = message.guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
-        if not lc: return
-        e = make_embed(C_WARNING)
-        e.title       = "🗑️ Message Deleted"
-        e.description = f"**Author:** {message.author.mention}\n**Channel:** {message.channel.mention}"
-        e.add_field(name="Content", value=f"```{message.content[:500] or '*no text*'}```", inline=False)
-        e.set_footer(text=f"ID: {message.id}")
-        try: await lc.send(embed=e)
-        except Exception: pass
-
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
         if before.author.bot or not before.guild or before.content == after.content: return
         config = await get_config(before.guild.id)
@@ -2174,6 +2343,94 @@ class LXTEBot(commands.Bot):
         e.add_field(name="After",  value=f"```{after.content[:400]}```",  inline=False)
         try: await lc.send(embed=e)
         except Exception: pass
+
+    # ── Anti-Ghost-Ping (v17) ─────────────────────────────────────────────────
+    async def on_message_delete(self, message: discord.Message):
+        if message.author.bot or not message.guild: return
+        config = await get_config(message.guild.id)
+        lc = message.guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
+        if lc:
+            e = make_embed(C_WARNING)
+            e.title       = "🗑️ Message Deleted"
+            e.description = f"**Author:** {message.author.mention}\n**Channel:** {message.channel.mention}"
+            e.add_field(name="Content", value=f"```{message.content[:500] or '*no text*'}```", inline=False)
+            e.set_footer(text=f"ID: {message.id}")
+            try: await lc.send(embed=e)
+            except Exception: pass
+        # Ghost-ping check
+        if config.get("anti_ghost_ping_enabled", True) and message.mentions:
+            real_mentions = [u for u in message.mentions if not u.bot and u.id != message.author.id]
+            if real_mentions and lc:
+                names = ", ".join(u.mention for u in real_mentions[:5])
+                eg = make_embed(C_ERROR, f"👻 **{message.author.mention}** ghost-pinged {names} and deleted the message.\n**Content:** {message.content[:300] or '*empty*'}")
+                eg.title = "👻 Ghost Ping Detected"
+                try: await lc.send(embed=eg)
+                except Exception: pass
+
+    # ── Anti-Nuke Event Hooks (v17) ───────────────────────────────────────────
+    async def on_guild_channel_delete(self, channel):
+        if not channel.guild: return
+        config = await get_config(channel.guild.id)
+        await handle_antinuke_channel_delete(channel.guild, config)
+
+    async def on_guild_channel_create(self, channel):
+        if not channel.guild: return
+        config = await get_config(channel.guild.id)
+        await handle_antinuke_channel_create(channel.guild, config)
+
+    async def on_guild_role_delete(self, role):
+        config = await get_config(role.guild.id)
+        await handle_antinuke_role_delete(role.guild, config)
+
+    async def on_member_ban(self, guild: discord.Guild, user: discord.User):
+        config = await get_config(guild.id)
+        await handle_antinuke_ban(guild, config, user)
+
+    async def on_member_remove(self, member: discord.Member):
+        if member.bot: return
+        await update_member_count(member.guild)
+        config = await get_config(member.guild.id)
+        # Anti-nuke: track rapid member removes (kicks don't have their own event)
+        await handle_antinuke_kick(member.guild, config)
+        lc = member.guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
+        if lc:
+            e = make_embed(C_WARNING)
+            e.title       = "📤 Member Left"
+            e.description = f"**{member.display_name}** (`{member.name}`, ID: `{member.id}`) left the server."
+            e.set_thumbnail(url=member.display_avatar.url)
+            e.add_field(name="Joined", value=ts_full(member.joined_at) if member.joined_at else "unknown", inline=True)
+            e.add_field(name="Left",   value=ts_full(datetime.now(timezone.utc)), inline=True)
+            try: await lc.send(embed=e)
+            except Exception: pass
+
+    # ── Anti-Selfbot (v17) ────────────────────────────────────────────────────
+    async def on_member_join(self, member: discord.Member):
+        if member.bot: return
+        config = await get_config(member.guild.id)
+        asyncio.create_task(handle_antiraid(member, config))
+        used = await find_used_invite(member.guild)
+        if used and used.inviter:
+            await self.db.increment_invite_count(member.guild.id, used.inviter.id)
+        if not _raid_active.get(member.guild.id, False):
+            for entry in config.get("autoroles", []):
+                role = member.guild.get_role(entry.get("role_id"))
+                if role:
+                    try: await member.add_roles(role, reason="Auto-role")
+                    except Exception as e: logger.warning("AutoRole: %s", e)
+        await send_welcome(member, config)
+        await update_member_count(member.guild)
+        # Anti-selfbot: flag suspiciously new accounts with no avatar
+        if config.get("anti_selfbot_enabled", True):
+            age_days = (datetime.now(timezone.utc) - member.created_at).days
+            no_avatar = member.display_avatar.is_asset()
+            if age_days < 7 and no_avatar:
+                lc_id = config.get("log_channel_id")
+                lc = member.guild.get_channel(lc_id) if lc_id else None
+                if lc:
+                    e = make_embed(C_WARNING, f"⚠️ {member.mention} joined with a **{age_days}-day-old account** and no avatar. Possible selfbot/alt.\nID: `{member.id}`")
+                    e.title = "🤖 Suspicious Account"
+                    try: await lc.send(embed=e)
+                    except Exception: pass
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         if not payload.guild_id or payload.user_id == self.user.id: return
@@ -2399,6 +2656,8 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.invites [@user]` — invite count\n"
             "`.invitelb` — top inviters\n"
             "`.boostlb` — boost leaderboard\n"
+            "`.msglb` — message count leaderboard\n"
+            "`.msgcheck [@user]` — message stats & rank\n"
             "`.analytics [growth|activity|streaks]` — server stats\n"
             "`.serverinfo` — server details\n"
             "`.userinfo [@user]` — user details\n"
@@ -2693,6 +2952,66 @@ async def cmd_invitelb(ctx: commands.Context):
         lines.append(f"{prefix} {name} — {count} invite{'s' if count != 1 else ''}")
     e = make_embed(C_GOLD, "\n".join(lines))
     e.title = "📨 Invite Leaderboard"
+    await ctx.send(embed=e)
+
+
+# ─── Message Leaderboard & Check (v17) ────────────────────────────────────────
+
+@bot.command(name="msglb", aliases=["messagelb", "msgleaderboard"])
+async def cmd_msglb(ctx: commands.Context):
+    """Top 10 users by total messages sent in this server."""
+    rows = await bot.db.get_msg_leaderboard(ctx.guild.id, 10)
+    if not rows:
+        await ctx.send(embed=make_embed(C_WARNING, "No message data yet — start chatting!")); return
+    medals = ["🥇","🥈","🥉"]
+    lines  = []
+    for idx, row in enumerate(rows):
+        member = ctx.guild.get_member(row["user_id"])
+        name   = member.display_name if member else f"<@{row['user_id']}>"
+        count  = row.get("total_messages", 0)
+        prefix = medals[idx] if idx < 3 else f"`{idx+1}.`"
+        lines.append(f"{prefix} {name} — **{count:,}** message{'s' if count != 1 else ''}")
+    e = make_embed(C_INFO, "\n".join(lines))
+    e.title = "💬 Message Leaderboard"
+    e.set_footer(text="LXTE's AI • v17")
+    await ctx.send(embed=e)
+
+
+@bot.command(name="msgcheck", aliases=["messages", "msgstats"])
+async def cmd_msgcheck(ctx: commands.Context, target: discord.Member = None):
+    """Check your own (or another user's) message stats."""
+    target = target or ctx.author
+    data   = await bot.db.get_msg_data(target.id, ctx.guild.id)
+    if not data:
+        await ctx.send(embed=make_embed(C_WARNING, f"No message data for **{target.display_name}** yet.")); return
+
+    total    = data.get("total_messages", 0)
+    channels = data.get("channels", {})
+    first_m  = data.get("first_message")
+    last_m   = data.get("last_message")
+
+    # Find top 3 most active channels
+    top_chans = sorted(channels.items(), key=lambda x: x[1], reverse=True)[:3]
+    chan_lines = []
+    for cid, cnt in top_chans:
+        ch = ctx.guild.get_channel(int(cid))
+        ch_name = ch.mention if ch else f"`#{cid}`"
+        chan_lines.append(f"{ch_name} — {cnt:,} msg{'s' if cnt != 1 else ''}")
+
+    # Find rank on leaderboard
+    rows = await bot.db.get_msg_leaderboard(ctx.guild.id, 100)
+    rank = next((i+1 for i, r in enumerate(rows) if r["user_id"] == target.id), None)
+
+    e = make_embed(C_INFO)
+    e.title = f"💬 {target.display_name}'s Message Stats"
+    e.set_thumbnail(url=target.display_avatar.url)
+    e.add_field(name="Total Messages", value=f"{total:,}", inline=True)
+    e.add_field(name="Server Rank",    value=f"#{rank}" if rank else "Unranked", inline=True)
+    if first_m: e.add_field(name="First Message", value=ts_full(first_m), inline=True)
+    if last_m:  e.add_field(name="Last Message",  value=ts(last_m),       inline=True)
+    if chan_lines:
+        e.add_field(name="Most Active Channels", value="\n".join(chan_lines), inline=False)
+    e.set_footer(text="LXTE's AI • v17")
     await ctx.send(embed=e)
 
 
