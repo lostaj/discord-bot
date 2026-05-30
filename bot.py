@@ -2658,13 +2658,14 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.boostlb` — boost leaderboard\n"
             "`.msglb` — message count leaderboard\n"
             "`.msgcheck [@user]` — message stats & rank\n"
+            "`.msgsync [limit]` — backfill all message history (admins)\n"
             "`.analytics [growth|activity|streaks]` — server stats\n"
             "`.serverinfo` — server details\n"
             "`.userinfo [@user]` — user details\n"
             "`.roleinfo @role` — role info\n"
             "`.stats` — your AI usage\n"
             "`.about` — bot info\n"
-            "`.purge <amount>` — delete messages (admins)"
+            "`.purge <amount>` — delete messages (admins)\n"
             "`.syncroles` — sync auto-roles and level roles for all members (admins)"
         ))
         e.title = "💬 Social & Utility"
@@ -3013,6 +3014,109 @@ async def cmd_msgcheck(ctx: commands.Context, target: discord.Member = None):
         e.add_field(name="Most Active Channels", value="\n".join(chan_lines), inline=False)
     e.set_footer(text="LXTE's AI • v17")
     await ctx.send(embed=e)
+
+
+# ─── Message History Sync (v17) ───────────────────────────────────────────────
+
+@bot.command(name="msgsync", aliases=["synccmessages", "syncmsg"])
+@commands.has_permissions(administrator=True)
+async def cmd_msgsync(ctx: commands.Context, limit: int = 500):
+    """
+    Backfill message counts for all existing members by scanning channel histories.
+    Usage: .msgsync [limit_per_channel]
+    limit = max messages to read per channel (default 500, max 10000).
+    Owner can go higher. Admins capped at 10000.
+    This can take a while — a progress message updates every 5 channels.
+    """
+    is_owner = ctx.author.id == bot.owner_id_int
+    max_limit = 100_000 if is_owner else 10_000
+    limit = max(50, min(limit, max_limit))
+
+    channels = [ch for ch in ctx.guild.text_channels
+                if ch.permissions_for(ctx.guild.me).read_message_history]
+
+    status_msg = await ctx.send(embed=make_embed(C_INFO,
+        f"⏳ Starting message sync…\n"
+        f"Scanning **{len(channels)}** channels · **{limit:,}** msgs/channel\n"
+        f"This may take a few minutes."
+    ))
+
+    # counts[user_id][channel_id] = count
+    counts: dict[int, dict[int, int]] = collections.defaultdict(lambda: collections.defaultdict(int))
+    # Track first/last message timestamps per user
+    first_seen: dict[int, datetime] = {}
+    last_seen:  dict[int, datetime] = {}
+
+    total_scanned = 0
+    total_channels_done = 0
+
+    for ch in channels:
+        try:
+            async for msg in ch.history(limit=limit, oldest_first=True):
+                if msg.author.bot:
+                    continue
+                uid = msg.author.id
+                counts[uid][ch.id] += 1
+                total_scanned += 1
+                ts_msg = msg.created_at.replace(tzinfo=timezone.utc) if msg.created_at.tzinfo is None else msg.created_at
+                if uid not in first_seen or ts_msg < first_seen[uid]:
+                    first_seen[uid] = ts_msg
+                if uid not in last_seen or ts_msg > last_seen[uid]:
+                    last_seen[uid] = ts_msg
+        except discord.Forbidden:
+            pass
+        except Exception as exc:
+            logger.warning("msgsync channel %s: %s", ch.name, exc)
+
+        total_channels_done += 1
+        # Update status every 5 channels
+        if total_channels_done % 5 == 0 or total_channels_done == len(channels):
+            try:
+                await status_msg.edit(embed=make_embed(C_INFO,
+                    f"⏳ Scanning… `{total_channels_done}/{len(channels)}` channels done\n"
+                    f"**{total_scanned:,}** messages counted so far across **{len(counts)}** users"
+                ))
+            except Exception:
+                pass
+
+    # Write to DB — upsert each user, adding to existing counts
+    written = 0
+    for uid, chan_map in counts.items():
+        total_for_user = sum(chan_map.values())
+        # Build $inc payload for per-channel counts
+        chan_inc = {f"channels.{cid}": cnt for cid, cnt in chan_map.items()}
+        chan_inc["total_messages"] = total_for_user
+
+        set_payload: dict = {}
+        if uid in last_seen:
+            set_payload["last_message"] = last_seen[uid]
+
+        update: dict = {"$inc": chan_inc}
+        if set_payload:
+            update["$set"] = set_payload
+        # Only set first_message if it doesn't exist yet (don't overwrite a newer stored value)
+        if uid in first_seen:
+            update["$min"] = {"first_message": first_seen[uid]}
+
+        try:
+            await bot.db.msg_tracking.update_one(
+                {"guild_id": ctx.guild.id, "user_id": uid},
+                update,
+                upsert=True,
+            )
+            written += 1
+        except Exception as exc:
+            logger.warning("msgsync write uid=%s: %s", uid, exc)
+
+    e = make_embed(C_SUCCESS,
+        f"✅ **Sync complete!**\n\n"
+        f"Channels scanned : **{total_channels_done}**\n"
+        f"Messages counted : **{total_scanned:,}**\n"
+        f"Users updated    : **{written}**\n\n"
+        f"Run `.msglb` to see the leaderboard."
+    )
+    e.title = "💬 Message Sync Done"
+    await status_msg.edit(embed=e)
 
 
 @bot.command(name="boostlb", aliases=["boosters"])
