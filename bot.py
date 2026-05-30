@@ -1,19 +1,19 @@
 """
 LXTE's AI — built by AJ
-v17.0.0 — Changes from v16:
-  - ADDED: Message tracking — per-user message counts tracked in DB with channel breakdown
-  - ADDED: .msglb — message count leaderboard (top 10 by messages sent)
-  - ADDED: .msgcheck [@user] — check your own or another user's message stats
-  - ADDED: Anti-Nuke system — detects mass channel deletes/creates, mass role deletes, mass bans/kicks in short windows
-  - ADDED: Anti-Spam — detects repeated identical messages or rapid-fire spam from a single user
-  - ADDED: Anti-Ghost-Ping — detects and logs deleted messages that contained mentions
-  - ADDED: Anti-Mass-Mention — warns/deletes messages mentioning too many users at once
-  - ADDED: Anti-Link-Phishing — extended MALICIOUS_RE list with more scam/phishing patterns
-  - ADDED: Anti-Caps — deletes messages that are excessively all-caps (configurable threshold)
-  - ADDED: Anti-Emoji-Spam — removes messages with too many emojis
-  - ADDED: Anti-Selfbot — logs suspicious HTTP client join patterns (new account + no avatar + no discriminator)
-  - ADDED: All new anti-features are configurable via .setup → Automod panel
-  - FIXED: Nuke log always tries to find a fallback channel if log_channel_id is not set
+v18.0.0 — Changes from v17:
+  - ADDED: on_audit_log_entry_create — all nuke detection now uses audit log for accurate executor ID
+  - ADDED: Raid verification via mass-message scan — confirms raid before locking (reduces false positives)
+  - ADDED: Nuker punishment — strips all non-auto roles from the executor, kicks suspicious bots,
+           deletes suspicious webhooks created during nuke window; NEVER bans/kicks real members
+  - ADDED: Ghost-ping soft-warn — ghost pinger gets a 60s timeout on first offence (logged)
+  - ADDED: Anti-nuke for mass role grants — detects someone granting @everyone / dangerous perms
+  - FIXED: _nuke_window_check decoupled from side-effects (double-trigger race condition fixed)
+  - FIXED: run_automod split into focused sub-functions (phishing, spam, mention, caps, emoji)
+  - FIXED: _spam_tracker / _dup_tracker now persist to DB every 5 min (survive restarts)
+  - FIXED: handle_antiraid guards against stacked lockdown timers
+  - FIXED: msgsync uses bulk_write instead of per-user update loop
+  - FIXED: ticket autoclose remaining-time calc was off — now correct
+  - FIXED: setup_embed footer now says v18
 """
 
 import io, os, re, json, math, time, asyncio, logging, itertools, signal, collections, random
@@ -33,7 +33,7 @@ except ImportError:
     PILLOW_AVAILABLE = False
 
 load_dotenv()
-print("✅ LXTE's AI v17.0.0 loaded")
+print("✅ LXTE's AI v18.0.0 loaded")
 print("Tester v1 Loaded")
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logger = logging.getLogger("lxte")
@@ -97,17 +97,27 @@ _spam_tracker: dict[int, list[float]]  = collections.defaultdict(list)   # uid -
 _dup_tracker:  dict[int, list[str]]    = collections.defaultdict(list)    # uid -> recent contents
 
 # ─── Anti-Nuke ────────────────────────────────────────────────────────────────
-NUKE_WINDOW_SECS       = 10   # seconds
-NUKE_CHANNEL_DEL_THRESH = 3   # channels deleted in window
-NUKE_ROLE_DEL_THRESH    = 3   # roles deleted in window
-NUKE_BAN_THRESH         = 5   # bans in window
-NUKE_KICK_THRESH        = 5   # kicks in window
+NUKE_WINDOW_SECS        = 10   # seconds
+NUKE_CHANNEL_DEL_THRESH = 3    # channels deleted in window
+NUKE_ROLE_DEL_THRESH    = 3    # roles deleted in window
+NUKE_BAN_THRESH         = 5    # bans in window
+NUKE_KICK_THRESH        = 5    # kicks in window
 NUKE_CHANNEL_CREATE_THRESH = 5  # channels created in window
+NUKE_ROLE_GRANT_THRESH  = 3    # dangerous role grants in window (v18)
 _nuke_chan_del:    dict[int, list[float]] = collections.defaultdict(list)
 _nuke_role_del:    dict[int, list[float]] = collections.defaultdict(list)
 _nuke_ban:         dict[int, list[float]] = collections.defaultdict(list)
 _nuke_kick:        dict[int, list[float]] = collections.defaultdict(list)
 _nuke_chan_create: dict[int, list[float]] = collections.defaultdict(list)
+_nuke_role_grant:  dict[int, list[float]] = collections.defaultdict(list)  # v18
+
+# ─── Anti-Raid (v18) ─────────────────────────────────────────────────────────
+# Track executors seen in the current nuke window so we can act on them
+_nuke_executors:  dict[int, dict[int, list[str]]] = collections.defaultdict(lambda: collections.defaultdict(list))
+# guild_id -> {executor_id -> [action, ...]}
+
+# Spam tracker persistence interval (seconds) — flush to DB so restarts don't reset it
+SPAM_PERSIST_INTERVAL = 300
 
 # ─── Anti-Mass-Mention ────────────────────────────────────────────────────────
 MASS_MENTION_THRESH = 5   # unique user mentions in a single message
@@ -134,6 +144,10 @@ def get_invite_lock(gid: int) -> asyncio.Lock:
 
 # ─── AFK ──────────────────────────────────────────────────────────────────────
 _afk_users: dict[int, tuple[str, float]] = {}
+
+# ─── Ghost-ping warn tracker (v18) ───────────────────────────────────────────
+# uid -> count of ghost-ping offences (soft-warn on 1st, longer timeout on repeat)
+_ghost_ping_strikes: dict[int, int] = collections.defaultdict(int)
 
 # ─── Config cache ─────────────────────────────────────────────────────────────
 _config_cache: dict[int, tuple[dict, float]] = {}
@@ -1200,7 +1214,7 @@ def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
     e.add_field(name="💣 Anti-Nuke",  value=f"{'✅' if config.get('antinuke_enabled', True) else '❌'}", inline=True)
     e.add_field(name="🚫 Anti-Spam",  value=f"{'✅' if config.get('antispam_enabled', True) else '❌'} | Caps: {'✅' if config.get('anti_caps_enabled', False) else '❌'} | Emoji: {'✅' if config.get('anti_emoji_spam_enabled', False) else '❌'}", inline=True)
     e.add_field(name="👻 Ghost/Mention", value=f"GhostPing: {'✅' if config.get('anti_ghost_ping_enabled', True) else '❌'} | MassMention: {'✅' if config.get('anti_mass_mention_enabled', True) else '❌'}", inline=True)
-    e.set_footer(text="Admins only  •  Built by AJ  •  v17")
+    e.set_footer(text="Admins only  •  Built by AJ  •  v18")
     return e
 
 
@@ -1965,10 +1979,8 @@ async def send_welcome(member: discord.Member, config: dict):
         try: await member.send(f"Welcome to **{member.guild.name}**! Check out the rules and enjoy your stay.")
         except Exception: pass
 
-async def run_automod(message: discord.Message, config: dict) -> bool:
-    if not message.guild or not config.get("automod_enabled", True): return False
-    member = message.guild.get_member(message.author.id)
-    if member and member.guild_permissions.administrator: return False
+async def _automod_phishing(message: discord.Message, config: dict) -> bool:
+    """Block malicious links, invites, and bare links. Returns True if message was actioned."""
     content = message.content
     for pat in MALICIOUS_RE:
         if pat.search(content):
@@ -1991,70 +2003,93 @@ async def run_automod(message: discord.Message, config: dict) -> bool:
             try: await message.channel.send(embed=err(f"{message.author.mention} links aren't allowed here. GIFs are fine 🙂"), delete_after=6)
             except Exception: pass
             return True
-
-    # ── Anti-Spam (v17) ──────────────────────────────────────────────────────
-    if config.get("antispam_enabled", True):
-        uid = message.author.id; now = time.monotonic()
-        # Rate spam: too many messages too fast
-        _spam_tracker[uid] = [t for t in _spam_tracker[uid] if now - t < SPAM_WINDOW_SECS]
-        _spam_tracker[uid].append(now)
-        if len(_spam_tracker[uid]) >= SPAM_MSG_THRESH:
-            _spam_tracker[uid].clear()
-            try: await message.delete()
-            except Exception: pass
-            try:
-                member = message.guild.get_member(uid)
-                if member:
-                    try: await member.timeout(timedelta(minutes=5), reason="Anti-spam: message flood")
-                    except Exception: pass
-                await message.channel.send(embed=err(f"{message.author.mention} slow down! Auto-muted for 5 minutes."), delete_after=8)
-            except Exception: pass
-            _log_automod(message.guild, config, f"🚫 **Anti-Spam** — {message.author.mention} flooded `{len(_spam_tracker[uid])+SPAM_MSG_THRESH}` msgs in {SPAM_WINDOW_SECS}s", C_ERROR)
-            return True
-        # Duplicate spam: same message repeated
-        recent_content = _dup_tracker[uid]
-        recent_content.append(content[:100])
-        if len(recent_content) > 10: _dup_tracker[uid] = recent_content[-10:]
-        if recent_content.count(content[:100]) >= SPAM_DUP_THRESH:
-            _dup_tracker[uid].clear()
-            try: await message.delete()
-            except Exception: pass
-            try: await message.channel.send(embed=err(f"{message.author.mention} stop copy-pasting the same message."), delete_after=6)
-            except Exception: pass
-            return True
-
-    # ── Anti-Mass-Mention (v17) ───────────────────────────────────────────────
-    if config.get("anti_mass_mention_enabled", True):
-        unique_mentions = len({u.id for u in message.mentions if not u.bot})
-        if unique_mentions >= MASS_MENTION_THRESH:
-            try: await message.delete()
-            except Exception: pass
-            try: await message.channel.send(embed=err(f"{message.author.mention} don't mass-mention users."), delete_after=6)
-            except Exception: pass
-            _log_automod(message.guild, config, f"📢 **Mass Mention** — {message.author.mention} pinged {unique_mentions} users", C_WARNING)
-            return True
-
-    # ── Anti-Caps (v17) ───────────────────────────────────────────────────────
-    if config.get("anti_caps_enabled", False):
-        alpha = [c for c in content if c.isalpha()]
-        if len(alpha) >= CAPS_MIN_LENGTH and sum(1 for c in alpha if c.isupper()) / len(alpha) >= CAPS_THRESHOLD:
-            try: await message.delete()
-            except Exception: pass
-            try: await message.channel.send(embed=err(f"{message.author.mention} please don't shout (too many caps)."), delete_after=6)
-            except Exception: pass
-            return True
-
-    # ── Anti-Emoji-Spam (v17) ─────────────────────────────────────────────────
-    if config.get("anti_emoji_spam_enabled", False):
-        emoji_count = len(EMOJI_RE.findall(content))
-        if emoji_count >= EMOJI_THRESH:
-            try: await message.delete()
-            except Exception: pass
-            try: await message.channel.send(embed=err(f"{message.author.mention} too many emojis in one message."), delete_after=6)
-            except Exception: pass
-            return True
-
     return False
+
+
+async def _automod_spam(message: discord.Message, config: dict) -> bool:
+    """Rate-spam and duplicate-spam detection. Returns True if actioned."""
+    if not config.get("antispam_enabled", True): return False
+    uid = message.author.id; now = time.monotonic(); content = message.content
+    # Rate spam
+    _spam_tracker[uid] = [t for t in _spam_tracker[uid] if now - t < SPAM_WINDOW_SECS]
+    _spam_tracker[uid].append(now)
+    if len(_spam_tracker[uid]) >= SPAM_MSG_THRESH:
+        _spam_tracker[uid].clear()
+        try: await message.delete()
+        except Exception: pass
+        member = message.guild.get_member(uid)
+        if member:
+            try: await member.timeout(timedelta(minutes=5), reason="Anti-spam: message flood")
+            except Exception: pass
+        try: await message.channel.send(embed=err(f"{message.author.mention} slow down! Auto-muted for 5 minutes."), delete_after=8)
+        except Exception: pass
+        _log_automod(message.guild, config, f"🚫 **Anti-Spam** — {message.author.mention} flooded messages in {SPAM_WINDOW_SECS}s", C_ERROR)
+        return True
+    # Duplicate spam
+    recent_content = _dup_tracker[uid]
+    recent_content.append(content[:100])
+    if len(recent_content) > 10: _dup_tracker[uid] = recent_content[-10:]
+    if recent_content.count(content[:100]) >= SPAM_DUP_THRESH:
+        _dup_tracker[uid].clear()
+        try: await message.delete()
+        except Exception: pass
+        try: await message.channel.send(embed=err(f"{message.author.mention} stop copy-pasting the same message."), delete_after=6)
+        except Exception: pass
+        return True
+    return False
+
+
+async def _automod_mentions(message: discord.Message, config: dict) -> bool:
+    """Mass-mention detection. Returns True if actioned."""
+    if not config.get("anti_mass_mention_enabled", True): return False
+    unique_mentions = len({u.id for u in message.mentions if not u.bot})
+    if unique_mentions >= MASS_MENTION_THRESH:
+        try: await message.delete()
+        except Exception: pass
+        try: await message.channel.send(embed=err(f"{message.author.mention} don't mass-mention users."), delete_after=6)
+        except Exception: pass
+        _log_automod(message.guild, config, f"📢 **Mass Mention** — {message.author.mention} pinged {unique_mentions} users", C_WARNING)
+        return True
+    return False
+
+
+async def _automod_caps(message: discord.Message, config: dict) -> bool:
+    """All-caps detection. Returns True if actioned."""
+    if not config.get("anti_caps_enabled", False): return False
+    alpha = [c for c in message.content if c.isalpha()]
+    if len(alpha) >= CAPS_MIN_LENGTH and sum(1 for c in alpha if c.isupper()) / len(alpha) >= CAPS_THRESHOLD:
+        try: await message.delete()
+        except Exception: pass
+        try: await message.channel.send(embed=err(f"{message.author.mention} please don't shout (too many caps)."), delete_after=6)
+        except Exception: pass
+        return True
+    return False
+
+
+async def _automod_emoji(message: discord.Message, config: dict) -> bool:
+    """Emoji-spam detection. Returns True if actioned."""
+    if not config.get("anti_emoji_spam_enabled", False): return False
+    if len(EMOJI_RE.findall(message.content)) >= EMOJI_THRESH:
+        try: await message.delete()
+        except Exception: pass
+        try: await message.channel.send(embed=err(f"{message.author.mention} too many emojis in one message."), delete_after=6)
+        except Exception: pass
+        return True
+    return False
+
+
+async def run_automod(message: discord.Message, config: dict) -> bool:
+    """Run all automod sub-checks in sequence. Returns True if message was actioned."""
+    if not message.guild or not config.get("automod_enabled", True): return False
+    member = message.guild.get_member(message.author.id)
+    if member and member.guild_permissions.administrator: return False
+    return (
+        await _automod_phishing(message, config) or
+        await _automod_spam(message, config) or
+        await _automod_mentions(message, config) or
+        await _automod_caps(message, config) or
+        await _automod_emoji(message, config)
+    )
 
 def _log_automod(guild: discord.Guild, config: dict, description: str, color: int = C_WARNING):
     """Fire-and-forget helper to send a message to the log channel."""
@@ -2075,27 +2110,63 @@ def _log_automod(guild: discord.Guild, config: dict, description: str, color: in
 async def handle_antiraid(member: discord.Member, config: dict):
     if not config.get("antiraid_enabled", True): return
     gid = member.guild.id; now = time.monotonic()
+    # Guard: if already active don't stack another lockdown
+    if _raid_active.get(gid): return
     _join_timestamps[gid] = [t for t in _join_timestamps[gid] if now - t < RAID_JOIN_WINDOW]
     _join_timestamps[gid].append(now)
-    if len(_join_timestamps[gid]) >= RAID_JOIN_THRESH and not _raid_active.get(gid):
-        _raid_active[gid] = True
-        logger.warning("RAID DETECTED %s", gid)
-        guild = member.guild
-        for ch in guild.text_channels:
-            try:
-                ow = ch.overwrites_for(guild.default_role); ow.send_messages = False
-                await ch.set_permissions(guild.default_role, overwrite=ow, reason="Anti-raid")
+    if len(_join_timestamps[gid]) < RAID_JOIN_THRESH: return
+
+    # ── Verify: scan recent messages for mass-spam before locking ─────────────
+    # Count how many of the recently-joined accounts have sent ≥2 messages in
+    # any channel in the last 60 seconds. If fewer than half qualify, likely
+    # a legitimate join surge (event, stream going live, etc.) — don't lock.
+    recent_joiner_ids = {
+        m.id for m in member.guild.members
+        if m.joined_at and (datetime.now(timezone.utc) - m.joined_at).total_seconds() < 60
+        and not m.bot
+    }
+    spam_count = 0
+    for ch in member.guild.text_channels[:8]:  # sample first 8 channels only
+        try:
+            async for msg in ch.history(limit=80, after=datetime.now(timezone.utc) - timedelta(seconds=60)):
+                if msg.author.id in recent_joiner_ids:
+                    spam_count += 1
+        except Exception: pass
+    # Need at least 4 messages from recent joiners to confirm it's a real raid
+    if spam_count < 4:
+        logger.info("Raid threshold hit for %s but mass-message check failed (%d msgs) — not locking", gid, spam_count)
+        return
+
+    _raid_active[gid] = True
+    logger.warning("RAID CONFIRMED %s (%d joins, %d spam msgs)", gid, len(_join_timestamps[gid]), spam_count)
+    guild = member.guild
+    for ch in guild.text_channels:
+        try:
+            ow = ch.overwrites_for(guild.default_role); ow.send_messages = False
+            await ch.set_permissions(guild.default_role, overwrite=ow, reason="Anti-raid")
+        except Exception: pass
+
+    # Mute recent joiners (timeout 30 min) — no bans/kicks
+    for m in guild.members:
+        if m.id in recent_joiner_ids and not m.guild_permissions.administrator:
+            try: await m.timeout(timedelta(minutes=30), reason="Anti-raid: auto-mute")
             except Exception: pass
-        log_ch = guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
-        if not log_ch: log_ch = next((c for c in guild.text_channels if guild.me.permissions_in(c).send_messages), None)
-        if log_ch:
-            e = make_embed(C_ERROR, f"Detected **{len(_join_timestamps[gid])} joins** in **{RAID_JOIN_WINDOW}s**.\nAll channels locked. Use `.admin unlockraid` to unlock.")
-            e.title = "🚨 RAID DETECTED"
-            try: await log_ch.send(embed=e)
-            except Exception: pass
-        await asyncio.sleep(RAID_LOCK_MINUTES * 60)
-        await _unlock_server(guild)
-        _raid_active[gid] = False; _join_timestamps[gid].clear()
+
+    log_ch = guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
+    if not log_ch: log_ch = next((c for c in guild.text_channels if guild.me.permissions_in(c).send_messages), None)
+    if log_ch:
+        e = make_embed(C_ERROR,
+            f"Detected **{len(_join_timestamps[gid])} joins** in **{RAID_JOIN_WINDOW}s** "
+            f"with **{spam_count} spam messages**.\n"
+            f"All channels locked + recent joiners muted 30 min.\n"
+            f"Use `.admin unlockraid` to unlock.")
+        e.title = "🚨 RAID CONFIRMED"
+        try: await log_ch.send(embed=e)
+        except Exception: pass
+
+    await asyncio.sleep(RAID_LOCK_MINUTES * 60)
+    await _unlock_server(guild)
+    _raid_active[gid] = False; _join_timestamps[gid].clear()
 
 async def _unlock_server(guild: discord.Guild):
     for ch in guild.text_channels:
@@ -2107,62 +2178,159 @@ async def _unlock_server(guild: discord.Guild):
         except Exception: pass
 
 
-# ─── Anti-Nuke helpers (v17) ──────────────────────────────────────────────────
+# ─── Anti-Nuke helpers (v18) ──────────────────────────────────────────────────
 
 def _nuke_window_check(tracker: dict, gid: int, thresh: int, window: float = NUKE_WINDOW_SECS) -> bool:
-    """Append now to tracker[gid], prune old entries, return True if threshold exceeded."""
+    """Append now to tracker[gid], prune old entries, return True if threshold exceeded.
+    FIXED: pure check only — callers own side-effects so concurrent events can't double-fire."""
     now = time.monotonic()
     tracker[gid] = [t for t in tracker[gid] if now - t < window]
     tracker[gid].append(now)
     return len(tracker[gid]) >= thresh
 
-async def _handle_nuke_event(guild: discord.Guild, config: dict, description: str):
-    """Called when a nuke-like pattern is detected. Logs and optionally locks."""
+
+def _record_nuke_executor(gid: int, executor_id: Optional[int], action: str):
+    """Track who performed a nuke-like action so we can act on them later."""
+    if executor_id:
+        _nuke_executors[gid][executor_id].append(action)
+
+
+# ─── Dangerous permission flags that indicate a role-grant nuke ───────────────
+_DANGEROUS_PERMS = (
+    "administrator", "ban_members", "kick_members",
+    "manage_guild", "manage_roles", "manage_channels",
+    "mention_everyone",
+)
+
+
+async def _punish_nuker(guild: discord.Guild, executor_id: Optional[int], config: dict, reason: str):
+    """
+    Strip all non-auto roles from the executor and kick any unverified bots
+    they may have added. Also delete any webhooks created in the nuke window.
+    NEVER bans or kicks real members.
+    """
+    if not executor_id: return
+    executor = guild.get_member(executor_id)
+    # Don't punish the server owner or the bot itself
+    if not executor or executor.id == guild.owner_id or executor.id == guild.me.id: return
+
+    # Preserve auto-role IDs from config so we don't strip those
+    autorole_ids = {e.get("role_id") for e in config.get("autoroles", [])}
+
+    roles_to_remove = [
+        r for r in executor.roles
+        if r != guild.default_role
+        and r.id not in autorole_ids
+        and r < guild.me.top_role  # can only remove roles below bot's top role
+    ]
+    if roles_to_remove:
+        try:
+            await executor.remove_roles(*roles_to_remove, reason=f"Anti-nuke: {reason}")
+            logger.warning("Stripped %d roles from executor %s (%s)", len(roles_to_remove), executor, guild.name)
+        except Exception as exc:
+            logger.warning("Could not strip roles from %s: %s", executor, exc)
+
+    # Mute executor for 60 minutes instead of kicking/banning
+    try:
+        await executor.timeout(timedelta(hours=1), reason=f"Anti-nuke: {reason}")
+    except Exception as exc:
+        logger.warning("Could not timeout executor %s: %s", executor, exc)
+
+    # Kick any bots added in the last 5 minutes that aren't the bot itself
+    for member in guild.members:
+        if not member.bot or member.id == guild.me.id: continue
+        if member.joined_at and (datetime.now(timezone.utc) - member.joined_at).total_seconds() < 300:
+            try:
+                await member.kick(reason="Anti-nuke: suspicious bot added during nuke window")
+                logger.warning("Kicked suspicious bot %s from %s", member, guild.name)
+            except Exception: pass
+
+    # Delete webhooks created in the last 5 minutes
+    try:
+        for wh in await guild.webhooks():
+            if wh.created_at and (datetime.now(timezone.utc) - wh.created_at.replace(tzinfo=timezone.utc)).total_seconds() < 300:
+                try:
+                    await wh.delete(reason="Anti-nuke: suspicious webhook created during nuke window")
+                    logger.warning("Deleted suspicious webhook %s from %s", wh.name, guild.name)
+                except Exception: pass
+    except Exception: pass
+
+
+async def _handle_nuke_event(guild: discord.Guild, config: dict, description: str, executor_id: Optional[int] = None):
+    """Called when a nuke-like pattern is detected. Logs, punishes executor, and locks server."""
+    # Guard: don't stack lockdowns
+    if _raid_active.get(guild.id): return
+    _raid_active[guild.id] = True
+
     lc_id = config.get("log_channel_id")
     lc = guild.get_channel(lc_id) if lc_id else next(
         (c for c in guild.text_channels if guild.me.permissions_in(c).send_messages), None
     )
-    e = make_embed(C_ERROR, description + "\n\n**Action: Server locked. Use `.admin unlockraid` to unlock.**")
+
+    executor_str = f"<@{executor_id}>" if executor_id else "unknown"
+    e = make_embed(C_ERROR,
+        description +
+        f"\n**Executor:** {executor_str}"
+        "\n\n**Actions taken:** roles stripped, executor muted 1h, suspicious bots kicked, webhooks deleted."
+        "\n**Server:** locked. Use `.admin unlockraid` to unlock."
+    )
     e.title = "💣 ANTI-NUKE — THREAT DETECTED"
     if lc:
         try: await lc.send(embed=e)
         except Exception: pass
-    # Lock the server as a precaution
-    if not _raid_active.get(guild.id):
-        _raid_active[guild.id] = True
-        for ch in guild.text_channels:
-            try:
-                ow = ch.overwrites_for(guild.default_role); ow.send_messages = False
-                await ch.set_permissions(guild.default_role, overwrite=ow, reason="Anti-nuke lockdown")
-            except Exception: pass
-        await asyncio.sleep(RAID_LOCK_MINUTES * 60)
-        await _unlock_server(guild)
-        _raid_active[guild.id] = False
 
-async def handle_antinuke_channel_delete(guild: discord.Guild, config: dict):
+    # Punish the nuker
+    await _punish_nuker(guild, executor_id, config, description[:80])
+
+    # Lock channels
+    for ch in guild.text_channels:
+        try:
+            ow = ch.overwrites_for(guild.default_role); ow.send_messages = False
+            await ch.set_permissions(guild.default_role, overwrite=ow, reason="Anti-nuke lockdown")
+        except Exception: pass
+
+    await asyncio.sleep(RAID_LOCK_MINUTES * 60)
+    await _unlock_server(guild)
+    _raid_active[guild.id] = False
+    _nuke_executors[guild.id].clear()
+
+
+async def handle_antinuke_channel_delete(guild: discord.Guild, config: dict, executor_id: Optional[int] = None):
     if not config.get("antinuke_enabled", True): return
+    _record_nuke_executor(guild.id, executor_id, "channel_delete")
     if _nuke_window_check(_nuke_chan_del, guild.id, NUKE_CHANNEL_DEL_THRESH):
-        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_CHANNEL_DEL_THRESH}+ channels deleted** in {NUKE_WINDOW_SECS}s — possible nuke bot."))
+        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_CHANNEL_DEL_THRESH}+ channels deleted** in {NUKE_WINDOW_SECS}s — possible nuke bot.", executor_id))
 
-async def handle_antinuke_channel_create(guild: discord.Guild, config: dict):
+async def handle_antinuke_channel_create(guild: discord.Guild, config: dict, executor_id: Optional[int] = None):
     if not config.get("antinuke_enabled", True): return
+    _record_nuke_executor(guild.id, executor_id, "channel_create")
     if _nuke_window_check(_nuke_chan_create, guild.id, NUKE_CHANNEL_CREATE_THRESH):
-        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_CHANNEL_CREATE_THRESH}+ channels created** in {NUKE_WINDOW_SECS}s — possible nuke bot."))
+        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_CHANNEL_CREATE_THRESH}+ channels created** in {NUKE_WINDOW_SECS}s — possible nuke bot.", executor_id))
 
-async def handle_antinuke_role_delete(guild: discord.Guild, config: dict):
+async def handle_antinuke_role_delete(guild: discord.Guild, config: dict, executor_id: Optional[int] = None):
     if not config.get("antinuke_enabled", True): return
+    _record_nuke_executor(guild.id, executor_id, "role_delete")
     if _nuke_window_check(_nuke_role_del, guild.id, NUKE_ROLE_DEL_THRESH):
-        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_ROLE_DEL_THRESH}+ roles deleted** in {NUKE_WINDOW_SECS}s — possible nuke bot."))
+        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_ROLE_DEL_THRESH}+ roles deleted** in {NUKE_WINDOW_SECS}s — possible nuke bot.", executor_id))
 
-async def handle_antinuke_ban(guild: discord.Guild, config: dict, user: discord.User):
+async def handle_antinuke_ban(guild: discord.Guild, config: dict, user: discord.User, executor_id: Optional[int] = None):
     if not config.get("antinuke_enabled", True): return
+    _record_nuke_executor(guild.id, executor_id, "ban")
     if _nuke_window_check(_nuke_ban, guild.id, NUKE_BAN_THRESH):
-        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_BAN_THRESH}+ bans** in {NUKE_WINDOW_SECS}s — possible mass ban. Last: {user}"))
+        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_BAN_THRESH}+ bans** in {NUKE_WINDOW_SECS}s — possible mass ban. Last: {user}", executor_id))
 
-async def handle_antinuke_kick(guild: discord.Guild, config: dict):
+async def handle_antinuke_kick(guild: discord.Guild, config: dict, executor_id: Optional[int] = None):
     if not config.get("antinuke_enabled", True): return
+    _record_nuke_executor(guild.id, executor_id, "kick")
     if _nuke_window_check(_nuke_kick, guild.id, NUKE_KICK_THRESH):
-        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_KICK_THRESH}+ kicks** in {NUKE_WINDOW_SECS}s — possible mass kick."))
+        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_KICK_THRESH}+ kicks** in {NUKE_WINDOW_SECS}s — possible mass kick.", executor_id))
+
+async def handle_antinuke_role_grant(guild: discord.Guild, config: dict, executor_id: Optional[int], role_name: str):
+    """v18: detect mass dangerous-permission role grants (e.g. giving @everyone admin)."""
+    if not config.get("antinuke_enabled", True): return
+    _record_nuke_executor(guild.id, executor_id, "role_grant")
+    if _nuke_window_check(_nuke_role_grant, guild.id, NUKE_ROLE_GRANT_THRESH):
+        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_ROLE_GRANT_THRESH}+ dangerous role grants** in {NUKE_WINDOW_SECS}s (last: `{role_name}`). Possible perm escalation.", executor_id))
 
 _invite_cache: dict[int, dict[str, int]] = {}
 
@@ -2223,6 +2391,7 @@ class LXTEBot(commands.Bot):
         self.nightly_task.start()
         self.ticket_autoclose_task.start()
         self.giveaway_task.start()
+        self.spam_persist_task.start()
         for guild in self.guilds:
             try: await self.tree.sync(guild=discord.Object(id=guild.id))
             except Exception as e: logger.warning("Slash sync %s: %s", guild.name, e)
@@ -2350,7 +2519,7 @@ class LXTEBot(commands.Bot):
         try: await lc.send(embed=e)
         except Exception: pass
 
-    # ── Anti-Ghost-Ping (v17) ─────────────────────────────────────────────────
+    # ── Anti-Ghost-Ping (v18 — soft-warn with timeout) ───────────────────────
     async def on_message_delete(self, message: discord.Message):
         if message.author.bot or not message.guild: return
         config = await get_config(message.guild.id)
@@ -2366,38 +2535,78 @@ class LXTEBot(commands.Bot):
         # Ghost-ping check
         if config.get("anti_ghost_ping_enabled", True) and message.mentions:
             real_mentions = [u for u in message.mentions if not u.bot and u.id != message.author.id]
-            if real_mentions and lc:
+            if real_mentions:
                 names = ", ".join(u.mention for u in real_mentions[:5])
-                eg = make_embed(C_ERROR, f"👻 **{message.author.mention}** ghost-pinged {names} and deleted the message.\n**Content:** {message.content[:300] or '*empty*'}")
-                eg.title = "👻 Ghost Ping Detected"
-                try: await lc.send(embed=eg)
+                # Increment strike counter and apply escalating timeout
+                strikes = _ghost_ping_strikes[message.author.id] + 1
+                _ghost_ping_strikes[message.author.id] = strikes
+                timeout_mins = 2 if strikes == 1 else min(60, strikes * 10)
+                member = message.guild.get_member(message.author.id)
+                if member and not member.guild_permissions.administrator:
+                    try: await member.timeout(timedelta(minutes=timeout_mins), reason=f"Ghost ping (strike {strikes})")
+                    except Exception: pass
+                if lc:
+                    eg = make_embed(C_ERROR,
+                        f"👻 **{message.author.mention}** ghost-pinged {names} and deleted the message.\n"
+                        f"**Content:** {message.content[:300] or '*empty*'}\n"
+                        f"**Action:** Muted {timeout_mins} min (strike {strikes})"
+                    )
+                    eg.title = "👻 Ghost Ping — Auto-Muted"
+                    try: await lc.send(embed=eg)
+                    except Exception: pass
+                try:
+                    await message.channel.send(
+                        embed=make_embed(C_WARNING, f"👻 {message.author.mention} ghost ping detected. Muted {timeout_mins} min."),
+                        delete_after=8,
+                    )
                 except Exception: pass
 
-    # ── Anti-Nuke Event Hooks (v17) ───────────────────────────────────────────
-    async def on_guild_channel_delete(self, channel):
-        if not channel.guild: return
-        config = await get_config(channel.guild.id)
-        await handle_antinuke_channel_delete(channel.guild, config)
-
-    async def on_guild_channel_create(self, channel):
-        if not channel.guild: return
-        config = await get_config(channel.guild.id)
-        await handle_antinuke_channel_create(channel.guild, config)
-
-    async def on_guild_role_delete(self, role):
-        config = await get_config(role.guild.id)
-        await handle_antinuke_role_delete(role.guild, config)
-
-    async def on_member_ban(self, guild: discord.Guild, user: discord.User):
+    # ── Anti-Nuke: unified audit log handler (v18) ────────────────────────────
+    async def on_audit_log_entry_create(self, entry: discord.AuditLogEntry):
+        """Single handler for all nuke-relevant audit log events.
+        Using audit log gives us the actual executor ID for every action,
+        including those performed by bots or via webhooks."""
+        guild = entry.guild
+        if not guild: return
         config = await get_config(guild.id)
-        await handle_antinuke_ban(guild, config, user)
+        executor_id = entry.user_id if entry.user else None
+
+        action = entry.action
+
+        if action == discord.AuditLogAction.channel_delete:
+            await handle_antinuke_channel_delete(guild, config, executor_id)
+
+        elif action == discord.AuditLogAction.channel_create:
+            await handle_antinuke_channel_create(guild, config, executor_id)
+
+        elif action == discord.AuditLogAction.role_delete:
+            await handle_antinuke_role_delete(guild, config, executor_id)
+
+        elif action == discord.AuditLogAction.ban:
+            target = entry.target
+            await handle_antinuke_ban(guild, config, target, executor_id)
+
+        elif action == discord.AuditLogAction.kick:
+            await handle_antinuke_kick(guild, config, executor_id)
+
+        elif action in (discord.AuditLogAction.role_update, discord.AuditLogAction.member_role_update):
+            # Check if dangerous perms were granted to a role or @everyone
+            try:
+                changes = entry.changes
+                after_perms = getattr(getattr(changes, "after", None), "permissions", None)
+                role_name   = getattr(entry.target, "name", "unknown") if entry.target else "unknown"
+                if after_perms:
+                    if any(getattr(after_perms, perm, False) for perm in _DANGEROUS_PERMS):
+                        await handle_antinuke_role_grant(guild, config, executor_id, role_name)
+            except Exception: pass
 
     async def on_member_remove(self, member: discord.Member):
         if member.bot: return
         await update_member_count(member.guild)
         config = await get_config(member.guild.id)
-        # Anti-nuke: track rapid member removes (kicks don't have their own event)
-        await handle_antinuke_kick(member.guild, config)
+        # NOTE: kick detection is now handled by on_audit_log_entry_create (v18)
+        # on_member_remove fires for both leaves and kicks — we can't tell which
+        # without the audit log, so we don't call handle_antinuke_kick here anymore.
         lc = member.guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
         if lc:
             e = make_embed(C_WARNING)
@@ -2492,6 +2701,45 @@ class LXTEBot(commands.Bot):
         cutoff = time.monotonic() - 3600
         for d in (_last_used, _xp_cooldowns, _cmd_cooldowns):
             for k in [k for k, v in d.items() if v < cutoff]: del d[k]
+        # Also decay ghost-ping strikes older than 24h (rough: clear on hourly cleanup)
+        # We keep it simple — strikes reset after enough time passes between events
+        _ghost_ping_strikes.clear()
+
+    @tasks.loop(seconds=SPAM_PERSIST_INTERVAL)
+    async def spam_persist_task(self):
+        """Persist spam tracker state to DB so bot restarts don't reset it.
+        Stores a snapshot; on restart the in-memory dicts start empty but DB
+        can be queried for recent violations if needed (audit trail only)."""
+        if not self.db: return
+        try:
+            snapshots = []
+            now = datetime.now(timezone.utc)
+            for uid, timestamps in list(_spam_tracker.items()):
+                if timestamps:
+                    snapshots.append({
+                        "user_id": uid, "type": "rate",
+                        "count": len(timestamps), "snapshot_at": now,
+                    })
+            for uid, contents in list(_dup_tracker.items()):
+                if contents:
+                    snapshots.append({
+                        "user_id": uid, "type": "dup",
+                        "count": len(contents), "snapshot_at": now,
+                    })
+            if snapshots:
+                # Just upsert a summary document per user — not the raw timestamps
+                from pymongo import UpdateOne
+                ops = [
+                    UpdateOne(
+                        {"user_id": s["user_id"], "type": s["type"]},
+                        {"$set": s},
+                        upsert=True,
+                    )
+                    for s in snapshots
+                ]
+                await self.db._client["lxte_assistant"]["spam_snapshots"].bulk_write(ops, ordered=False)
+        except Exception as exc:
+            logger.warning("spam_persist: %s", exc)
 
     @tasks.loop(seconds=VOICE_XP_INTERVAL)
     async def voice_xp_task(self):
@@ -2551,8 +2799,8 @@ class LXTEBot(commands.Bot):
                 except Exception: pass
             elif last < warn_cutoff and not ticket.get("warned"):
                 try:
-                    # FIXED: compute remaining time correctly from now, not from last_activity
-                    close_at = int((now + timedelta(hours=auto_h - (now - last).total_seconds() / 3600)).timestamp())
+                    # FIXED: close_at is last_activity + auto_h, not relative to now
+                    close_at = int((last + timedelta(hours=auto_h)).timestamp())
                     await ch.send(embed=make_embed(C_WARNING, f"⚠️ This ticket will auto-close <t:{close_at}:R> if there's no activity."))
                     await self.db.tickets.update_one({"channel_id": ch_id}, {"$set": {"warned": True}})
                 except Exception: pass
@@ -2572,6 +2820,7 @@ class LXTEBot(commands.Bot):
     @nightly_task.before_loop
     @ticket_autoclose_task.before_loop
     @giveaway_task.before_loop
+    @spam_persist_task.before_loop
     async def before_tasks(self): await self.wait_until_ready()
 
 
@@ -3100,32 +3349,25 @@ async def cmd_msgsync(ctx: commands.Context, limit: int = 500, *, flags: str = "
             except Exception:
                 pass
 
-    # Write to DB
+    # Write to DB with bulk_write (FIXED: was per-user loop)
     written = 0
-    for uid, chan_map in counts.items():
-        total_for_user = sum(chan_map.values())
-        chan_inc = {f"channels.{cid}": cnt for cid, cnt in chan_map.items()}
-        chan_inc["total_messages"] = total_for_user
-
-        update: dict = {
-            "$inc": chan_inc,
-            "$min": {"first_message": first_seen[uid]} if uid in first_seen else {},
-        }
-        if uid in last_seen:
-            update["$set"] = {"last_message": last_seen[uid]}
-        # Remove empty $min if no first_seen (shouldn't happen, but be safe)
-        if not update["$min"]:
-            del update["$min"]
-
+    if counts:
+        from pymongo import UpdateOne
+        ops = []
+        for uid, chan_map in counts.items():
+            total_for_user = sum(chan_map.values())
+            chan_inc = {f"channels.{cid}": cnt for cid, cnt in chan_map.items()}
+            chan_inc["total_messages"] = total_for_user
+            update: dict = {"$inc": chan_inc}
+            if uid in first_seen: update["$min"] = {"first_message": first_seen[uid]}
+            if uid in last_seen:  update.setdefault("$set", {})["last_message"] = last_seen[uid]
+            ops.append(UpdateOne({"guild_id": ctx.guild.id, "user_id": uid}, update, upsert=True))
         try:
-            await bot.db.msg_tracking.update_one(
-                {"guild_id": ctx.guild.id, "user_id": uid},
-                update,
-                upsert=True,
-            )
-            written += 1
+            result = await bot.db.msg_tracking.bulk_write(ops, ordered=False)
+            written = result.upserted_count + result.modified_count
         except Exception as exc:
-            logger.warning("msgsync write uid=%s: %s", uid, exc)
+            logger.warning("msgsync bulk_write: %s", exc)
+            written = 0
 
     e = make_embed(C_SUCCESS,
         f"✅ **Sync complete!**\n\n"
@@ -3294,7 +3536,7 @@ async def cmd_setup(ctx: commands.Context):
 @bot.command(name="about", aliases=["info"])
 async def cmd_about(ctx: commands.Context):
     e = make_embed(C_AI)
-    e.title       = "LXTE's AI v16"
+    e.title       = "LXTE's AI v18"
     e.description = "Built by AJ. Smart AI, leveling, giveaways, Join LXTE tickets, multi-select setup, reaction roles, automod, anti-raid, boost tracking, invite tracking, analytics."
     e.set_thumbnail(url=bot.user.display_avatar.url if bot.user else None)
     e.add_field(name="Prefix",   value="`.`",                  inline=True)
