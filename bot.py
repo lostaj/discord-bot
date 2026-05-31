@@ -2238,7 +2238,7 @@ class SingleRoleSelect(discord.ui.RoleSelect):
 
 def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
     e = make_embed(C_PRIMARY)
-    e.title       = "⚙️ Server Setup — v18"
+    e.title       = "⚙️ Server Setup — v19"
     e.description = "Pick a section to configure. Dropdowns now support multiple selections."
 
     def ch(key):
@@ -3685,7 +3685,7 @@ class LXTEBot(commands.Bot):
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
         if before.author.bot or not before.guild or before.content == after.content: return
         config = await get_config(before.guild.id)
-        lc = get_log_channel(before.guild, config, "message") if config.get("message_log_channel_id") or config.get("log_channel_id") else None
+        lc = get_log_channel(before.guild, config, "message")
         if not lc: return
         e = make_embed(C_INFO)
         e.title       = "✏️ Message Edited"
@@ -3699,7 +3699,7 @@ class LXTEBot(commands.Bot):
     async def on_message_delete(self, message: discord.Message):
         if message.author.bot or not message.guild: return
         config = await get_config(message.guild.id)
-        lc = get_log_channel(message.guild, config, "message") if config.get("message_log_channel_id") or config.get("log_channel_id") else None
+        lc = get_log_channel(message.guild, config, "message")
         if lc:
             e = make_embed(C_WARNING)
             e.title       = "🗑️ Message Deleted"
@@ -3721,14 +3721,15 @@ class LXTEBot(commands.Bot):
                 if member and not member.guild_permissions.administrator:
                     try: await member.timeout(timedelta(minutes=timeout_mins), reason=f"Ghost ping (strike {strikes})")
                     except Exception: pass
-                if lc:
+                alc = get_log_channel(message.guild, config, "automod")
+                if alc:
                     eg = make_embed(C_ERROR,
                         f"👻 **{message.author.mention}** ghost-pinged {names} and deleted the message.\n"
                         f"**Content:** {message.content[:300] or '*empty*'}\n"
                         f"**Action:** Muted {timeout_mins} min (strike {strikes})"
                     )
                     eg.title = "👻 Ghost Ping — Auto-Muted"
-                    try: await lc.send(embed=eg)
+                    try: await alc.send(embed=eg)
                     except Exception: pass
                 try:
                     await message.channel.send(
@@ -3810,6 +3811,19 @@ class LXTEBot(commands.Bot):
                     except Exception as e: logger.warning("AutoRole: %s", e)
         await send_welcome(member, config)
         await update_member_count(member.guild)
+        # Log join to entry log channel
+        lc = get_log_channel(member.guild, config, "entry")
+        if lc:
+            e = make_embed(C_SUCCESS)
+            e.title       = "📥 Member Joined"
+            e.description = f"**{member.display_name}** (`{member.name}`, ID: `{member.id}`) joined the server."
+            e.set_thumbnail(url=member.display_avatar.url)
+            e.add_field(name="Account Created", value=ts_full(member.created_at), inline=True)
+            e.add_field(name="Joined",           value=ts_full(member.joined_at) if member.joined_at else "now", inline=True)
+            if used and used.inviter:
+                e.add_field(name="Invited By", value=used.inviter.mention, inline=True)
+            try: await lc.send(embed=e)
+            except Exception: pass
         # Anti-selfbot: flag suspiciously new accounts with no avatar
         if config.get("anti_selfbot_enabled", True):
             age_days = (datetime.now(timezone.utc) - member.created_at).days
