@@ -769,6 +769,7 @@ _LOG_CATEGORY_KEYS = {
     "mod":     "mod_log_channel_id",
     "entry":   "entry_log_channel_id",
     "bot":     "bot_log_channel_id",
+    "server":  "server_log_channel_id",
 }
 
 def get_log_channel(guild: discord.Guild, config: dict, category: str) -> Optional[discord.TextChannel]:
@@ -2273,7 +2274,8 @@ def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
             f"🛡️ Automod: {ch('automod_log_channel_id')}\n"
             f"⚖️ Mod: {ch('mod_log_channel_id')}\n"
             f"🚪 Entry/Exit: {ch('entry_log_channel_id')}\n"
-            f"🤖 Bot: {ch('bot_log_channel_id')}"
+            f"🤖 Bot: {ch('bot_log_channel_id')}\n"
+            f"🌐 Server: {ch('server_log_channel_id')}"
         ),
         inline=False,
     )
@@ -2323,7 +2325,8 @@ class SetupView(discord.ui.View):
             f"🛡️ **Automod logs:** {ch('automod_log_channel_id')}\n"
             f"⚖️ **Mod logs:** {ch('mod_log_channel_id')}\n"
             f"🚪 **Entry/exit logs:** {ch('entry_log_channel_id')}\n"
-            f"🤖 **Bot logs:** {ch('bot_log_channel_id')}"
+            f"🤖 **Bot logs:** {ch('bot_log_channel_id')}\n"
+            f"🌐 **Server logs:** {ch('server_log_channel_id')}"
         )
         await i.response.send_message(embed=make_embed(C_INFO, desc), view=LogChannelsSetupView(self.owner_id, self.guild_id), ephemeral=True)
 
@@ -2461,9 +2464,10 @@ class AutomodSetupView(discord.ui.View):
 _LOG_CHANNEL_OPTIONS = [
     ("message_log_channel_id", "💬 Message logs",    "Message edits & deletes"),
     ("automod_log_channel_id", "🛡️ Automod logs",   "Spam, slurs, invites, caps…"),
-    ("mod_log_channel_id",     "⚖️ Mod logs",        "Bans, kicks, nuke, raid"),
+    ("mod_log_channel_id",     "⚖️ Mod logs",        "Bans, kicks, mutes, purges"),
     ("entry_log_channel_id",   "🚪 Entry/Exit logs", "Member joins & leaves"),
-    ("bot_log_channel_id",     "🤖 Bot logs",        "Selfbot flags, suspicious accts"),
+    ("bot_log_channel_id",     "🤖 Bot logs",        "Online, shutdown, restart"),
+    ("server_log_channel_id",  "🌐 Server logs",     "Every server change"),
 ]
 
 class LogChannelsSetupView(discord.ui.View):
@@ -2536,7 +2540,8 @@ class LogChannelsSetupView(discord.ui.View):
             f"🛡️ **Automod logs:** {ch('automod_log_channel_id')}\n"
             f"⚖️ **Mod logs:** {ch('mod_log_channel_id')}\n"
             f"🚪 **Entry/exit logs:** {ch('entry_log_channel_id')}\n"
-            f"🤖 **Bot logs:** {ch('bot_log_channel_id')}"
+            f"🤖 **Bot logs:** {ch('bot_log_channel_id')}\n"
+            f"🌐 **Server logs:** {ch('server_log_channel_id')}"
         )
         try: await interaction.message.edit(embed=make_embed(C_INFO, desc), view=self)
         except Exception: pass
@@ -2544,7 +2549,7 @@ class LogChannelsSetupView(discord.ui.View):
     @discord.ui.button(label="Clear All Log Channels", style=discord.ButtonStyle.danger, row=2)
     async def clear_all(self, i: discord.Interaction, b):
         for key in ("message_log_channel_id", "automod_log_channel_id", "mod_log_channel_id",
-                    "entry_log_channel_id", "bot_log_channel_id", "log_channel_id"):
+                    "entry_log_channel_id", "bot_log_channel_id", "server_log_channel_id", "log_channel_id"):
             await bot.db.update_config(self.guild_id, key, None)
         await i.response.send_message(embed=ok("All log channels cleared."), ephemeral=True)
         await self.refresh(i)
@@ -3420,8 +3425,10 @@ _DANGEROUS_PERMS = (
 
 async def _punish_nuker(guild: discord.Guild, executor_id: Optional[int], config: dict, reason: str):
     """
-    Strip all non-auto roles from the executor and kick any unverified bots
-    they may have added. Also delete any webhooks created in the nuke window.
+    Strip only dangerous/staff roles from the executor — roles that have elevated
+    permissions (admin, ban, kick, manage_*, etc.). Safe roles with no elevated
+    perms (member role, level roles, colour roles, etc.) are left untouched.
+    Also kicks any suspicious bots and deletes nuke webhooks.
     NEVER bans or kicks real members.
     """
     if not executor_id: return
@@ -3429,19 +3436,23 @@ async def _punish_nuker(guild: discord.Guild, executor_id: Optional[int], config
     # Don't punish the server owner or the bot itself
     if not executor or executor.id == guild.owner_id or executor.id == guild.me.id: return
 
-    # Preserve auto-role IDs from config so we don't strip those
-    autorole_ids = {e.get("role_id") for e in config.get("autoroles", [])}
-
+    # Only strip roles that actually carry elevated/dangerous permissions
+    _STRIP_PERMS = (
+        "administrator", "ban_members", "kick_members", "manage_guild",
+        "manage_roles", "manage_channels", "manage_messages", "manage_webhooks",
+        "mention_everyone", "moderate_members", "manage_nicknames",
+        "mute_members", "deafen_members", "move_members",
+    )
     roles_to_remove = [
         r for r in executor.roles
         if r != guild.default_role
-        and r.id not in autorole_ids
-        and r < guild.me.top_role  # can only remove roles below bot's top role
+        and r < guild.me.top_role
+        and any(getattr(r.permissions, p, False) for p in _STRIP_PERMS)
     ]
     if roles_to_remove:
         try:
             await executor.remove_roles(*roles_to_remove, reason=f"Anti-nuke: {reason}")
-            logger.warning("Stripped %d roles from executor %s (%s)", len(roles_to_remove), executor, guild.name)
+            logger.warning("Stripped %d dangerous roles from executor %s (%s)", len(roles_to_remove), executor, guild.name)
         except Exception as exc:
             logger.warning("Could not strip roles from %s: %s", executor, exc)
 
@@ -3585,6 +3596,16 @@ class LXTEBot(commands.Bot):
         await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=".help"), status=discord.Status.online)
         logger.info("Ready as %s (%s) — %d guilds", self.user, self.user.id, len(self.guilds))
         await self.db.ensure_indexes()
+        # ── Bot online log ────────────────────────────────────────────────────
+        for guild in self.guilds:
+            try:
+                cfg = await self.db.get_config(guild.id)
+                lc  = get_log_channel(guild, cfg, "bot")
+                if lc:
+                    e = make_embed(C_SUCCESS, f"**{self.user}** is now **online** and ready.\n**Guilds:** {len(self.guilds)} | **Latency:** {round(self.latency*1000)}ms")
+                    e.title = "🟢 Bot Online"
+                    await lc.send(embed=e)
+            except Exception: pass
         self.add_view(TicketOpenView()); self.add_view(TicketCloseView())
         self.add_view(GiveawayEnterView())
         for guild in self.guilds:
@@ -3796,18 +3817,41 @@ class LXTEBot(commands.Bot):
                     )
                 except Exception: pass
 
-    # ── Anti-Nuke: unified audit log handler (v18) ────────────────────────────
+    # ── Unified audit log handler: anti-nuke + mod logs + server logs ───────────
     async def on_audit_log_entry_create(self, entry: discord.AuditLogEntry):
-        """Single handler for all nuke-relevant audit log events.
-        Using audit log gives us the actual executor ID for every action,
-        including those performed by bots or via webhooks."""
+        """Handles all audit log events: anti-nuke checks, mod logging, server logging."""
         guild = entry.guild
         if not guild: return
-        config = await get_config(guild.id)
+        config      = await get_config(guild.id)
         executor_id = entry.user_id if entry.user else None
+        executor    = guild.get_member(executor_id) if executor_id else None
+        exec_str    = executor.mention if executor else (f"<@{executor_id}>" if executor_id else "Unknown")
+        target      = entry.target
+        action      = entry.action
+        reason_str  = f"\n**Reason:** {entry.reason}" if entry.reason else ""
 
-        action = entry.action
+        mod_lc    = get_log_channel(guild, config, "mod")
+        server_lc = get_log_channel(guild, config, "server")
 
+        # ── Helper: send to server log ─────────────────────────────────────────
+        async def _slog(title: str, desc: str, color: int = C_INFO):
+            if not server_lc: return
+            e = make_embed(color, desc)
+            e.title = title
+            e.set_footer(text=f"By: {exec_str}")
+            try: await server_lc.send(embed=e)
+            except Exception: pass
+
+        # ── Helper: send to mod log ────────────────────────────────────────────
+        async def _mlog(title: str, desc: str, color: int = C_ERROR):
+            if not mod_lc: return
+            e = make_embed(color, desc)
+            e.title = title
+            e.set_footer(text=f"By: {exec_str}")
+            try: await mod_lc.send(embed=e)
+            except Exception: pass
+
+        # ══ ANTI-NUKE checks ═══════════════════════════════════════════════════
         if action == discord.AuditLogAction.channel_delete:
             await handle_antinuke_channel_delete(guild, config, executor_id)
 
@@ -3818,22 +3862,203 @@ class LXTEBot(commands.Bot):
             await handle_antinuke_role_delete(guild, config, executor_id)
 
         elif action == discord.AuditLogAction.ban:
-            target = entry.target
             await handle_antinuke_ban(guild, config, target, executor_id)
 
         elif action == discord.AuditLogAction.kick:
             await handle_antinuke_kick(guild, config, executor_id)
 
         elif action in (discord.AuditLogAction.role_update, discord.AuditLogAction.member_role_update):
-            # Check if dangerous perms were granted to a role or @everyone
             try:
-                changes = entry.changes
+                changes     = entry.changes
                 after_perms = getattr(getattr(changes, "after", None), "permissions", None)
-                role_name   = getattr(entry.target, "name", "unknown") if entry.target else "unknown"
-                if after_perms:
-                    if any(getattr(after_perms, perm, False) for perm in _DANGEROUS_PERMS):
-                        await handle_antinuke_role_grant(guild, config, executor_id, role_name)
+                role_name   = getattr(target, "name", "unknown") if target else "unknown"
+                if after_perms and any(getattr(after_perms, perm, False) for perm in _DANGEROUS_PERMS):
+                    await handle_antinuke_role_grant(guild, config, executor_id, role_name)
             except Exception: pass
+
+        # ══ MOD LOGS ═══════════════════════════════════════════════════════════
+
+        if action == discord.AuditLogAction.ban:
+            tname = f"{target} (ID: `{target.id}`)" if target else "Unknown"
+            await _mlog("🔨 Member Banned",
+                f"**User:** {tname}\n**By:** {exec_str}{reason_str}", C_ERROR)
+
+        elif action == discord.AuditLogAction.unban:
+            tname = f"{target} (ID: `{target.id}`)" if target else "Unknown"
+            await _mlog("🔓 Member Unbanned",
+                f"**User:** {tname}\n**By:** {exec_str}{reason_str}", C_SUCCESS)
+
+        elif action == discord.AuditLogAction.kick:
+            tname = f"{target} (ID: `{target.id}`)" if target else "Unknown"
+            await _mlog("👢 Member Kicked",
+                f"**User:** {tname}\n**By:** {exec_str}{reason_str}", C_WARNING)
+
+        elif action == discord.AuditLogAction.member_update:
+            # Timeout (mute) — check if communication_disabled_until changed
+            try:
+                before_to = getattr(getattr(entry.changes, "before", None), "communication_disabled_until", None)
+                after_to  = getattr(getattr(entry.changes, "after",  None), "communication_disabled_until", None)
+                tname     = f"{target.mention} (ID: `{target.id}`)" if target else "Unknown"
+                if after_to and not before_to:
+                    until_ts = f"<t:{int(after_to.timestamp())}:R>" if hasattr(after_to, "timestamp") else str(after_to)
+                    await _mlog("🔇 Member Muted (Timeout)",
+                        f"**User:** {tname}\n**Until:** {until_ts}\n**By:** {exec_str}{reason_str}", C_WARNING)
+                elif before_to and not after_to:
+                    await _mlog("🔊 Timeout Removed",
+                        f"**User:** {tname}\n**By:** {exec_str}{reason_str}", C_SUCCESS)
+            except Exception: pass
+
+        # ══ SERVER LOGS ════════════════════════════════════════════════════════
+
+        elif action == discord.AuditLogAction.channel_create:
+            ch_name = getattr(target, "name", "?") if target else "?"
+            ch_type = str(getattr(target, "type", "?"))
+            await _slog("📢 Channel Created", f"**#{ch_name}** (type: {ch_type})\n**By:** {exec_str}", C_SUCCESS)
+
+        elif action == discord.AuditLogAction.channel_delete:
+            ch_name = getattr(entry, "extra", None)
+            name = getattr(ch_name, "name", None) or getattr(target, "name", "?") if target else "?"
+            await _slog("🗑️ Channel Deleted", f"**#{name}**\n**By:** {exec_str}{reason_str}", C_ERROR)
+
+        elif action == discord.AuditLogAction.channel_update:
+            ch_name = getattr(target, "name", "?") if target else "?"
+            changes = entry.changes
+            diff_lines = []
+            for attr in ("name", "topic", "nsfw", "slowmode_delay", "bitrate", "user_limit", "position"):
+                bv = getattr(getattr(changes, "before", None), attr, None)
+                av = getattr(getattr(changes, "after",  None), attr, None)
+                if bv != av and av is not None:
+                    diff_lines.append(f"**{attr}:** `{bv}` → `{av}`")
+            if diff_lines:
+                await _slog("✏️ Channel Updated", f"**#{ch_name}**\n" + "\n".join(diff_lines) + f"\n**By:** {exec_str}", C_INFO)
+
+        elif action == discord.AuditLogAction.role_create:
+            rname = getattr(target, "name", "?") if target else "?"
+            await _slog("🎭 Role Created", f"**@{rname}**\n**By:** {exec_str}", C_SUCCESS)
+
+        elif action == discord.AuditLogAction.role_delete:
+            rname = getattr(target, "name", "?") if target else "?"
+            await _slog("🗑️ Role Deleted", f"**@{rname}**\n**By:** {exec_str}", C_ERROR)
+
+        elif action == discord.AuditLogAction.role_update:
+            rname = getattr(target, "name", "?") if target else "?"
+            changes = entry.changes
+            diff_lines = []
+            for attr in ("name", "color", "hoist", "mentionable", "permissions"):
+                bv = getattr(getattr(changes, "before", None), attr, None)
+                av = getattr(getattr(changes, "after",  None), attr, None)
+                if bv != av and av is not None:
+                    diff_lines.append(f"**{attr}:** `{bv}` → `{av}`")
+            if diff_lines:
+                await _slog("✏️ Role Updated", f"**@{rname}**\n" + "\n".join(diff_lines) + f"\n**By:** {exec_str}", C_INFO)
+
+        elif action == discord.AuditLogAction.member_role_update:
+            tname = target.mention if target else "Unknown"
+            before_roles = getattr(getattr(entry.changes, "before", None), "roles", []) or []
+            after_roles  = getattr(getattr(entry.changes, "after",  None), "roles", []) or []
+            added   = [r for r in after_roles  if r not in before_roles]
+            removed = [r for r in before_roles if r not in after_roles]
+            parts = []
+            if added:   parts.append("Added: " + ", ".join(f"@{r.name}" for r in added))
+            if removed: parts.append("Removed: " + ", ".join(f"@{r.name}" for r in removed))
+            if parts:
+                await _slog("🎭 Member Roles Updated",
+                    f"**Member:** {tname}\n" + "\n".join(parts) + f"\n**By:** {exec_str}", C_INFO)
+
+        elif action == discord.AuditLogAction.member_update:
+            # Nickname change (timeout handled above in MOD LOGS)
+            try:
+                tname  = target.mention if target else "Unknown"
+                before_nick = getattr(getattr(entry.changes, "before", None), "nick", None)
+                after_nick  = getattr(getattr(entry.changes, "after",  None), "nick", None)
+                if before_nick != after_nick:
+                    await _slog("✏️ Nickname Changed",
+                        f"**Member:** {tname}\n`{before_nick}` → `{after_nick}`\n**By:** {exec_str}", C_INFO)
+            except Exception: pass
+
+        elif action == discord.AuditLogAction.guild_update:
+            changes = entry.changes
+            diff_lines = []
+            for attr in ("name", "icon", "description", "verification_level",
+                         "explicit_content_filter", "default_notifications",
+                         "afk_timeout", "mfa_level", "vanity_url_code"):
+                bv = getattr(getattr(changes, "before", None), attr, None)
+                av = getattr(getattr(changes, "after",  None), attr, None)
+                if bv != av and av is not None:
+                    diff_lines.append(f"**{attr}:** `{bv}` → `{av}`")
+            if diff_lines:
+                await _slog("🌐 Server Updated", "\n".join(diff_lines) + f"\n**By:** {exec_str}", C_INFO)
+
+        elif action == discord.AuditLogAction.emoji_create:
+            await _slog("😄 Emoji Added", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_SUCCESS)
+
+        elif action == discord.AuditLogAction.emoji_delete:
+            await _slog("🗑️ Emoji Deleted", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_WARNING)
+
+        elif action == discord.AuditLogAction.emoji_update:
+            await _slog("✏️ Emoji Updated", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_INFO)
+
+        elif action == discord.AuditLogAction.sticker_create:
+            await _slog("🎟️ Sticker Added", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_SUCCESS)
+
+        elif action == discord.AuditLogAction.sticker_delete:
+            await _slog("🗑️ Sticker Deleted", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_WARNING)
+
+        elif action == discord.AuditLogAction.invite_create:
+            code = getattr(target, "code", "?") if target else "?"
+            ch_inv = getattr(target, "channel", None)
+            ch_str = ch_inv.mention if ch_inv else "?"
+            uses   = getattr(target, "max_uses", "∞")
+            await _slog("🔗 Invite Created",
+                f"**Code:** `{code}` → {ch_str}\n**Max uses:** {uses}\n**By:** {exec_str}", C_INFO)
+
+        elif action == discord.AuditLogAction.invite_delete:
+            code = getattr(target, "code", "?") if target else "?"
+            await _slog("🗑️ Invite Deleted", f"**Code:** `{code}`\n**By:** {exec_str}", C_WARNING)
+
+        elif action == discord.AuditLogAction.webhook_create:
+            wname = getattr(target, "name", "?") if target else "?"
+            await _slog("🪝 Webhook Created", f"**{wname}**\n**By:** {exec_str}", C_INFO)
+
+        elif action == discord.AuditLogAction.webhook_delete:
+            wname = getattr(target, "name", "?") if target else "?"
+            await _slog("🗑️ Webhook Deleted", f"**{wname}**\n**By:** {exec_str}", C_WARNING)
+
+        elif action == discord.AuditLogAction.webhook_update:
+            wname = getattr(target, "name", "?") if target else "?"
+            await _slog("✏️ Webhook Updated", f"**{wname}**\n**By:** {exec_str}", C_INFO)
+
+        elif action == discord.AuditLogAction.integration_create:
+            await _slog("🔌 Integration Added", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_INFO)
+
+        elif action == discord.AuditLogAction.integration_delete:
+            await _slog("🔌 Integration Removed", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_WARNING)
+
+        elif action == discord.AuditLogAction.overwrite_create:
+            ch_name = getattr(target, "name", "?") if target else "?"
+            await _slog("🔒 Permission Override Added", f"**#{ch_name}**\n**By:** {exec_str}", C_INFO)
+
+        elif action == discord.AuditLogAction.overwrite_delete:
+            ch_name = getattr(target, "name", "?") if target else "?"
+            await _slog("🔓 Permission Override Removed", f"**#{ch_name}**\n**By:** {exec_str}", C_INFO)
+
+        elif action == discord.AuditLogAction.thread_create:
+            await _slog("🧵 Thread Created", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_SUCCESS)
+
+        elif action == discord.AuditLogAction.thread_delete:
+            await _slog("🗑️ Thread Deleted", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_WARNING)
+
+        elif action == discord.AuditLogAction.stage_instance_create:
+            await _slog("🎙️ Stage Started", f"**By:** {exec_str}", C_SUCCESS)
+
+        elif action == discord.AuditLogAction.stage_instance_delete:
+            await _slog("🎙️ Stage Ended", f"**By:** {exec_str}", C_WARNING)
+
+        elif action == discord.AuditLogAction.scheduled_event_create:
+            await _slog("📅 Event Created", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_SUCCESS)
+
+        elif action == discord.AuditLogAction.scheduled_event_delete:
+            await _slog("🗑️ Event Deleted", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_WARNING)
 
     async def on_member_remove(self, member: discord.Member):
         if member.bot: return
@@ -4780,6 +5005,15 @@ async def cmd_purge(ctx: commands.Context, amount: int = 10):
     await ctx.message.delete()
     deleted = await ctx.channel.purge(limit=amount)
     await ctx.send(embed=ok(f"Deleted **{len(deleted)}** messages."), delete_after=5)
+    # Log to mod channel
+    if ctx.guild:
+        config = await get_config(ctx.guild.id)
+        lc = get_log_channel(ctx.guild, config, "mod")
+        if lc:
+            e = make_embed(C_WARNING, f"**{ctx.author.mention}** purged **{len(deleted)}** messages in {ctx.channel.mention}.")
+            e.title = "🧹 Messages Purged"
+            try: await lc.send(embed=e)
+            except Exception: pass
 
 
 @bot.command(name="setup", aliases=["config"])
@@ -5171,6 +5405,18 @@ async def _startup():
     except discord.LoginFailure: logger.critical("Invalid Discord token.")
     except Exception as exc:     logger.critical("Fatal: %s", exc, exc_info=exc)
     finally:
+        # ── Bot shutdown log (best-effort before DB closes) ───────────────────
+        try:
+            for guild in bot.guilds:
+                cfg = await db.get_config(guild.id)
+                lc_id = cfg.get("bot_log_channel_id") or cfg.get("log_channel_id")
+                if lc_id:
+                    lc = guild.get_channel(lc_id)
+                    if lc:
+                        e = make_embed(C_ERROR, f"**{bot.user}** is going **offline** / shutting down.")
+                        e.title = "🔴 Bot Offline"
+                        await lc.send(embed=e)
+        except Exception: pass
         await db.close()
         logger.info("DB closed.")
 
