@@ -1,17 +1,6 @@
 """
 LXTE's AI — built by AJ
-v18.1.0 — Changes from v18:
-  - ADDED: Dedicated log channels — message-logs, automod, mod-logs, entry-exit-logs, bot-logs
-  - ADDED: .setup → 📋 Logs section to configure each log channel independently
-  - ADDED: _get_log_channel() helper — routes logs to correct channel with legacy fallback
-  - ADDED: on_command() — logs every command invocation to bot-logs
-  - ADDED: on_command_error() — logs errors to bot-logs
-  - ADDED: on_member_update now logs role changes and timeouts to mod-logs
-  - ADDED: on_member_join now sends a full join embed to entry-exit-logs (account age, inviter)
-  - ADDED: on_member_remove now includes roles held in exit log
-  - IMPROVED: ghost-ping alert goes to mod-logs (separate from message-logs)
-  - IMPROVED: anti-nuke events go to mod-logs
-  - IMPROVED: anti-raid events go to entry-exit-logs
+v18.0.0 — Changes from v17:
   - ADDED: on_audit_log_entry_create — all nuke detection now uses audit log for accurate executor ID
   - ADDED: Raid verification via mass-message scan — confirms raid before locking (reduces false positives)
   - ADDED: Nuker punishment — strips all non-auto roles from the executor, kicks suspicious bots,
@@ -43,25 +32,230 @@ try:
 except ImportError:
     PILLOW_AVAILABLE = False
 
-try:
-    from better_profanity import profanity as _profanity_checker
-    _SWEAR_WORDS = [
-        "fuck", "fuk", "frick", "shit", "shite", "crap", "bitch",
-        "bastard", "asshole", "arsehole", "ass", "arse", "dick", "cock",
-        "pussy", "cunt", "damn", "damnit", "bollocks", "twat", "wanker",
-        "piss", "pissed", "bullshit", "motherfucker", "motherfucking",
-        "fucking", "shitting", "bitching", "jackass", "douchebag",
-    ]
-    _profanity_checker.load_censor_words()
-    _profanity_checker.add_censor_words(_SWEAR_WORDS)
-    PROFANITY_AVAILABLE = True
-    print("✅ better-profanity loaded — swear filter active")
-except ImportError:
-    PROFANITY_AVAILABLE = False
-    print("❌ better-profanity NOT installed — swear filter disabled! Run: pip install better-profanity==0.6.1")
+# ─── Slur / Swear Filter — bypass-resistant, zero dependencies ────────────────
+# Handles ALL known bypass techniques:
+#   • Repeated letters:        niiiggger, faaaggot
+#   • Separator insertion:     n.i.g.g.e.r  n-i-g  n_i_g  n i g g e r
+#   • Leetspeak:               n1gg3r  f4gg0t  k1k3  @ss
+#   • Unicode lookalikes:      Cyrillic/Greek/fullwidth chars that look like ASCII
+#   • Zero-width chars:        ni​gg​er (invisible chars between letters)
+#   • Combining diacritics:    n̈ïg̈g̈ër stripped via NFKD + combining removal
+#   • Mixed case + all above simultaneously
+
+import unicodedata as _ud
+
+# ── Invisible / zero-width character stripper ─────────────────────────────────
+_INVIS_RE = re.compile(
+    r"[\u200b-\u200f\u00ad\ufeff\u180e\u2060-\u2064"
+    r"\ufe0f\u034f\u115f\u1160\u17b4\u17b5\u3164\uffa0"
+    r"\u{E0000}-\u{E007F}]",  # tags block
+    re.UNICODE,
+)
+
+# ── Normalise: strip invisibles, NFKD decompose, drop combining marks, lowercase
+def _clean(text: str) -> str:
+    # 1. strip zero-width / invisible
+    text = re.sub(
+        r"[\u200b-\u200f\u00ad\ufeff\u180e\u2060-\u2064\ufe0f\u034f"
+        r"\u115f\u1160\u17b4\u17b5\u3164\uffa0]",
+        "", text,
+    )
+    # 2. NFKD — decomposes fullwidth, ligatures, precomposed chars
+    text = _ud.normalize("NFKD", text)
+    # 3. Drop combining diacritics (accent marks etc.)
+    text = "".join(c for c in text if _ud.category(c) != "Mn")
+    # 4. Lowercase
+    return text.lower()
+
+# ── Separator between letter slots (catches spaces, dots, dashes, underscores…)
+_SEP = r"[\s\W_]*"   # zero or more separator chars between every letter slot
+
+# ── Letter-slot character classes
+# Each string = all chars that can represent that letter (ASCII + lookalikes + leet)
+_A = r"[a@4áàâãäåæаą]"
+_B = r"[b68вбƀ]"
+_C = r"[cç¢(сċćčĉ]"
+_D = r"[dďđ]"
+_E = r"[e3éèêëęėеë€ę]"
+_F = r"[fƒ]"
+_G = r"[g9ģğġĝ]"
+_H = r"[hнħĥ]"
+_I = r"[i1!|íìîïіїįĩ]"
+_J = r"[jĵ]"
+_K = r"[kкķ]"
+_L = r"[l1|£ļłĺľ]"
+_M = r"[mмɱ]"
+_N = r"[nņñńňŋ]"
+_O = r"[o0óòôõöøðоőœ]"
+_P = r"[pрþ]"
+_Q = r"[q]"
+_R = r"[rгŗřŕ]"
+_S = r"[s5\$§šśŝşș]"
+_T = r"[t7\+ţťțŧ]"
+_U = r"[uüúùûůűųµ]"
+_V = r"[vνѵ]"
+_W = r"[wωŵ]"
+_X = r"[x×хχ]"
+_Y = r"[yýÿŷ]"
+_Z = r"[z2žżźƶ]"
+
+def _w(*slots: str) -> str:
+    """Join letter slots with optional separator between each."""
+    return _SEP.join(slots)
+
+# ── Pattern registry ──────────────────────────────────────────────────────────
+_SLUR_PATTERNS: list[tuple[re.Pattern, str]] = []
+
+def _add(pat: str, label: str):
+    try:
+        _SLUR_PATTERNS.append((re.compile(pat, re.IGNORECASE | re.UNICODE), label))
+    except re.error as exc:
+        print(f"[slur filter] Bad pattern '{label}': {exc}")
+
+# ── Boundary helper: word must not be embedded inside a longer alpha word ─────
+# Uses negative lookbehind/lookahead for ASCII letters only (post-clean text)
+_LB = r"(?<![a-z])"   # left boundary
+_RB = r"(?![a-z])"    # right boundary
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  SLUR PATTERNS
+# ════════════════════════════════════════════════════════════════════════════════
+
+# ── N-word (nigger / nigga / niggah / niglet / and all variants) ───────────────
+# Core: n + i/e + g + g + (e/a)(r/h)?  — with boundaries to avoid snigger/niggardly
+_add(_LB + _w(_N,_I,_G,_G) + r"[eaа@]?" + r"[rh]?" + _RB, "n-word")
+# Catch spaced-out: n word, n-word, n****r
+_add(r"(?<![a-z])" + _N + r"[\s\-_\*\.]{1,3}" + r"w[o0]r[dl]" + r"(?![a-z])", "n-word-phrase")
+# n + (any junk) + igger/igga pattern — catches deliberate letter insertions
+_add(_LB + _N + _SEP + r"[i1!|íìîïії]" + _SEP + _G + r"+" + _SEP + r"[eaа@]" + r"[rh]?" + _RB, "n-word-sep")
+
+# ── F-slur (faggot / fag / fgt / fagz) ───────────────────────────────────────
+_add(_LB + _w(_F,_A,_G) + r"(?:" + _SEP + _w(_G,_O,_T) + r")?" + _RB, "f-slur")
+_add(_LB + _F + _SEP + _G + _SEP + _T + _RB, "fgt")
+
+# ── K-slur (kike) ─────────────────────────────────────────────────────────────
+_add(_LB + _w(_K,_I,_K,_E) + _RB, "k-slur")
+
+# ── C-slur (ch*nk) ────────────────────────────────────────────────────────────
+_add(_LB + _w(_C,_H,_I,_N,_K) + r"s?" + _RB, "chink")
+
+# ── Sp*c / sp*ck ──────────────────────────────────────────────────────────────
+_add(_LB + _w(_S,_P) + r"[iae]" + _SEP + _w(_C,_K) + r"s?" + _RB, "spick")
+
+# ── W*tback ───────────────────────────────────────────────────────────────────
+_add(_LB + _w(_W,_E,_T,_B,_A,_C,_K) + _RB, "wetback")
+
+# ── Beaner ────────────────────────────────────────────────────────────────────
+_add(_LB + _w(_B,_E,_A,_N,_E,_R) + r"s?" + _RB, "beaner")
+
+# ── G**k ──────────────────────────────────────────────────────────────────────
+_add(_LB + _G + _SEP + r"[ou0]" + _SEP + _O + _SEP + _K + r"s?" + _RB, "gook")
+
+# ── J*p ───────────────────────────────────────────────────────────────────────
+_add(_LB + _J + _SEP + r"[a@]" + _SEP + _P + r"s?" + _RB, "jap")
+
+# ── R-slur (ret*rd) ───────────────────────────────────────────────────────────
+_add(_LB + _w(_R,_E,_T,_A,_R,_D) + r"(?:e[ds]?)?" + _RB, "r-slur")
+
+# ── Tr*nny ────────────────────────────────────────────────────────────────────
+_add(_LB + _w(_T,_R,_A,_N,_N) + r"(?:ie|y|ies)?" + _RB, "t-slur-tranny")
+
+# ── Sh*male ───────────────────────────────────────────────────────────────────
+_add(_LB + _w(_S,_H,_E,_M,_A,_L,_E) + _RB, "t-slur-shemale")
+
+# ── D*ke ──────────────────────────────────────────────────────────────────────
+_add(_LB + _D + _SEP + r"[yi1!]" + _SEP + _K + _SEP + _E + r"s?" + _RB, "d-slur")
+
+# ── C**t ──────────────────────────────────────────────────────────────────────
+_add(_LB + _w(_C,_U,_N,_T) + r"s?" + _RB, "c-word")
+
+# ── Cr*cker (racial) ──────────────────────────────────────────────────────────
+_add(_LB + _w(_C,_R,_A,_C,_K,_E,_R) + r"s?" + _RB, "cracker")
+
+# ── H*aji ─────────────────────────────────────────────────────────────────────
+_add(_LB + _w(_H,_A,_J,_I) + r"s?" + _RB, "haji")
+
+# ── Towelhead ─────────────────────────────────────────────────────────────────
+_add(_LB + _w(_T,_O,_W,_E,_L) + _SEP + _w(_H,_E,_A,_D) + _RB, "towelhead")
+
+# ── Sandnigger ────────────────────────────────────────────────────────────────
+_add(_LB + _w(_S,_A,_N,_D) + _SEP + _N + _SEP + r"[i1!|íì]" + _SEP + _G, "sand-n-word")
+
+# ── P*ki ──────────────────────────────────────────────────────────────────────
+_add(_LB + _w(_P,_A,_K,_I) + r"s?" + _RB, "paki")
+
+# ── G*psy (slur usage) ────────────────────────────────────────────────────────
+_add(_LB + _w(_G,_Y+r"|[ie]",_P,_S) + r"(?:y|ie|ies)?" + _RB, "gypo")
+
+# ── Zipperhead ────────────────────────────────────────────────────────────────
+_add(_LB + _w(_Z,_I,_P,_P,_E,_R) + _SEP + _w(_H,_E,_A,_D) + _RB, "zipperhead")
+
+# ── Slope (anti-Asian) ────────────────────────────────────────────────────────
+_add(_LB + _w(_S,_L,_O,_P,_E) + r"s?" + _RB, "slope")
+
+# ── Coon ──────────────────────────────────────────────────────────────────────
+_add(_LB + _w(_C,_O,_O,_N) + r"s?" + _RB, "coon")
+
+# ── Sambo ─────────────────────────────────────────────────────────────────────
+_add(_LB + _w(_S,_A,_M,_B,_O) + r"s?" + _RB, "sambo")
+
+# ── Darkie / Darky ────────────────────────────────────────────────────────────
+_add(_LB + _w(_D,_A,_R,_K) + r"(?:ie|y|ies)?" + _RB, "darkie")
+
+# ── Jungle bunny ──────────────────────────────────────────────────────────────
+_add(_LB + _w(_J,_U,_N,_G,_L,_E) + _SEP + _w(_B,_U,_N,_N) + r"(?:y|ies)?" + _RB, "jungle-bunny")
+
+# ── Porch monkey ──────────────────────────────────────────────────────────────
+_add(_LB + r"porch" + _SEP + _w(_M,_O,_N,_K) + r"(?:ey|ies)?" + _RB, "porch-monkey")
+
+# ── Mud duck (anti-Black) ─────────────────────────────────────────────────────
+_add(_LB + r"mud" + _SEP + r"duck" + _RB, "mud-duck")
+
+# ── Rice ball / rice eye (anti-Asian) ────────────────────────────────────────
+_add(_LB + r"rice" + _SEP + r"(?:ball|eye)" + _RB, "rice-slur")
+
+# ── Rag ?head ─────────────────────────────────────────────────────────────────
+_add(_LB + r"rag" + _SEP + r"head" + _RB, "raghead")
+
+# ── Camel jockey ──────────────────────────────────────────────────────────────
+_add(_LB + r"camel" + _SEP + r"jockey" + _RB, "camel-jockey")
+
+# ── White power / 1488 / 14 words ────────────────────────────────────────────
+_add(r"\b14\s*88\b", "1488")
+_add(r"\bwhite\s+power\b", "white-power")
+_add(r"\b88\b.*\b88\b", "hh-double")   # heil hitler coded
+_add(r"\bsieg\s+heil\b", "sieg-heil")
+_add(r"[hн][hн]\s*[hн][hн]", "hh")   # HH / heil hitler shorthand
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GENERAL SWEAR WORDS (same bypass-resistant engine)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_add(r"\b" + _w(_F,_U,_C,_K) + r"\b", "fuck")
+_add(r"\b" + _w(_S,_H,_I,_T) + r"\b", "shit")
+_add(r"\b" + _w(_B,_I,_T,_C,_H) + r"\b", "bitch")
+_add(r"\b" + _w(_D,_I,_C,_K) + r"\b", "dick")
+_add(r"\b" + _w(_C,_O,_C,_K) + r"\b", "cock")
+_add(r"\b" + _w(_W,_A,_N,_K,_E,_R) + r"\b", "wanker")
+_add(r"\b" + _w(_T,_W,_A,_T) + r"\b", "twat")
+_add(r"\b" + _w(_B,_O,_L,_L,_O,_C,_K) + r"s?\b", "bollocks")
+_add(r"\b" + _w(_M,_O,_T,_H,_E,_R) + _SEP + _w(_F,_U,_C,_K) + r"\b", "motherfucker")
+_add(r"\b" + _w(_A,_S,_S) + r"(?:" + _SEP + _w(_H,_O,_L,_E) + r")?\b", "ass")
+
+PROFANITY_AVAILABLE = True
+print(f"✅ Slur filter v2 loaded — {len(_SLUR_PATTERNS)} patterns active")
+
+# ── Detection function ────────────────────────────────────────────────────────
+def _contains_slur(text: str) -> tuple[bool, str]:
+    """Returns (matched, label). Cleans text before matching."""
+    cleaned = _clean(text)
+    for pattern, label in _SLUR_PATTERNS:
+        if pattern.search(cleaned):
+            return True, label
+    return False, ""
 
 load_dotenv()
-print("✅ LXTE's AI v18.1.0 loaded")
+print("✅ LXTE's AI v18.0.0 loaded")
 print("Tester v1 Loaded")
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logger = logging.getLogger("lxte")
@@ -975,7 +1169,7 @@ async def check_top_leaderboard(guild: discord.Guild):
         awarded = await bot.db.award_badge(top_uid, guild.id, "top_leaderboard")
         if awarded:
             config = await get_config(guild.id)
-            lc = _get_log_channel(guild, config, "bot") or guild.get_channel(config.get("log_channel_id"))
+            lc = guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
             if lc:
                 try: await lc.send(embed=make_embed(C_GOLD, f"🏆 {member.mention} is **#1 on the leaderboard** and earned **The Best** badge!"))
                 except Exception: pass
@@ -1220,7 +1414,7 @@ class SingleRoleSelect(discord.ui.RoleSelect):
 
 def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
     e = make_embed(C_PRIMARY)
-    e.title       = "⚙️ Server Setup — v18"
+    e.title       = "⚙️ Server Setup — v17"
     e.description = "Pick a section to configure. Dropdowns now support multiple selections."
 
     def ch(key):
@@ -1246,18 +1440,6 @@ def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
     e.add_field(name="💣 Anti-Nuke",  value=f"{'✅' if config.get('antinuke_enabled', True) else '❌'}", inline=True)
     e.add_field(name="🚫 Anti-Spam",  value=f"{'✅' if config.get('antispam_enabled', True) else '❌'} | Caps: {'✅' if config.get('anti_caps_enabled', False) else '❌'} | Emoji: {'✅' if config.get('anti_emoji_spam_enabled', False) else '❌'} | Swear: {'✅' if config.get('anti_swear_enabled', True) else '❌'}", inline=True)
     e.add_field(name="👻 Ghost/Mention", value=f"GhostPing: {'✅' if config.get('anti_ghost_ping_enabled', True) else '❌'} | MassMention: {'✅' if config.get('anti_mass_mention_enabled', True) else '❌'}", inline=True)
-    # ── Logs section ──────────────────────────────────────────────────────────
-    e.add_field(
-        name="📋 Logs",
-        value=(
-            f"💬 Messages: {ch('message_log_channel_id')}\n"
-            f"🛡️ Automod: {ch('automod_log_channel_id')}\n"
-            f"⚖️ Mod: {ch('mod_log_channel_id')}\n"
-            f"🚪 Entry/Exit: {ch('entry_exit_log_channel_id')}\n"
-            f"🤖 Bot: {ch('bot_log_channel_id')}"
-        ),
-        inline=False,
-    )
     e.set_footer(text="Admins only  •  Built by AJ  •  v18")
     return e
 
@@ -1325,74 +1507,9 @@ class SetupView(discord.ui.View):
     async def btn_levelroles(self, i, b):
         await i.response.send_message(embed=make_embed(C_INFO, "Configure level-up roles:"), view=LevelRolesSetupView(self.owner_id, self.guild_id), ephemeral=True)
 
-    @discord.ui.button(label="📋 Logs",       style=discord.ButtonStyle.primary,   row=3)
-    async def btn_logs(self, i, b):
-        config = await get_config(self.guild_id)
-        view   = LogsSetupView(self.owner_id, self.guild_id)
-        await i.response.send_message(embed=view._make_embed(config), view=view, ephemeral=True)
-
-    @discord.ui.button(label="✖ Close",      style=discord.ButtonStyle.danger,    row=4)
+    @discord.ui.button(label="✖ Close",      style=discord.ButtonStyle.danger,    row=3)
     async def btn_close(self, i, b):
         await i.message.delete()
-
-# ── Logs Setup ────────────────────────────────────────────────────────────────
-class LogsSetupView(discord.ui.View):
-    """Configure the 5 dedicated log channels. Each is independent."""
-
-    def __init__(self, owner_id: int, guild_id: int):
-        super().__init__(timeout=300)
-        self.owner_id = owner_id
-        self.guild_id = guild_id
-        # Row 0 — each selector targets a different config key
-        self.add_item(SingleChannelSelect("message_log_channel_id",    guild_id, self, "💬 Message logs channel…"))
-        self.add_item(SingleChannelSelect("automod_log_channel_id",    guild_id, self, "🛡️ Automod logs channel…"))
-        self.add_item(SingleChannelSelect("mod_log_channel_id",        guild_id, self, "⚖️ Mod logs channel…"))
-        self.add_item(SingleChannelSelect("entry_exit_log_channel_id", guild_id, self, "🚪 Entry/exit logs channel…"))
-        self.add_item(SingleChannelSelect("bot_log_channel_id",        guild_id, self, "🤖 Bot logs channel…"))
-
-    async def refresh(self, interaction: discord.Interaction):
-        config = await get_config(self.guild_id)
-        try:
-            await interaction.message.edit(embed=self._make_embed(config), view=self)
-        except Exception:
-            pass
-
-    def _make_embed(self, config: dict) -> discord.Embed:
-        def ch(key):
-            v = config.get(key)
-            return f"<#{v}>" if v else "`not set`"
-        e = make_embed(C_PRIMARY)
-        e.title = "📋 Log Channels"
-        e.description = (
-            "Set a dedicated channel for each log type.\n"
-            "If a specific channel isn't set, the bot falls back to the legacy **Automod Log** channel.\n\n"
-            f"**💬 message-logs** → {ch('message_log_channel_id')}\n"
-            f"*Edited & deleted messages*\n\n"
-            f"**🛡️ automod** → {ch('automod_log_channel_id')}\n"
-            f"*Spam, phishing, caps, swear filter actions*\n\n"
-            f"**⚖️ mod-logs** → {ch('mod_log_channel_id')}\n"
-            f"*Timeouts, role changes, ghost pings, anti-nuke events*\n\n"
-            f"**🚪 entry-exit-logs** → {ch('entry_exit_log_channel_id')}\n"
-            f"*Member joins, leaves, raid alerts, selfbot flags*\n\n"
-            f"**🤖 bot-logs** → {ch('bot_log_channel_id')}\n"
-            f"*Commands used, leaderboard badge awards*"
-        )
-        e.set_footer(text="Built by AJ  •  v18")
-        return e
-
-    @discord.ui.button(label="🗑️ Clear All Log Channels", style=discord.ButtonStyle.danger, row=1)
-    async def btn_clear_all(self, i: discord.Interaction, b):
-        for key in ("message_log_channel_id", "automod_log_channel_id", "mod_log_channel_id",
-                    "entry_exit_log_channel_id", "bot_log_channel_id"):
-            await bot.db.update_config(self.guild_id, key, None)
-        config = await get_config(self.guild_id)
-        await i.response.edit_message(embed=self._make_embed(config), view=self)
-
-    @discord.ui.button(label="📊 View Current", style=discord.ButtonStyle.secondary, row=1)
-    async def btn_view(self, i: discord.Interaction, b):
-        config = await get_config(self.guild_id)
-        await i.response.edit_message(embed=self._make_embed(config), view=self)
-
 
 # ── Welcome Setup ─────────────────────────────────────────────────────────────
 class WelcomeSetupView(discord.ui.View):
@@ -2191,19 +2308,36 @@ async def _automod_emoji(message: discord.Message, config: dict) -> bool:
     return False
 
 
+def _contains_slur(text: str) -> tuple[bool, str]:
+    """
+    Returns (matched, label) — label is the category name for logging.
+    Cleans the text first (strips zero-width, normalises unicode, lowercases).
+    """
+    cleaned = _clean(text)
+    for pattern, label in _SLUR_PATTERNS:
+        if pattern.search(cleaned):
+            return True, label
+    return False, ""
+
+
 async def _automod_swear(message: discord.Message, config: dict) -> bool:
-    """Swear word filter using better-profanity. Returns True if actioned."""
+    """Bypass-resistant slur/swear filter. Returns True if message was actioned."""
     if not config.get("anti_swear_enabled", True): return False
-    if not PROFANITY_AVAILABLE: return False
-    if not _profanity_checker.contains_profanity(message.content): return False
+    matched, label = _contains_slur(message.content)
+    if not matched: return False
     try: await message.delete()
     except Exception: pass
-    try: await message.channel.send(
-        embed=err(f"{message.author.mention} watch the language."),
-        delete_after=6,
-    )
+    try:
+        await message.channel.send(
+            embed=err(f"{message.author.mention} that language isn't allowed here."),
+            delete_after=6,
+        )
     except Exception: pass
-    _log_automod(message.guild, config, f"🤬 **Swear filter** — {message.author.mention}", C_WARNING)
+    _log_automod(
+        message.guild, config,
+        f"🤬 **Slur/swear filter** — {message.author.mention} triggered `{label}` filter",
+        C_WARNING,
+    )
     return True
 
 
@@ -2225,10 +2359,9 @@ async def run_automod(message: discord.Message, config: dict) -> bool:
     )
 
 def _log_automod(guild: discord.Guild, config: dict, description: str, color: int = C_WARNING):
-    """Fire-and-forget helper to send a message to the automod log channel."""
+    """Fire-and-forget helper to send a message to the log channel."""
     async def _send():
-        # Prefer dedicated automod log, fall back to legacy log_channel_id
-        lc_id = config.get("automod_log_channel_id") or config.get("log_channel_id")
+        lc_id = config.get("log_channel_id")
         lc = guild.get_channel(lc_id) if lc_id else next(
             (c for c in guild.text_channels if guild.me.permissions_in(c).send_messages), None
         )
@@ -2239,26 +2372,6 @@ def _log_automod(guild: discord.Guild, config: dict, description: str, color: in
             try: await lc.send(embed=e)
             except Exception: pass
     asyncio.create_task(_send())
-
-
-def _get_log_channel(guild: discord.Guild, config: dict, log_type: str) -> Optional[discord.TextChannel]:
-    """
-    Return the appropriate log channel for a given log type.
-    log_type: 'message' | 'automod' | 'mod' | 'entry_exit' | 'bot'
-    Falls back to the legacy log_channel_id if a specific one isn't set.
-    """
-    key_map = {
-        "message":    "message_log_channel_id",
-        "automod":    "automod_log_channel_id",
-        "mod":        "mod_log_channel_id",
-        "entry_exit": "entry_exit_log_channel_id",
-        "bot":        "bot_log_channel_id",
-    }
-    key   = key_map.get(log_type)
-    lc_id = config.get(key) if key else None
-    if not lc_id:
-        lc_id = config.get("log_channel_id")
-    return guild.get_channel(lc_id) if lc_id else None
 
 
 async def handle_antiraid(member: discord.Member, config: dict):
@@ -2306,7 +2419,7 @@ async def handle_antiraid(member: discord.Member, config: dict):
             try: await m.timeout(timedelta(minutes=30), reason="Anti-raid: auto-mute")
             except Exception: pass
 
-    log_ch = _get_log_channel(guild, config, "entry_exit") or _get_log_channel(guild, config, "mod")
+    log_ch = guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
     if not log_ch: log_ch = next((c for c in guild.text_channels if guild.me.permissions_in(c).send_messages), None)
     if log_ch:
         e = make_embed(C_ERROR,
@@ -2416,7 +2529,8 @@ async def _handle_nuke_event(guild: discord.Guild, config: dict, description: st
     if _raid_active.get(guild.id): return
     _raid_active[guild.id] = True
 
-    lc = _get_log_channel(guild, config, "mod") or next(
+    lc_id = config.get("log_channel_id")
+    lc = guild.get_channel(lc_id) if lc_id else next(
         (c for c in guild.text_channels if guild.me.permissions_in(c).send_messages), None
     )
 
@@ -2657,11 +2771,9 @@ class LXTEBot(commands.Bot):
         await self.process_commands(message)
 
     async def on_member_update(self, before: discord.Member, after: discord.Member):
-        guild  = after.guild
-        config = await get_config(guild.id)
-
-        # ── Boost detection ───────────────────────────────────────────────────
         if before.premium_since is None and after.premium_since is not None:
+            guild  = after.guild
+            config = await get_config(guild.id)
             total  = await self.db.record_boost(guild.id, after.id)
             await self.db.add_xp(after.id, guild.id, BOOST_XP_REWARD)
             data = await self.db.get_level_data(after.id, guild.id)
@@ -2683,71 +2795,16 @@ class LXTEBot(commands.Bot):
                 try: await bc.send(content=after.mention, embed=e)
                 except Exception: pass
 
-        # ── Mod log: role changes ─────────────────────────────────────────────
-        before_roles = set(r.id for r in before.roles)
-        after_roles  = set(r.id for r in after.roles)
-        added_ids    = after_roles - before_roles
-        removed_ids  = before_roles - after_roles
-        if added_ids or removed_ids:
-            mod_lc = _get_log_channel(guild, config, "mod")
-            if mod_lc:
-                added_str   = ", ".join(f"<@&{r}>" for r in added_ids)   or "None"
-                removed_str = ", ".join(f"<@&{r}>" for r in removed_ids) or "None"
-                e = make_embed(C_INFO)
-                e.title       = "🎭 Member Roles Updated"
-                e.description = f"{after.mention} (`{after.name}`)"
-                if added_ids:   e.add_field(name="➕ Added",   value=added_str,   inline=False)
-                if removed_ids: e.add_field(name="➖ Removed", value=removed_str, inline=False)
-                e.set_footer(text=f"User ID: {after.id}")
-                try: await mod_lc.send(embed=e)
-                except Exception: pass
-
-        # ── Mod log: timeout applied/removed ─────────────────────────────────
-        before_to = getattr(before, "timed_out_until", None)
-        after_to  = getattr(after,  "timed_out_until", None)
-        if before_to != after_to:
-            mod_lc = _get_log_channel(guild, config, "mod")
-            if mod_lc:
-                if after_to and (not before_to or after_to > before_to):
-                    e = make_embed(C_ERROR)
-                    e.title       = "🔇 Member Timed Out"
-                    e.description = f"{after.mention} (`{after.name}`) was timed out until {ts_full(after_to)}."
-                else:
-                    e = make_embed(C_SUCCESS)
-                    e.title       = "🔊 Timeout Removed"
-                    e.description = f"{after.mention} (`{after.name}`)'s timeout was removed."
-                e.set_footer(text=f"User ID: {after.id}")
-                try: await mod_lc.send(embed=e)
-                except Exception: pass
-
-    async def on_command(self, ctx: commands.Context):
-        """Log every command invocation to bot-logs."""
-        if not ctx.guild: return
-        config = await get_config(ctx.guild.id)
-        bot_lc = _get_log_channel(ctx.guild, config, "bot")
-        if not bot_lc: return
-        e = make_embed(C_PRIMARY)
-        e.title       = "🤖 Command Used"
-        e.description = (
-            f"**User:** {ctx.author.mention} (`{ctx.author.name}`, ID: `{ctx.author.id}`)\n"
-            f"**Command:** `{ctx.message.content[:200]}`\n"
-            f"**Channel:** {ctx.channel.mention}"
-        )
-        e.set_footer(text=f"Message ID: {ctx.message.id}")
-        try: await bot_lc.send(embed=e)
-        except Exception: pass
-
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
         if before.author.bot or not before.guild or before.content == after.content: return
         config = await get_config(before.guild.id)
-        lc = _get_log_channel(before.guild, config, "message")
+        lc = before.guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
         if not lc: return
         e = make_embed(C_INFO)
         e.title       = "✏️ Message Edited"
         e.description = f"{before.author.mention} in {before.channel.mention} [Jump]({after.jump_url})"
         e.add_field(name="Before", value=f"```{before.content[:400]}```", inline=False)
         e.add_field(name="After",  value=f"```{after.content[:400]}```",  inline=False)
-        e.set_footer(text=f"User ID: {before.author.id}  •  Msg ID: {before.id}")
         try: await lc.send(embed=e)
         except Exception: pass
 
@@ -2755,15 +2812,14 @@ class LXTEBot(commands.Bot):
     async def on_message_delete(self, message: discord.Message):
         if message.author.bot or not message.guild: return
         config = await get_config(message.guild.id)
-        msg_lc = _get_log_channel(message.guild, config, "message")
-        mod_lc = _get_log_channel(message.guild, config, "mod")
-        if msg_lc:
+        lc = message.guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
+        if lc:
             e = make_embed(C_WARNING)
             e.title       = "🗑️ Message Deleted"
             e.description = f"**Author:** {message.author.mention}\n**Channel:** {message.channel.mention}"
             e.add_field(name="Content", value=f"```{message.content[:500] or '*no text*'}```", inline=False)
-            e.set_footer(text=f"User ID: {message.author.id}  •  Msg ID: {message.id}")
-            try: await msg_lc.send(embed=e)
+            e.set_footer(text=f"ID: {message.id}")
+            try: await lc.send(embed=e)
             except Exception: pass
         # Ghost-ping check
         if config.get("anti_ghost_ping_enabled", True) and message.mentions:
@@ -2778,15 +2834,14 @@ class LXTEBot(commands.Bot):
                 if member and not member.guild_permissions.administrator:
                     try: await member.timeout(timedelta(minutes=timeout_mins), reason=f"Ghost ping (strike {strikes})")
                     except Exception: pass
-                log_target = mod_lc or msg_lc
-                if log_target:
+                if lc:
                     eg = make_embed(C_ERROR,
                         f"👻 **{message.author.mention}** ghost-pinged {names} and deleted the message.\n"
                         f"**Content:** {message.content[:300] or '*empty*'}\n"
                         f"**Action:** Muted {timeout_mins} min (strike {strikes})"
                     )
                     eg.title = "👻 Ghost Ping — Auto-Muted"
-                    try: await log_target.send(embed=eg)
+                    try: await lc.send(embed=eg)
                     except Exception: pass
                 try:
                     await message.channel.send(
@@ -2841,7 +2896,7 @@ class LXTEBot(commands.Bot):
         # NOTE: kick detection is now handled by on_audit_log_entry_create (v18)
         # on_member_remove fires for both leaves and kicks — we can't tell which
         # without the audit log, so we don't call handle_antinuke_kick here anymore.
-        lc = _get_log_channel(member.guild, config, "entry_exit")
+        lc = member.guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
         if lc:
             e = make_embed(C_WARNING)
             e.title       = "📤 Member Left"
@@ -2849,7 +2904,6 @@ class LXTEBot(commands.Bot):
             e.set_thumbnail(url=member.display_avatar.url)
             e.add_field(name="Joined", value=ts_full(member.joined_at) if member.joined_at else "unknown", inline=True)
             e.add_field(name="Left",   value=ts_full(datetime.now(timezone.utc)), inline=True)
-            e.add_field(name="Roles",  value=", ".join(r.name for r in member.roles if r.name != "@everyone")[:512] or "None", inline=False)
             try: await lc.send(embed=e)
             except Exception: pass
 
@@ -2869,29 +2923,13 @@ class LXTEBot(commands.Bot):
                     except Exception as e: logger.warning("AutoRole: %s", e)
         await send_welcome(member, config)
         await update_member_count(member.guild)
-
-        # ── Entry/exit log: member joined ────────────────────────────────────
-        ee_lc = _get_log_channel(member.guild, config, "entry_exit")
-        if ee_lc:
-            age_days = (datetime.now(timezone.utc) - member.created_at).days
-            inviter_str = f"{used.inviter.mention} (code: `{used.code}`)" if (used and used.inviter) else "Unknown"
-            ej = make_embed(C_SUCCESS)
-            ej.title       = "📥 Member Joined"
-            ej.description = f"{member.mention} (`{member.name}`, ID: `{member.id}`) joined."
-            ej.set_thumbnail(url=member.display_avatar.url)
-            ej.add_field(name="Account Age",  value=f"{age_days}d",     inline=True)
-            ej.add_field(name="Member #",     value=f"{member.guild.member_count}", inline=True)
-            ej.add_field(name="Invited By",   value=inviter_str,        inline=True)
-            ej.add_field(name="Created",      value=ts_full(member.created_at), inline=False)
-            try: await ee_lc.send(embed=ej)
-            except Exception: pass
-
         # Anti-selfbot: flag suspiciously new accounts with no avatar
         if config.get("anti_selfbot_enabled", True):
             age_days = (datetime.now(timezone.utc) - member.created_at).days
             no_avatar = member.display_avatar.is_asset()
             if age_days < 7 and no_avatar:
-                lc = ee_lc or _get_log_channel(member.guild, config, "mod")
+                lc_id = config.get("log_channel_id")
+                lc = member.guild.get_channel(lc_id) if lc_id else None
                 if lc:
                     e = make_embed(C_WARNING, f"⚠️ {member.mention} joined with a **{age_days}-day-old account** and no avatar. Possible selfbot/alt.\nID: `{member.id}`")
                     e.title = "🤖 Suspicious Account"
@@ -2944,22 +2982,6 @@ class LXTEBot(commands.Bot):
         else:
             await ctx.send(embed=err(f"Something went wrong:\n```{str(error)[:400]}```"))
             logger.error("Unhandled: %s", error, exc_info=error)
-        # Log errors to bot-logs
-        if ctx.guild and not isinstance(error, (commands.CommandNotFound, commands.CommandOnCooldown)):
-            try:
-                config = await get_config(ctx.guild.id)
-                bot_lc = _get_log_channel(ctx.guild, config, "bot")
-                if bot_lc:
-                    e = make_embed(C_ERROR)
-                    e.title       = "⚠️ Command Error"
-                    e.description = (
-                        f"**User:** {ctx.author.mention}\n"
-                        f"**Command:** `{ctx.message.content[:200]}`\n"
-                        f"**Error:** `{type(error).__name__}: {str(error)[:300]}`"
-                    )
-                    e.set_footer(text=f"Channel: #{ctx.channel.name}")
-                    await bot_lc.send(embed=e)
-            except Exception: pass
 
     # ── Background tasks ──────────────────────────────────────────────────────
 
