@@ -2458,16 +2458,73 @@ class AutomodSetupView(discord.ui.View):
 
 
 # ── Log Channels Setup ────────────────────────────────────────────────────────
+_LOG_CHANNEL_OPTIONS = [
+    ("message_log_channel_id", "💬 Message logs",    "Message edits & deletes"),
+    ("automod_log_channel_id", "🛡️ Automod logs",   "Spam, slurs, invites, caps…"),
+    ("mod_log_channel_id",     "⚖️ Mod logs",        "Bans, kicks, nuke, raid"),
+    ("entry_log_channel_id",   "🚪 Entry/Exit logs", "Member joins & leaves"),
+    ("bot_log_channel_id",     "🤖 Bot logs",        "Selfbot flags, suspicious accts"),
+]
+
 class LogChannelsSetupView(discord.ui.View):
-    """Configure all five separate log channels."""
+    """
+    Configure the five log channels one at a time.
+    Row 0 — category picker (which log type to set)
+    Row 1 — channel select (populated after picking a category)
+    Row 2 — Clear All button
+    This layout uses only 3 rows and stays within Discord's limits.
+    """
     def __init__(self, owner_id: int, guild_id: int):
         super().__init__(timeout=180)
-        self.guild_id = guild_id
-        self.add_item(SingleChannelSelect("message_log_channel_id", guild_id, self, "💬 Message logs channel…"))
-        self.add_item(SingleChannelSelect("automod_log_channel_id", guild_id, self, "🛡️ Automod logs channel…"))
-        self.add_item(SingleChannelSelect("mod_log_channel_id",     guild_id, self, "⚖️ Mod logs channel…"))
-        self.add_item(SingleChannelSelect("entry_log_channel_id",   guild_id, self, "🚪 Entry/exit logs channel…"))
-        self.add_item(SingleChannelSelect("bot_log_channel_id",     guild_id, self, "🤖 Bot logs channel…"))
+        self.guild_id        = guild_id
+        self._selected_key   = None  # config key chosen from the category picker
+
+        # Row 0: category picker
+        cat_select = discord.ui.Select(
+            placeholder="Pick which log channel to set…",
+            custom_id="logch:category",
+            row=0,
+            options=[
+                discord.SelectOption(label=label, value=key, description=desc)
+                for key, label, desc in _LOG_CHANNEL_OPTIONS
+            ],
+        )
+        cat_select.callback = self._on_category
+        self.add_item(cat_select)
+
+        # Row 1: channel select — placeholder until a category is chosen
+        self._ch_select = discord.ui.ChannelSelect(
+            placeholder="← Pick a log type first",
+            channel_types=[discord.ChannelType.text],
+            min_values=1, max_values=1,
+            custom_id="logch:channel",
+            row=1,
+            disabled=True,
+        )
+        self._ch_select.callback = self._on_channel
+        self.add_item(self._ch_select)
+
+    async def _on_category(self, interaction: discord.Interaction):
+        self._selected_key = interaction.data["values"][0]
+        label = next(lbl for key, lbl, _ in _LOG_CHANNEL_OPTIONS if key == self._selected_key)
+        # Enable the channel select and update its placeholder
+        self._ch_select.disabled     = False
+        self._ch_select.placeholder  = f"Set channel for {label}…"
+        await interaction.response.edit_message(view=self)
+
+    async def _on_channel(self, interaction: discord.Interaction):
+        if not self._selected_key:
+            await interaction.response.send_message(embed=err("Pick a log type first."), ephemeral=True)
+            return
+        ch = self._ch_select.values[0]
+        await bot.db.update_config(self.guild_id, self._selected_key, ch.id)
+        label = next(lbl for key, lbl, _ in _LOG_CHANNEL_OPTIONS if key == self._selected_key)
+        # Reset for next pick
+        self._selected_key          = None
+        self._ch_select.disabled    = True
+        self._ch_select.placeholder = "← Pick a log type first"
+        await interaction.response.send_message(embed=ok(f"{label} set to {ch.mention}."), ephemeral=True)
+        await self.refresh(interaction)
 
     async def refresh(self, interaction: discord.Interaction):
         config = await get_config(self.guild_id)
@@ -2484,12 +2541,13 @@ class LogChannelsSetupView(discord.ui.View):
         try: await interaction.message.edit(embed=make_embed(C_INFO, desc), view=self)
         except Exception: pass
 
-    @discord.ui.button(label="Clear All Log Channels", style=discord.ButtonStyle.danger, row=4)
+    @discord.ui.button(label="Clear All Log Channels", style=discord.ButtonStyle.danger, row=2)
     async def clear_all(self, i: discord.Interaction, b):
         for key in ("message_log_channel_id", "automod_log_channel_id", "mod_log_channel_id",
                     "entry_log_channel_id", "bot_log_channel_id", "log_channel_id"):
             await bot.db.update_config(self.guild_id, key, None)
         await i.response.send_message(embed=ok("All log channels cleared."), ephemeral=True)
+        await self.refresh(i)
 
 
 # ── Ticket Setup ──────────────────────────────────────────────────────────────
