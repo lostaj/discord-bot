@@ -1,6 +1,17 @@
 """
 LXTE's AI — built by AJ
-v18.0.0 — Changes from v17:
+v18.1.0 — Changes from v18:
+  - ADDED: Dedicated log channels — message-logs, automod, mod-logs, entry-exit-logs, bot-logs
+  - ADDED: .setup → 📋 Logs section to configure each log channel independently
+  - ADDED: _get_log_channel() helper — routes logs to correct channel with legacy fallback
+  - ADDED: on_command() — logs every command invocation to bot-logs
+  - ADDED: on_command_error() — logs errors to bot-logs
+  - ADDED: on_member_update now logs role changes and timeouts to mod-logs
+  - ADDED: on_member_join now sends a full join embed to entry-exit-logs (account age, inviter)
+  - ADDED: on_member_remove now includes roles held in exit log
+  - IMPROVED: ghost-ping alert goes to mod-logs (separate from message-logs)
+  - IMPROVED: anti-nuke events go to mod-logs
+  - IMPROVED: anti-raid events go to entry-exit-logs
   - ADDED: on_audit_log_entry_create — all nuke detection now uses audit log for accurate executor ID
   - ADDED: Raid verification via mass-message scan — confirms raid before locking (reduces false positives)
   - ADDED: Nuker punishment — strips all non-auto roles from the executor, kicks suspicious bots,
@@ -50,7 +61,7 @@ except ImportError:
     print("❌ better-profanity NOT installed — swear filter disabled! Run: pip install better-profanity==0.6.1")
 
 load_dotenv()
-print("✅ LXTE's AI v18.0.0 loaded")
+print("✅ LXTE's AI v18.1.0 loaded")
 print("Tester v1 Loaded")
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logger = logging.getLogger("lxte")
@@ -964,7 +975,7 @@ async def check_top_leaderboard(guild: discord.Guild):
         awarded = await bot.db.award_badge(top_uid, guild.id, "top_leaderboard")
         if awarded:
             config = await get_config(guild.id)
-            lc = guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
+            lc = _get_log_channel(guild, config, "bot") or guild.get_channel(config.get("log_channel_id"))
             if lc:
                 try: await lc.send(embed=make_embed(C_GOLD, f"🏆 {member.mention} is **#1 on the leaderboard** and earned **The Best** badge!"))
                 except Exception: pass
@@ -1209,7 +1220,7 @@ class SingleRoleSelect(discord.ui.RoleSelect):
 
 def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
     e = make_embed(C_PRIMARY)
-    e.title       = "⚙️ Server Setup — v17"
+    e.title       = "⚙️ Server Setup — v18"
     e.description = "Pick a section to configure. Dropdowns now support multiple selections."
 
     def ch(key):
@@ -1235,6 +1246,18 @@ def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
     e.add_field(name="💣 Anti-Nuke",  value=f"{'✅' if config.get('antinuke_enabled', True) else '❌'}", inline=True)
     e.add_field(name="🚫 Anti-Spam",  value=f"{'✅' if config.get('antispam_enabled', True) else '❌'} | Caps: {'✅' if config.get('anti_caps_enabled', False) else '❌'} | Emoji: {'✅' if config.get('anti_emoji_spam_enabled', False) else '❌'} | Swear: {'✅' if config.get('anti_swear_enabled', True) else '❌'}", inline=True)
     e.add_field(name="👻 Ghost/Mention", value=f"GhostPing: {'✅' if config.get('anti_ghost_ping_enabled', True) else '❌'} | MassMention: {'✅' if config.get('anti_mass_mention_enabled', True) else '❌'}", inline=True)
+    # ── Logs section ──────────────────────────────────────────────────────────
+    e.add_field(
+        name="📋 Logs",
+        value=(
+            f"💬 Messages: {ch('message_log_channel_id')}\n"
+            f"🛡️ Automod: {ch('automod_log_channel_id')}\n"
+            f"⚖️ Mod: {ch('mod_log_channel_id')}\n"
+            f"🚪 Entry/Exit: {ch('entry_exit_log_channel_id')}\n"
+            f"🤖 Bot: {ch('bot_log_channel_id')}"
+        ),
+        inline=False,
+    )
     e.set_footer(text="Admins only  •  Built by AJ  •  v18")
     return e
 
@@ -1302,9 +1325,74 @@ class SetupView(discord.ui.View):
     async def btn_levelroles(self, i, b):
         await i.response.send_message(embed=make_embed(C_INFO, "Configure level-up roles:"), view=LevelRolesSetupView(self.owner_id, self.guild_id), ephemeral=True)
 
-    @discord.ui.button(label="✖ Close",      style=discord.ButtonStyle.danger,    row=3)
+    @discord.ui.button(label="📋 Logs",       style=discord.ButtonStyle.primary,   row=3)
+    async def btn_logs(self, i, b):
+        config = await get_config(self.guild_id)
+        view   = LogsSetupView(self.owner_id, self.guild_id)
+        await i.response.send_message(embed=view._make_embed(config), view=view, ephemeral=True)
+
+    @discord.ui.button(label="✖ Close",      style=discord.ButtonStyle.danger,    row=4)
     async def btn_close(self, i, b):
         await i.message.delete()
+
+# ── Logs Setup ────────────────────────────────────────────────────────────────
+class LogsSetupView(discord.ui.View):
+    """Configure the 5 dedicated log channels. Each is independent."""
+
+    def __init__(self, owner_id: int, guild_id: int):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+        # Row 0 — each selector targets a different config key
+        self.add_item(SingleChannelSelect("message_log_channel_id",    guild_id, self, "💬 Message logs channel…"))
+        self.add_item(SingleChannelSelect("automod_log_channel_id",    guild_id, self, "🛡️ Automod logs channel…"))
+        self.add_item(SingleChannelSelect("mod_log_channel_id",        guild_id, self, "⚖️ Mod logs channel…"))
+        self.add_item(SingleChannelSelect("entry_exit_log_channel_id", guild_id, self, "🚪 Entry/exit logs channel…"))
+        self.add_item(SingleChannelSelect("bot_log_channel_id",        guild_id, self, "🤖 Bot logs channel…"))
+
+    async def refresh(self, interaction: discord.Interaction):
+        config = await get_config(self.guild_id)
+        try:
+            await interaction.message.edit(embed=self._make_embed(config), view=self)
+        except Exception:
+            pass
+
+    def _make_embed(self, config: dict) -> discord.Embed:
+        def ch(key):
+            v = config.get(key)
+            return f"<#{v}>" if v else "`not set`"
+        e = make_embed(C_PRIMARY)
+        e.title = "📋 Log Channels"
+        e.description = (
+            "Set a dedicated channel for each log type.\n"
+            "If a specific channel isn't set, the bot falls back to the legacy **Automod Log** channel.\n\n"
+            f"**💬 message-logs** → {ch('message_log_channel_id')}\n"
+            f"*Edited & deleted messages*\n\n"
+            f"**🛡️ automod** → {ch('automod_log_channel_id')}\n"
+            f"*Spam, phishing, caps, swear filter actions*\n\n"
+            f"**⚖️ mod-logs** → {ch('mod_log_channel_id')}\n"
+            f"*Timeouts, role changes, ghost pings, anti-nuke events*\n\n"
+            f"**🚪 entry-exit-logs** → {ch('entry_exit_log_channel_id')}\n"
+            f"*Member joins, leaves, raid alerts, selfbot flags*\n\n"
+            f"**🤖 bot-logs** → {ch('bot_log_channel_id')}\n"
+            f"*Commands used, leaderboard badge awards*"
+        )
+        e.set_footer(text="Built by AJ  •  v18")
+        return e
+
+    @discord.ui.button(label="🗑️ Clear All Log Channels", style=discord.ButtonStyle.danger, row=1)
+    async def btn_clear_all(self, i: discord.Interaction, b):
+        for key in ("message_log_channel_id", "automod_log_channel_id", "mod_log_channel_id",
+                    "entry_exit_log_channel_id", "bot_log_channel_id"):
+            await bot.db.update_config(self.guild_id, key, None)
+        config = await get_config(self.guild_id)
+        await i.response.edit_message(embed=self._make_embed(config), view=self)
+
+    @discord.ui.button(label="📊 View Current", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_view(self, i: discord.Interaction, b):
+        config = await get_config(self.guild_id)
+        await i.response.edit_message(embed=self._make_embed(config), view=self)
+
 
 # ── Welcome Setup ─────────────────────────────────────────────────────────────
 class WelcomeSetupView(discord.ui.View):
@@ -2137,9 +2225,10 @@ async def run_automod(message: discord.Message, config: dict) -> bool:
     )
 
 def _log_automod(guild: discord.Guild, config: dict, description: str, color: int = C_WARNING):
-    """Fire-and-forget helper to send a message to the log channel."""
+    """Fire-and-forget helper to send a message to the automod log channel."""
     async def _send():
-        lc_id = config.get("log_channel_id")
+        # Prefer dedicated automod log, fall back to legacy log_channel_id
+        lc_id = config.get("automod_log_channel_id") or config.get("log_channel_id")
         lc = guild.get_channel(lc_id) if lc_id else next(
             (c for c in guild.text_channels if guild.me.permissions_in(c).send_messages), None
         )
@@ -2150,6 +2239,26 @@ def _log_automod(guild: discord.Guild, config: dict, description: str, color: in
             try: await lc.send(embed=e)
             except Exception: pass
     asyncio.create_task(_send())
+
+
+def _get_log_channel(guild: discord.Guild, config: dict, log_type: str) -> Optional[discord.TextChannel]:
+    """
+    Return the appropriate log channel for a given log type.
+    log_type: 'message' | 'automod' | 'mod' | 'entry_exit' | 'bot'
+    Falls back to the legacy log_channel_id if a specific one isn't set.
+    """
+    key_map = {
+        "message":    "message_log_channel_id",
+        "automod":    "automod_log_channel_id",
+        "mod":        "mod_log_channel_id",
+        "entry_exit": "entry_exit_log_channel_id",
+        "bot":        "bot_log_channel_id",
+    }
+    key   = key_map.get(log_type)
+    lc_id = config.get(key) if key else None
+    if not lc_id:
+        lc_id = config.get("log_channel_id")
+    return guild.get_channel(lc_id) if lc_id else None
 
 
 async def handle_antiraid(member: discord.Member, config: dict):
@@ -2197,7 +2306,7 @@ async def handle_antiraid(member: discord.Member, config: dict):
             try: await m.timeout(timedelta(minutes=30), reason="Anti-raid: auto-mute")
             except Exception: pass
 
-    log_ch = guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
+    log_ch = _get_log_channel(guild, config, "entry_exit") or _get_log_channel(guild, config, "mod")
     if not log_ch: log_ch = next((c for c in guild.text_channels if guild.me.permissions_in(c).send_messages), None)
     if log_ch:
         e = make_embed(C_ERROR,
@@ -2307,8 +2416,7 @@ async def _handle_nuke_event(guild: discord.Guild, config: dict, description: st
     if _raid_active.get(guild.id): return
     _raid_active[guild.id] = True
 
-    lc_id = config.get("log_channel_id")
-    lc = guild.get_channel(lc_id) if lc_id else next(
+    lc = _get_log_channel(guild, config, "mod") or next(
         (c for c in guild.text_channels if guild.me.permissions_in(c).send_messages), None
     )
 
@@ -2549,9 +2657,11 @@ class LXTEBot(commands.Bot):
         await self.process_commands(message)
 
     async def on_member_update(self, before: discord.Member, after: discord.Member):
+        guild  = after.guild
+        config = await get_config(guild.id)
+
+        # ── Boost detection ───────────────────────────────────────────────────
         if before.premium_since is None and after.premium_since is not None:
-            guild  = after.guild
-            config = await get_config(guild.id)
             total  = await self.db.record_boost(guild.id, after.id)
             await self.db.add_xp(after.id, guild.id, BOOST_XP_REWARD)
             data = await self.db.get_level_data(after.id, guild.id)
@@ -2573,16 +2683,71 @@ class LXTEBot(commands.Bot):
                 try: await bc.send(content=after.mention, embed=e)
                 except Exception: pass
 
+        # ── Mod log: role changes ─────────────────────────────────────────────
+        before_roles = set(r.id for r in before.roles)
+        after_roles  = set(r.id for r in after.roles)
+        added_ids    = after_roles - before_roles
+        removed_ids  = before_roles - after_roles
+        if added_ids or removed_ids:
+            mod_lc = _get_log_channel(guild, config, "mod")
+            if mod_lc:
+                added_str   = ", ".join(f"<@&{r}>" for r in added_ids)   or "None"
+                removed_str = ", ".join(f"<@&{r}>" for r in removed_ids) or "None"
+                e = make_embed(C_INFO)
+                e.title       = "🎭 Member Roles Updated"
+                e.description = f"{after.mention} (`{after.name}`)"
+                if added_ids:   e.add_field(name="➕ Added",   value=added_str,   inline=False)
+                if removed_ids: e.add_field(name="➖ Removed", value=removed_str, inline=False)
+                e.set_footer(text=f"User ID: {after.id}")
+                try: await mod_lc.send(embed=e)
+                except Exception: pass
+
+        # ── Mod log: timeout applied/removed ─────────────────────────────────
+        before_to = getattr(before, "timed_out_until", None)
+        after_to  = getattr(after,  "timed_out_until", None)
+        if before_to != after_to:
+            mod_lc = _get_log_channel(guild, config, "mod")
+            if mod_lc:
+                if after_to and (not before_to or after_to > before_to):
+                    e = make_embed(C_ERROR)
+                    e.title       = "🔇 Member Timed Out"
+                    e.description = f"{after.mention} (`{after.name}`) was timed out until {ts_full(after_to)}."
+                else:
+                    e = make_embed(C_SUCCESS)
+                    e.title       = "🔊 Timeout Removed"
+                    e.description = f"{after.mention} (`{after.name}`)'s timeout was removed."
+                e.set_footer(text=f"User ID: {after.id}")
+                try: await mod_lc.send(embed=e)
+                except Exception: pass
+
+    async def on_command(self, ctx: commands.Context):
+        """Log every command invocation to bot-logs."""
+        if not ctx.guild: return
+        config = await get_config(ctx.guild.id)
+        bot_lc = _get_log_channel(ctx.guild, config, "bot")
+        if not bot_lc: return
+        e = make_embed(C_PRIMARY)
+        e.title       = "🤖 Command Used"
+        e.description = (
+            f"**User:** {ctx.author.mention} (`{ctx.author.name}`, ID: `{ctx.author.id}`)\n"
+            f"**Command:** `{ctx.message.content[:200]}`\n"
+            f"**Channel:** {ctx.channel.mention}"
+        )
+        e.set_footer(text=f"Message ID: {ctx.message.id}")
+        try: await bot_lc.send(embed=e)
+        except Exception: pass
+
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
         if before.author.bot or not before.guild or before.content == after.content: return
         config = await get_config(before.guild.id)
-        lc = before.guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
+        lc = _get_log_channel(before.guild, config, "message")
         if not lc: return
         e = make_embed(C_INFO)
         e.title       = "✏️ Message Edited"
         e.description = f"{before.author.mention} in {before.channel.mention} [Jump]({after.jump_url})"
         e.add_field(name="Before", value=f"```{before.content[:400]}```", inline=False)
         e.add_field(name="After",  value=f"```{after.content[:400]}```",  inline=False)
+        e.set_footer(text=f"User ID: {before.author.id}  •  Msg ID: {before.id}")
         try: await lc.send(embed=e)
         except Exception: pass
 
@@ -2590,14 +2755,15 @@ class LXTEBot(commands.Bot):
     async def on_message_delete(self, message: discord.Message):
         if message.author.bot or not message.guild: return
         config = await get_config(message.guild.id)
-        lc = message.guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
-        if lc:
+        msg_lc = _get_log_channel(message.guild, config, "message")
+        mod_lc = _get_log_channel(message.guild, config, "mod")
+        if msg_lc:
             e = make_embed(C_WARNING)
             e.title       = "🗑️ Message Deleted"
             e.description = f"**Author:** {message.author.mention}\n**Channel:** {message.channel.mention}"
             e.add_field(name="Content", value=f"```{message.content[:500] or '*no text*'}```", inline=False)
-            e.set_footer(text=f"ID: {message.id}")
-            try: await lc.send(embed=e)
+            e.set_footer(text=f"User ID: {message.author.id}  •  Msg ID: {message.id}")
+            try: await msg_lc.send(embed=e)
             except Exception: pass
         # Ghost-ping check
         if config.get("anti_ghost_ping_enabled", True) and message.mentions:
@@ -2612,14 +2778,15 @@ class LXTEBot(commands.Bot):
                 if member and not member.guild_permissions.administrator:
                     try: await member.timeout(timedelta(minutes=timeout_mins), reason=f"Ghost ping (strike {strikes})")
                     except Exception: pass
-                if lc:
+                log_target = mod_lc or msg_lc
+                if log_target:
                     eg = make_embed(C_ERROR,
                         f"👻 **{message.author.mention}** ghost-pinged {names} and deleted the message.\n"
                         f"**Content:** {message.content[:300] or '*empty*'}\n"
                         f"**Action:** Muted {timeout_mins} min (strike {strikes})"
                     )
                     eg.title = "👻 Ghost Ping — Auto-Muted"
-                    try: await lc.send(embed=eg)
+                    try: await log_target.send(embed=eg)
                     except Exception: pass
                 try:
                     await message.channel.send(
@@ -2674,7 +2841,7 @@ class LXTEBot(commands.Bot):
         # NOTE: kick detection is now handled by on_audit_log_entry_create (v18)
         # on_member_remove fires for both leaves and kicks — we can't tell which
         # without the audit log, so we don't call handle_antinuke_kick here anymore.
-        lc = member.guild.get_channel(config.get("log_channel_id")) if config.get("log_channel_id") else None
+        lc = _get_log_channel(member.guild, config, "entry_exit")
         if lc:
             e = make_embed(C_WARNING)
             e.title       = "📤 Member Left"
@@ -2682,6 +2849,7 @@ class LXTEBot(commands.Bot):
             e.set_thumbnail(url=member.display_avatar.url)
             e.add_field(name="Joined", value=ts_full(member.joined_at) if member.joined_at else "unknown", inline=True)
             e.add_field(name="Left",   value=ts_full(datetime.now(timezone.utc)), inline=True)
+            e.add_field(name="Roles",  value=", ".join(r.name for r in member.roles if r.name != "@everyone")[:512] or "None", inline=False)
             try: await lc.send(embed=e)
             except Exception: pass
 
@@ -2701,13 +2869,29 @@ class LXTEBot(commands.Bot):
                     except Exception as e: logger.warning("AutoRole: %s", e)
         await send_welcome(member, config)
         await update_member_count(member.guild)
+
+        # ── Entry/exit log: member joined ────────────────────────────────────
+        ee_lc = _get_log_channel(member.guild, config, "entry_exit")
+        if ee_lc:
+            age_days = (datetime.now(timezone.utc) - member.created_at).days
+            inviter_str = f"{used.inviter.mention} (code: `{used.code}`)" if (used and used.inviter) else "Unknown"
+            ej = make_embed(C_SUCCESS)
+            ej.title       = "📥 Member Joined"
+            ej.description = f"{member.mention} (`{member.name}`, ID: `{member.id}`) joined."
+            ej.set_thumbnail(url=member.display_avatar.url)
+            ej.add_field(name="Account Age",  value=f"{age_days}d",     inline=True)
+            ej.add_field(name="Member #",     value=f"{member.guild.member_count}", inline=True)
+            ej.add_field(name="Invited By",   value=inviter_str,        inline=True)
+            ej.add_field(name="Created",      value=ts_full(member.created_at), inline=False)
+            try: await ee_lc.send(embed=ej)
+            except Exception: pass
+
         # Anti-selfbot: flag suspiciously new accounts with no avatar
         if config.get("anti_selfbot_enabled", True):
             age_days = (datetime.now(timezone.utc) - member.created_at).days
             no_avatar = member.display_avatar.is_asset()
             if age_days < 7 and no_avatar:
-                lc_id = config.get("log_channel_id")
-                lc = member.guild.get_channel(lc_id) if lc_id else None
+                lc = ee_lc or _get_log_channel(member.guild, config, "mod")
                 if lc:
                     e = make_embed(C_WARNING, f"⚠️ {member.mention} joined with a **{age_days}-day-old account** and no avatar. Possible selfbot/alt.\nID: `{member.id}`")
                     e.title = "🤖 Suspicious Account"
@@ -2760,6 +2944,22 @@ class LXTEBot(commands.Bot):
         else:
             await ctx.send(embed=err(f"Something went wrong:\n```{str(error)[:400]}```"))
             logger.error("Unhandled: %s", error, exc_info=error)
+        # Log errors to bot-logs
+        if ctx.guild and not isinstance(error, (commands.CommandNotFound, commands.CommandOnCooldown)):
+            try:
+                config = await get_config(ctx.guild.id)
+                bot_lc = _get_log_channel(ctx.guild, config, "bot")
+                if bot_lc:
+                    e = make_embed(C_ERROR)
+                    e.title       = "⚠️ Command Error"
+                    e.description = (
+                        f"**User:** {ctx.author.mention}\n"
+                        f"**Command:** `{ctx.message.content[:200]}`\n"
+                        f"**Error:** `{type(error).__name__}: {str(error)[:300]}`"
+                    )
+                    e.set_footer(text=f"Channel: #{ctx.channel.name}")
+                    await bot_lc.send(embed=e)
+            except Exception: pass
 
     # ── Background tasks ──────────────────────────────────────────────────────
 
