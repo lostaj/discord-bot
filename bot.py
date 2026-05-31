@@ -252,7 +252,6 @@ def _contains_slur(text: str) -> tuple[bool, str]:
 
 load_dotenv()
 print("✅ LXTE's AI v18.0.0 loaded")
-print("Tester v1 Loaded")
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logger = logging.getLogger("lxte")
 logger.setLevel(logging.INFO)
@@ -1451,7 +1450,9 @@ def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
 
     e.add_field(name="👋 Welcome",    value=f"Channel: {ch('welcome_channel_id')}\nDM: {'✅' if config.get('welcome_dm_enabled') else '❌'}", inline=True)
     e.add_field(name="🛡️ Automod",   value=f"{'✅' if config.get('automod_enabled', True) else '❌'}", inline=True)
-    e.add_field(name="🎫 Tickets",   value=f"Panel: {ch('ticket_panel_channel_id')}\nStaff: {ro('ticket_staff_role_ids') if not config.get('ticket_staff_role_ids') else f'{len(config.get(\"ticket_staff_role_ids\",[]))} role(s)'}", inline=True)
+    _tsr = config.get("ticket_staff_role_ids", [])
+    _staff_val = ro("ticket_staff_role_ids") if not _tsr else f"{len(_tsr)} role(s)"
+    e.add_field(name="🎫 Tickets",   value=f"Panel: {ch('ticket_panel_channel_id')}\nStaff: {_staff_val}", inline=True)
     e.add_field(name="🚀 Boosts",    value=f"Channel: {ch('boost_channel_id')}", inline=True)
     e.add_field(name="🎭 Roles",     value=f"Auto: {len(config.get('autoroles', []))} | 2XP: {len(config.get('double_xp_roles', []))} | LvlRoles: {len(config.get('level_roles', []))}", inline=True)
     e.add_field(name="🤖 AI",        value=f"Channels: {ch_list('ai_channel_ids')} | Web: {'✅' if config.get('web_search', True) else '❌'}", inline=True)
@@ -3008,7 +3009,7 @@ class LXTEBot(commands.Bot):
             age_days = (datetime.now(timezone.utc) - member.created_at).days
             no_avatar = member.display_avatar.is_asset()
             if age_days < 7 and no_avatar:
-            lc = get_log_channel(member.guild, config, "bot")
+                lc = get_log_channel(member.guild, config, "bot")
                 if lc:
                     e = make_embed(C_WARNING, f"⚠️ {member.mention} joined with a **{age_days}-day-old account** and no avatar. Possible selfbot/alt.\nID: `{member.id}`")
                     e.title = "🤖 Suspicious Account"
