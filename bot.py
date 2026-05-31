@@ -1,25 +1,21 @@
 """
 LXTE's AI — built by AJ
-v18.0.0 — Changes from v17:
-  - ADDED: on_audit_log_entry_create — all nuke detection now uses audit log for accurate executor ID
-  - ADDED: Raid verification via mass-message scan — confirms raid before locking (reduces false positives)
-  - ADDED: Nuker punishment — strips all non-auto roles from the executor, kicks suspicious bots,
-           deletes suspicious webhooks created during nuke window; NEVER bans/kicks real members
-  - ADDED: Ghost-ping soft-warn — ghost pinger gets a 60s timeout on first offence (logged)
-  - ADDED: Anti-nuke for mass role grants — detects someone granting @everyone / dangerous perms
-  - FIXED: _nuke_window_check decoupled from side-effects (double-trigger race condition fixed)
-  - FIXED: run_automod split into focused sub-functions (phishing, spam, mention, caps, emoji)
-  - FIXED: _spam_tracker / _dup_tracker now persist to DB every 5 min (survive restarts)
-  - FIXED: handle_antiraid guards against stacked lockdown timers
-  - FIXED: msgsync uses bulk_write instead of per-user update loop
-  - FIXED: ticket autoclose remaining-time calc was off — now correct
-  - FIXED: setup_embed footer now says v18
+v19.0.0 — Changes from v18:
+  - ADDED: Real-time web search — AI can search the internet for current info (DuckDuckGo, no key needed)
+  - ADDED: .weather <city> — live weather via Open-Meteo (free, no API key)
+  - ADDED: .roblox <game> — live Roblox game stats (player count, visits) via Roblox API
+  - ADDED: .price <coin/stock> — live crypto prices via CoinGecko (free) + basic stock via Yahoo Finance
+  - ADDED: .news [topic] — latest headlines via NewsData.io RSS (no key needed)
+  - ADDED: Web search auto-trigger in .ask — detects when question needs real-time info and auto-searches
+  - ADDED: setup_embed now shows web search toggle (was already in config but not displayed)
+  - FIXED: setup_embed footer now says v19
+  - FIXED: AIEngine.ask accepts web_results kwarg to inject live data into context
 """
 
 import io, os, re, json, math, time, asyncio, logging, itertools, signal, collections, random
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from dotenv import load_dotenv
 import psutil, httpx, discord
@@ -251,7 +247,7 @@ def _contains_slur(text: str) -> tuple[bool, str]:
     return False, ""
 
 load_dotenv()
-print("✅ LXTE's AI v18.0.0 loaded")
+print("✅ LXTE's AI v19.0.0 loaded")
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logger = logging.getLogger("lxte")
 logger.setLevel(logging.INFO)
@@ -273,6 +269,32 @@ GROQ_TEXT   = "llama-3.3-70b-versatile"
 GROQ_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"
 MAX_TOKENS  = 800
 TEMPERATURE = 0.55
+
+# ─── Real-time / Web Search ───────────────────────────────────────────────────
+# DuckDuckGo Instant Answer API — no key needed
+DDG_API          = "https://api.duckduckgo.com/"
+# Open-Meteo weather — free, no key
+OPENMETEO_GEO    = "https://geocoding-api.open-meteo.com/v1/search"
+OPENMETEO_WX     = "https://api.open-meteo.com/v1/forecast"
+# CoinGecko crypto — free tier, no key
+COINGECKO_SEARCH = "https://api.coingecko.com/api/v3/search"
+COINGECKO_PRICE  = "https://api.coingecko.com/api/v3/simple/price"
+# Roblox public API — no key
+ROBLOX_SEARCH    = "https://games.roblox.com/v1/games/list"
+ROBLOX_DETAIL    = "https://games.roblox.com/v1/games"
+# Yahoo Finance scrape-free endpoint
+YAHOO_QUOTE      = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+# Web search result limit
+WEB_SEARCH_RESULTS = 5
+
+# Regex to detect real-time intent in questions
+_REALTIME_RE = re.compile(
+    r"\b(today|tonight|right now|current(?:ly)?|live|latest|recent(?:ly)?|"
+    r"new(?:est)?|now|this (week|month|year)|trending|update[sd]?|"
+    r"weather|temperature|price|cost|stock|crypto|bitcoin|ethereum|"
+    r"news|headline|breaking|announcement|patch|update|roblox|bedwars)\b",
+    re.I,
+)
 
 # ─── Limits ───────────────────────────────────────────────────────────────────
 MAX_HISTORY_TURNS  = 30
@@ -409,6 +431,27 @@ MEMBER_TRIGGER = re.compile(
     r"\b(my|your|their|his|her)\s+(level|xp|role|rank|badge|streak|join|account)\b"
     r"|who (am i|is @|are they)|@\w+|\b\d{17,20}\b", re.I)
 
+# Triggers for live server-wide data (leaderboard, members online, channels, etc.)
+SERVER_TRIGGER = re.compile(
+    r"\b("
+    r"leaderboard|top\s*\d*|most\s+active|most\s+messages|highest\s+(level|xp)|"
+    r"who('s|s| is| are| has| have)\s+(online|active|talking|boosting|playing|top|#1|first|winning|leading|in\s+voice)|"
+    r"how\s+many\s+(members|people|users|online|boosters|roles|channels)|"
+    r"server\s+(stats|info|members|roles|channels|activity)|"
+    r"member\s+(count|list|stats)|"
+    r"channel\s+(list|stats|activity)|"
+    r"voice\s+(channel|members|who.{0,10}voice)|"
+    r"online\s+(members|people|users|now)|"
+    r"who.{0,20}(server|here|join(ed)?|left|boost|online)|"
+    r"recent\s+(join|activity|members)|"
+    r"(active|inactive)\s+(members?|users?)|"
+    r"boost(er)?s?|"
+    r"giveaway|ticket|"
+    r"(server|guild)\s+(level|xp|rank|tier|boost)"
+    r")\b",
+    re.I,
+)
+
 # ─── Achievements ─────────────────────────────────────────────────────────────
 ACHIEVEMENTS = [
     {"id": "first_message",   "name": "First Words",     "emoji": "🌱", "desc": "Send your first message"},
@@ -474,6 +517,30 @@ You are an expert on:
 If someone asks about something completely unrelated (e.g. homework, random trivia), gently steer back:
 "I'm mostly here for LXTE and BedWars stuff — but I can try help with that too if you need."
 Never flat-out refuse, just steer.
+
+## LIVE SERVER DATA — HOW TO USE IT
+Every single response you give already has a complete live snapshot of the entire server injected into your context. This was pulled from Discord and the database the exact moment the message was sent. It includes:
+
+- The person asking: their status, voice channel, activity, every role, full XP/level/messages/streaks/badges/invites, AFK status
+- Every member: who's online, idle, DND, offline, in voice, playing, streaming, listening to Spotify, AFK
+- Every voice channel and exactly who is in it right now, with their mute/deaf/stream/camera flags
+- Every text channel, every category, every role with member counts and permission flags
+- XP leaderboard top 10 with streaks and last active dates
+- Message leaderboard top 10 with first/last message dates
+- Invite leaderboard top 10
+- Boost leaderboard top 10 with first boost dates
+- All active giveaways with prize, entries, host, end time
+- All open tickets with opener and timestamp
+- Member count history for the last 7 days
+- Whether a double XP event is running and how long is left
+- Full server config (all toggles, all log channels, all configured roles)
+- All reaction roles and role menus
+- The last 10 messages in the current channel before this question
+
+USE THIS DATA DIRECTLY. Never say "I don't have access to server info" — you always do. Read the context and answer from it. If someone asks who's online, look at the online list. If they ask who's most active, read the leaderboard. If they ask who's in voice, read the voice section. Answer like you're watching the server live, because you are.
+
+## REAL-TIME INFORMATION
+When a LIVE WEB SEARCH RESULTS block is in context, use it as your primary source for current facts outside the server.
 
 ## FACT CHECKING
 - If a user states something as fact and you're not sure, say: "I'm not 100% sure on that one — worth double checking."
@@ -1063,6 +1130,225 @@ class Database:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  REAL-TIME DATA HELPERS  (v19)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def web_search(query: str, max_results: int = WEB_SEARCH_RESULTS) -> str:
+    """Search DuckDuckGo Instant Answer API + HTML scrape fallback. Returns formatted string."""
+    try:
+        params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True,
+                                     headers={"User-Agent": "LXTEBot/19 Discord"}) as c:
+            r = await c.get(DDG_API, params=params)
+            data = r.json()
+
+        lines: list[str] = []
+        if data.get("AbstractText"):
+            lines.append(f"📖 {data['AbstractText'][:400]}")
+            if data.get("AbstractURL"):
+                lines.append(f"   Source: {data['AbstractURL']}")
+
+        for topic in data.get("RelatedTopics", [])[:max_results]:
+            text = topic.get("Text") or (topic.get("Topics") and topic["Topics"][0].get("Text"))
+            if text:
+                lines.append(f"• {text[:200]}")
+
+        if not lines and data.get("Answer"):
+            lines.append(f"💡 {data['Answer']}")
+
+        if not lines:
+            return f"[No instant answer found for: {query}]"
+
+        return "\n".join(lines[:max_results + 2])
+    except Exception as exc:
+        logger.warning("web_search error: %s", exc)
+        return f"[Search failed: {exc}]"
+
+
+async def get_weather(city: str) -> str:
+    """Fetch current weather for a city using Open-Meteo (free, no key)."""
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+            # Step 1: geocode
+            geo = await c.get(OPENMETEO_GEO, params={"name": city, "count": 1, "language": "en", "format": "json"})
+            geo_data = geo.json()
+            results = geo_data.get("results")
+            if not results:
+                return f"❌ Couldn't find location: **{city}**"
+            loc = results[0]
+            lat, lon = loc["latitude"], loc["longitude"]
+            name = loc.get("name", city)
+            country = loc.get("country", "")
+
+            # Step 2: fetch weather
+            wx = await c.get(OPENMETEO_WX, params={
+                "latitude": lat, "longitude": lon,
+                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,weathercode",
+                "wind_speed_unit": "mph",
+                "temperature_unit": "celsius",
+                "timezone": "auto",
+            })
+            wx_data = wx.json()
+
+        cur = wx_data.get("current", {})
+        temp     = cur.get("temperature_2m", "?")
+        feels    = cur.get("apparent_temperature", "?")
+        humidity = cur.get("relative_humidity_2m", "?")
+        wind     = cur.get("wind_speed_10m", "?")
+        code     = cur.get("weathercode", 0)
+
+        # WMO weather code → description
+        WMO = {
+            0: "☀️ Clear sky", 1: "🌤️ Mostly clear", 2: "⛅ Partly cloudy", 3: "☁️ Overcast",
+            45: "🌫️ Foggy", 48: "🌫️ Icy fog",
+            51: "🌦️ Light drizzle", 53: "🌦️ Drizzle", 55: "🌧️ Heavy drizzle",
+            61: "🌧️ Light rain", 63: "🌧️ Rain", 65: "🌧️ Heavy rain",
+            71: "🌨️ Light snow", 73: "🌨️ Snow", 75: "❄️ Heavy snow",
+            80: "🌦️ Rain showers", 81: "🌧️ Showers", 82: "⛈️ Heavy showers",
+            95: "⛈️ Thunderstorm", 96: "⛈️ Thunderstorm + hail", 99: "⛈️ Heavy thunderstorm",
+        }
+        desc = WMO.get(code, f"Code {code}")
+
+        return (
+            f"🌍 **{name}, {country}**\n"
+            f"{desc}\n"
+            f"🌡️ {temp}°C (feels {feels}°C) | 💧 {humidity}% humidity | 💨 {wind} mph"
+        )
+    except Exception as exc:
+        logger.warning("get_weather error: %s", exc)
+        return f"❌ Weather fetch failed: {exc}"
+
+
+async def get_crypto_price(query: str) -> str:
+    """Get live crypto price from CoinGecko (free, no key)."""
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True,
+                                     headers={"Accept": "application/json"}) as c:
+            # Search for coin ID
+            sr = await c.get(COINGECKO_SEARCH, params={"query": query})
+            sr_data = sr.json()
+            coins = sr_data.get("coins", [])
+            if not coins:
+                return f"❌ Couldn't find crypto: **{query}**"
+            coin_id   = coins[0]["id"]
+            coin_name = coins[0]["name"]
+            coin_sym  = coins[0]["symbol"].upper()
+
+            # Fetch price
+            pr = await c.get(COINGECKO_PRICE, params={
+                "ids": coin_id, "vs_currencies": "usd",
+                "include_24hr_change": "true", "include_market_cap": "true",
+            })
+            pr_data = pr.json()
+            info = pr_data.get(coin_id, {})
+            price  = info.get("usd", "?")
+            change = info.get("usd_24h_change")
+            mcap   = info.get("usd_market_cap")
+
+            change_str = f"{change:+.2f}%" if isinstance(change, float) else "?"
+            mcap_str   = f"${mcap/1e9:.2f}B" if isinstance(mcap, float) and mcap > 1e9 else (f"${mcap/1e6:.1f}M" if isinstance(mcap, float) else "?")
+            arrow      = "📈" if isinstance(change, float) and change >= 0 else "📉"
+
+            return (
+                f"{arrow} **{coin_name} ({coin_sym})**\n"
+                f"Price: **${price:,.4f}**\n"
+                f"24h: {change_str} | Market cap: {mcap_str}"
+            )
+    except Exception as exc:
+        logger.warning("get_crypto_price error: %s", exc)
+        return f"❌ Price fetch failed: {exc}"
+
+
+async def get_stock_price(ticker: str) -> str:
+    """Get live stock quote from Yahoo Finance (no key)."""
+    try:
+        ticker = ticker.upper().strip()
+        url = YAHOO_QUOTE.format(ticker=quote(ticker))
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True,
+                                     headers={"User-Agent": "Mozilla/5.0"}) as c:
+            r = await c.get(url)
+            data = r.json()
+        meta   = data["chart"]["result"][0]["meta"]
+        price  = meta.get("regularMarketPrice", "?")
+        prev   = meta.get("chartPreviousClose", price)
+        name   = meta.get("longName") or meta.get("shortName") or ticker
+        change = ((price - prev) / prev * 100) if isinstance(price, float) and isinstance(prev, float) and prev else 0
+        arrow  = "📈" if change >= 0 else "📉"
+        return (
+            f"{arrow} **{name} ({ticker})**\n"
+            f"Price: **${price:,.2f}** | 24h: {change:+.2f}%"
+        )
+    except Exception as exc:
+        logger.warning("get_stock_price error: %s", exc)
+        return f"❌ Stock fetch failed for **{ticker}**: {exc}"
+
+
+async def get_roblox_game(query: str) -> str:
+    """Search Roblox games and return live stats."""
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True,
+                                     headers={"User-Agent": "LXTEBot/19"}) as c:
+            # Search games
+            sr = await c.get(
+                "https://apis.roblox.com/search-api/omni-search",
+                params={"searchQuery": query, "sessionId": "", "pageToken": "", "pageType": "all"},
+            )
+            sr_data = sr.json()
+            items = sr_data.get("searchResults", [])
+            game_results = next((x for x in items if x.get("contentGroupType") == "Game"), None)
+            if not game_results:
+                return f"❌ Couldn't find Roblox game: **{query}**"
+
+            contents = game_results.get("contents", [])
+            if not contents:
+                return f"❌ No results for: **{query}**"
+
+            universe_id = contents[0].get("universeId") or contents[0].get("id")
+            if not universe_id:
+                return f"❌ Couldn't get game ID for: **{query}**"
+
+            # Get game details
+            gd = await c.get(f"{ROBLOX_DETAIL}?universeIds={universe_id}")
+            gd_data = gd.json()
+            game = gd_data.get("data", [{}])[0]
+
+            name      = game.get("name", query)
+            playing   = game.get("playing", "?")
+            visits    = game.get("visits", "?")
+            created   = game.get("created", "")[:10]
+            max_plrs  = game.get("maxPlayers", "?")
+            creator   = game.get("creator", {}).get("name", "?")
+
+            visits_fmt = f"{int(visits):,}" if isinstance(visits, int) else str(visits)
+            playing_fmt = f"{int(playing):,}" if isinstance(playing, int) else str(playing)
+
+            return (
+                f"🎮 **{name}**\n"
+                f"👥 Playing now: **{playing_fmt}** | 👀 Total visits: **{visits_fmt}**\n"
+                f"🏗️ Creator: {creator} | Max players: {max_plrs} | Created: {created}"
+            )
+    except Exception as exc:
+        logger.warning("get_roblox_game error: %s", exc)
+        return f"❌ Roblox lookup failed: {exc}"
+
+
+async def auto_web_search(question: str) -> str:
+    """
+    Called automatically inside .ask when question looks like it needs real-time info.
+    Returns a short search result block to inject into AI context, or "" if not needed.
+    """
+    if not _REALTIME_RE.search(question):
+        return ""
+    try:
+        results = await web_search(question, max_results=4)
+        if results.startswith("[No instant") or results.startswith("[Search failed"):
+            return ""
+        return f"\n\n## LIVE WEB SEARCH RESULTS\nQuery: {question}\n{results}"
+    except Exception:
+        return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  AI ENGINE  (FIXED: simplified, no more dead JSON meta routing)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1095,64 +1381,584 @@ def resolve_mentioned_members(message: discord.Message, guild: discord.Guild) ->
         if m: found.add(m.id)
     return [guild.get_member(uid) for uid in found if guild.get_member(uid)]
 
+# ── Status helpers ────────────────────────────────────────────────────────────
+_STATUS_EMOJI = {
+    discord.Status.online:  "🟢",
+    discord.Status.idle:    "🌙",
+    discord.Status.dnd:     "🔴",
+    discord.Status.offline: "⚫",
+}
+
+def _member_status(member: discord.Member) -> str:
+    emoji  = _STATUS_EMOJI.get(member.status, "⚫")
+    label  = str(member.status).replace("dnd", "DND").replace("online", "online").replace("offline", "offline").replace("idle", "idle")
+    mobile = " 📱" if getattr(member, "mobile_status", None) not in (None, discord.Status.offline) else ""
+    return f"{emoji} {label}{mobile}"
+
+def _member_activity(member: discord.Member) -> str:
+    acts = member.activities if hasattr(member, "activities") else ([member.activity] if member.activity else [])
+    parts = []
+    for act in acts:
+        if isinstance(act, discord.Spotify):
+            parts.append(f"🎵 Listening: {act.title} by {act.artist}")
+        elif isinstance(act, discord.Game):
+            parts.append(f"🎮 Playing: {act.name}")
+        elif isinstance(act, discord.Streaming):
+            parts.append(f"📡 Streaming: {act.name}")
+        elif isinstance(act, discord.CustomActivity) and act.name:
+            parts.append(f"💬 Status: {act.name}")
+        elif hasattr(act, "name") and act.name:
+            parts.append(f"▶ {act.name}")
+    return " | ".join(parts) if parts else "none"
+
+def _voice_detail(member: discord.Member) -> str:
+    if not member.voice or not member.voice.channel:
+        return "not in voice"
+    vs  = member.voice
+    vc  = vs.channel
+    others = [m.display_name for m in vc.members if m.id != member.id and not m.bot]
+    flags  = []
+    if vs.self_mute or vs.mute:   flags.append("muted")
+    if vs.self_deaf or vs.deaf:   flags.append("deafened")
+    if vs.self_stream:            flags.append("streaming")
+    if vs.self_video:             flags.append("camera on")
+    flag_str  = f" [{', '.join(flags)}]" if flags else ""
+    other_str = f" with: {', '.join(others[:5])}{'...' if len(others) > 5 else ''}" if others else " (alone)"
+    return f"#{vc.name}{flag_str}{other_str}"
+
+
 async def build_member_context(member: discord.Member, guild: discord.Guild) -> str:
-    data  = await bot.db.get_level_data(member.id, guild.id)
-    stats = await bot.db.get_stats(member.id)
-    total_xp = data.get("total_xp", 0)
+    """Full profile of a single member — DB + Discord gateway."""
+    # Parallel DB fetches
+    lvl_data, stats, msg_data = await asyncio.gather(
+        bot.db.get_level_data(member.id, guild.id),
+        bot.db.get_stats(member.id),
+        bot.db.get_msg_data(member.id, guild.id),
+        return_exceptions=True,
+    )
+    if isinstance(lvl_data, Exception): lvl_data = {}
+    if isinstance(stats,    Exception): stats    = {}
+    if isinstance(msg_data, Exception): msg_data = {}
+
+    total_xp           = lvl_data.get("total_xp", 0)
     level, xp_in, xp_need = calculate_level(total_xp)
-    badges = [a["name"] for a in ACHIEVEMENTS if a["id"] in data.get("badges", [])]
-    roles  = [f"{r.name}" for r in member.roles if r.name != "@everyone"]
-    lines  = [
-        f"Display: {member.display_name}  |  Username: {member.name}  |  ID: {member.id}",
-        f"Created: {ts_full(member.created_at)}  |  Joined: {ts_full(member.joined_at) if member.joined_at else 'unknown'}",
-        f"Top role: {member.top_role.name}  |  Admin: {member.guild_permissions.administrator}",
-        f"Boosting: {ts_full(member.premium_since) if member.premium_since else 'no'}",
-        f"Roles: {', '.join(roles) or 'none'}",
-        f"Level: {level}  |  XP: {total_xp:,}  |  Progress: {xp_in}/{xp_need}",
-        f"Messages: {data.get('messages',0):,}  |  Streak: {data.get('streak',0)}d",
-        f"Rank: {get_role_for_level(level) or 'Unranked'}  |  Badges: {', '.join(badges) or 'none'}",
-        f"AI questions: {stats.get('questions', 0):,}",
+    badges             = [a["name"] for a in ACHIEVEMENTS if a["id"] in lvl_data.get("badges", [])]
+    roles              = [r.name for r in reversed(member.roles) if r.name != "@everyone"]
+    perms              = member.guild_permissions
+
+    # Key permissions summary
+    perm_flags = []
+    if perms.administrator:    perm_flags.append("ADMIN")
+    if perms.manage_guild:     perm_flags.append("manage_guild")
+    if perms.manage_messages:  perm_flags.append("manage_messages")
+    if perms.kick_members:     perm_flags.append("kick")
+    if perms.ban_members:      perm_flags.append("ban")
+    if perms.manage_roles:     perm_flags.append("manage_roles")
+    if perms.moderate_members: perm_flags.append("timeout")
+
+    # Invite count
+    invite_count = 0
+    try:
+        invite_count = await bot.db.get_invite_count(guild.id, member.id)
+    except Exception: pass
+
+    # Boost history
+    boost_doc = {}
+    try:
+        boost_doc = await bot.db.boosts.find_one({"guild_id": guild.id, "user_id": member.id}) or {}
+    except Exception: pass
+
+    # Top channels by message count
+    ch_data    = msg_data.get("channels", {}) if isinstance(msg_data, dict) else {}
+    top_chans  = sorted(ch_data.items(), key=lambda x: x[1], reverse=True)[:3]
+    chan_str   = ", ".join(
+        f"#{guild.get_channel(int(cid)).name if guild.get_channel(int(cid)) else cid} ({cnt:,})"
+        for cid, cnt in top_chans
+    ) if top_chans else "none"
+
+    lines = [
+        f"┌─ {member.display_name} (@{member.name}) — ID: {member.id}",
+        f"│  Status: {_member_status(member)}",
+        f"│  Activity: {_member_activity(member)}",
+        f"│  Voice: {_voice_detail(member)}",
+        f"│  Account created: {member.created_at.strftime('%Y-%m-%d')}",
+        f"│  Joined server:   {member.joined_at.strftime('%Y-%m-%d') if member.joined_at else 'unknown'}",
+        f"│  Boosting since:  {member.premium_since.strftime('%Y-%m-%d') if member.premium_since else 'no'}"
+        + (f" (×{boost_doc.get('boost_count', 1)} total boosts)" if boost_doc else ""),
+        f"│  Top role: {member.top_role.name}",
+        f"│  All roles [{len(roles)}]: {', '.join(roles) or 'none'}",
+        f"│  Permissions: {', '.join(perm_flags) or 'standard'}",
+        f"│  Bot account: {member.bot}",
+        f"│  XP level: {level}  |  Total XP: {total_xp:,}  |  Progress: {xp_in:,}/{xp_need:,}",
+        f"│  XP rank name: {get_role_for_level(level) or 'Unranked'}",
+        f"│  XP messages: {lvl_data.get('messages', 0):,}  |  Streak: {lvl_data.get('streak', 0)}d",
+        f"│  Total messages (all-time): {msg_data.get('total_messages', 0):,}",
+        f"│  Most active channels: {chan_str}",
+        f"│  First message: {msg_data.get('first_message', 'unknown')}",
+        f"│  Last message: {msg_data.get('last_message', 'unknown')}",
+        f"│  Invites brought: {invite_count}",
+        f"│  Badges: {', '.join(badges) or 'none'}",
+        f"│  AI questions asked: {stats.get('questions', 0):,}",
+        f"└─ AFK: {_afk_users[member.id][0] if member.id in _afk_users else 'no'}",
     ]
     return "\n".join(lines)
 
-async def build_context(ctx: commands.Context, recent_chat: str = "") -> str:
-    lines  = []
-    member = ctx.author
-    guild  = ctx.guild
-    q      = ctx.message.content
-    needs  = bool(MEMBER_TRIGGER.search(q))
 
-    lines.append("=== REQUESTING USER ===")
-    if needs and isinstance(member, discord.Member) and guild:
-        lines.append(await build_member_context(member, guild))
+async def build_full_server_snapshot(guild: discord.Guild) -> str:
+    """
+    Complete live snapshot of everything the bot knows about the server.
+    Pulls from Discord gateway (in-memory, instant) + MongoDB (async DB queries run in parallel).
+    """
+    now = datetime.now(timezone.utc)
+    lines: list[str] = []
+
+    # ══ 1. SERVER IDENTITY ════════════════════════════════════════════════════
+    lines.append("╔══ SERVER IDENTITY ══╗")
+    owner = guild.owner
+    lines.append(
+        f"Name: {guild.name}  |  ID: {guild.id}\n"
+        f"Owner: {owner.display_name} (@{owner.name}, ID: {owner.id})" if owner else f"Name: {guild.name}  |  ID: {guild.id}"
+    )
+    lines.append(
+        f"Created: {guild.created_at.strftime('%Y-%m-%d')}  |  "
+        f"Verification: {guild.verification_level}  |  "
+        f"MFA required: {guild.mfa_level.value > 0}  |  "
+        f"Explicit filter: {guild.explicit_content_filter}"
+    )
+    lines.append(
+        f"Boost tier: {guild.premium_tier}  |  "
+        f"Boosts: {guild.premium_subscription_count or 0}  |  "
+        f"Max file size: {guild.filesize_limit // 1_048_576}MB  |  "
+        f"Max bitrate: {guild.bitrate_limit // 1000}kbps"
+    )
+    lines.append(f"Features: {', '.join(guild.features) or 'none'}")
+
+    # ══ 2. MEMBER COUNTS & ONLINE STATUS ═════════════════════════════════════
+    lines.append("\n╔══ MEMBERS — LIVE ══╗")
+    all_members  = guild.members
+    humans       = [m for m in all_members if not m.bot]
+    bots_list    = [m for m in all_members if m.bot]
+    online_h     = [m for m in humans if m.status == discord.Status.online]
+    idle_h       = [m for m in humans if m.status == discord.Status.idle]
+    dnd_h        = [m for m in humans if m.status == discord.Status.dnd]
+    offline_h    = [m for m in humans if m.status == discord.Status.offline]
+    mobile_h     = [m for m in humans if getattr(m, "mobile_status", discord.Status.offline) not in (discord.Status.offline, None)]
+    boosters     = [m for m in humans if m.premium_since]
+    admins       = [m for m in humans if m.guild_permissions.administrator]
+    moderators   = [m for m in humans if not m.guild_permissions.administrator and (
+                    m.guild_permissions.kick_members or m.guild_permissions.ban_members or m.guild_permissions.manage_messages)]
+
+    lines.append(
+        f"Total: {len(all_members)}  |  Humans: {len(humans)}  |  Bots: {len(bots_list)}\n"
+        f"🟢 Online: {len(online_h)}  |  🌙 Idle: {len(idle_h)}  |  🔴 DND: {len(dnd_h)}  |  ⚫ Offline: {len(offline_h)}\n"
+        f"📱 On mobile: {len(mobile_h)}  |  🚀 Boosters: {len(boosters)}  |  🛡️ Admins: {len(admins)}  |  ⚖️ Mods: {len(moderators)}"
+    )
+
+    # Who is online right now (names, up to 20)
+    if online_h:
+        names = ", ".join(m.display_name for m in online_h[:20])
+        extra = f" +{len(online_h)-20} more" if len(online_h) > 20 else ""
+        lines.append(f"Online now: {names}{extra}")
+    if idle_h:
+        names = ", ".join(m.display_name for m in idle_h[:10])
+        lines.append(f"Idle: {names}{'...' if len(idle_h) > 10 else ''}")
+    if dnd_h:
+        names = ", ".join(m.display_name for m in dnd_h[:10])
+        lines.append(f"DND: {names}{'...' if len(dnd_h) > 10 else ''}")
+    if boosters:
+        bnames = ", ".join(m.display_name for m in boosters)
+        lines.append(f"Current boosters: {bnames}")
+    if admins:
+        lines.append(f"Admins: {', '.join(m.display_name for m in admins)}")
+    if moderators:
+        lines.append(f"Moderators: {', '.join(m.display_name for m in moderators[:10])}")
+
+    # Bots in the server
+    lines.append(f"Bots: {', '.join(m.display_name for m in bots_list)}")
+
+    # Recently joined (last 10)
+    recent_joins = sorted([m for m in humans if m.joined_at], key=lambda m: m.joined_at, reverse=True)[:10]
+    if recent_joins:
+        rj = " | ".join(f"{m.display_name} (joined {m.joined_at.strftime('%Y-%m-%d')})" for m in recent_joins)
+        lines.append(f"Recently joined (newest first): {rj}")
+
+    # Members playing something / streaming / listening to Spotify
+    playing   = []
+    streaming = []
+    listening = []
+    for m in humans:
+        for act in (m.activities if hasattr(m, "activities") else ([m.activity] if m.activity else [])):
+            if isinstance(act, discord.Spotify):
+                listening.append(f"{m.display_name}: {act.title} by {act.artist}")
+            elif isinstance(act, discord.Streaming):
+                streaming.append(f"{m.display_name}: {act.name}")
+            elif isinstance(act, discord.Game):
+                playing.append(f"{m.display_name}: {act.name}")
+    if playing:   lines.append(f"Playing games: {' | '.join(playing[:10])}")
+    if streaming: lines.append(f"Streaming:      {' | '.join(streaming[:5])}")
+    if listening: lines.append(f"Listening:      {' | '.join(listening[:10])}")
+
+    # AFK members
+    afk_in_server = [(guild.get_member(uid), reason) for uid, (reason, _) in _afk_users.items() if guild.get_member(uid)]
+    if afk_in_server:
+        afk_str = " | ".join(f"{m.display_name}: {r}" for m, r in afk_in_server if m)
+        lines.append(f"AFK members: {afk_str}")
+
+    # ══ 3. VOICE CHANNELS — LIVE OCCUPANTS ═══════════════════════════════════
+    lines.append("\n╔══ VOICE CHANNELS — LIVE ══╗")
+    any_voice = False
+    for vc in sorted(guild.voice_channels, key=lambda c: c.position):
+        vc_humans = [m for m in vc.members if not m.bot]
+        vc_bots   = [m for m in vc.members if m.bot]
+        if vc_humans or vc_bots:
+            any_voice = True
+            member_parts = []
+            for m in vc_humans:
+                vs    = m.voice
+                flags = []
+                if vs and (vs.self_mute or vs.mute):   flags.append("muted")
+                if vs and (vs.self_deaf or vs.deaf):   flags.append("deaf")
+                if vs and vs.self_stream:              flags.append("streaming")
+                if vs and vs.self_video:               flags.append("cam")
+                flag_str = f"[{','.join(flags)}]" if flags else ""
+                member_parts.append(f"{m.display_name}{flag_str}")
+            bot_str = f" + bots: {', '.join(b.display_name for b in vc_bots)}" if vc_bots else ""
+            lines.append(f"  #{vc.name} ({vc.bitrate//1000}kbps, limit {vc.user_limit or '∞'}): {', '.join(member_parts)}{bot_str}")
+        else:
+            lines.append(f"  #{vc.name}: empty")
+    if not any_voice:
+        lines.append("  All voice channels empty")
+
+    # ══ 4. TEXT CHANNELS & CATEGORIES ════════════════════════════════════════
+    lines.append("\n╔══ CHANNELS & CATEGORIES ══╗")
+    # Uncategorised
+    uncategorised = [c for c in guild.text_channels if c.category is None]
+    if uncategorised:
+        lines.append(f"  [No category]: {', '.join(f'#{c.name}' for c in uncategorised)}")
+    # By category
+    for cat in sorted(guild.categories, key=lambda c: c.position):
+        txt = [c for c in cat.channels if isinstance(c, discord.TextChannel)]
+        vcs = [c for c in cat.channels if isinstance(c, discord.VoiceChannel)]
+        ch_str = ", ".join(
+            f"#{c.name}" + (" 🔒" if c.overwrites_for(guild.default_role).read_messages is False else "")
+            + (" 🔞" if getattr(c, "nsfw", False) else "")
+            + (f" [slow:{c.slowmode_delay}s]" if getattr(c, "slowmode_delay", 0) else "")
+            for c in txt
+        )
+        vc_str = f"  voice: {', '.join(f'#{v.name}' for v in vcs)}" if vcs else ""
+        lines.append(f"  [{cat.name}]: {ch_str or '(no text)'}{vc_str}")
+    lines.append(
+        f"Total: {len(guild.text_channels)} text | {len(guild.voice_channels)} voice "
+        f"| {len(guild.categories)} categories | {len(guild.stage_channels)} stages"
+    )
+
+    # ══ 5. ROLES — FULL LIST ══════════════════════════════════════════════════
+    lines.append("\n╔══ ROLES ══╗")
+    sorted_roles = sorted([r for r in guild.roles if r.name != "@everyone"], key=lambda r: r.position, reverse=True)
+    for r in sorted_roles:
+        color   = str(r.color) if r.color.value else "default"
+        flags   = []
+        if r.hoist:       flags.append("hoisted")
+        if r.mentionable: flags.append("mentionable")
+        if r.managed:     flags.append("managed/bot")
+        members_preview = ", ".join(m.display_name for m in r.members[:5] if not m.bot)
+        extra_m = f" +{len(r.members)-5} more" if len(r.members) > 5 else ""
+        lines.append(
+            f"  @{r.name} — {len(r.members)} members | color: {color} | "
+            f"{', '.join(flags) or 'no flags'} | members: {members_preview or 'none'}{extra_m}"
+        )
+
+    # ══ 6. XP LEADERBOARD (top 10) ════════════════════════════════════════════
+    lines.append("\n╔══ XP LEADERBOARD (top 10) ══╗")
+    try:
+        lb_rows = await bot.db.get_leaderboard(guild.id, 10)
+        if lb_rows:
+            for i, row in enumerate(lb_rows):
+                m    = guild.get_member(row["user_id"])
+                name = m.display_name if m else f"<id:{row['user_id']}>"
+                lv   = row.get("level", calculate_level(row.get("total_xp", 0))[0])
+                xp   = row.get("total_xp", 0)
+                stk  = row.get("streak", 0)
+                last = row.get("last_message_date")
+                last_str = last.strftime("%Y-%m-%d") if last else "?"
+                lines.append(f"  #{i+1} {name} — Lv {lv} | {xp:,} XP | 🔥{stk}d streak | last active: {last_str}")
+        else:
+            lines.append("  No XP data yet.")
+    except Exception as exc:
+        lines.append(f"  [XP leaderboard error: {exc}]")
+
+    # ══ 7. MESSAGE LEADERBOARD (top 10) ═══════════════════════════════════════
+    lines.append("\n╔══ MESSAGE LEADERBOARD (top 10) ══╗")
+    try:
+        msg_rows = await bot.db.get_msg_leaderboard(guild.id, 10)
+        if msg_rows:
+            for i, row in enumerate(msg_rows):
+                m     = guild.get_member(row["user_id"])
+                name  = m.display_name if m else f"<id:{row['user_id']}>"
+                cnt   = row.get("total_messages", 0)
+                first = row.get("first_message")
+                last  = row.get("last_message")
+                first_str = first.strftime("%Y-%m-%d") if first else "?"
+                last_str  = last.strftime("%Y-%m-%d") if last else "?"
+                lines.append(f"  #{i+1} {name} — {cnt:,} messages | first: {first_str} | last: {last_str}")
+        else:
+            lines.append("  No message tracking data yet.")
+    except Exception as exc:
+        lines.append(f"  [Message LB error: {exc}]")
+
+    # ══ 8. INVITE LEADERBOARD (top 10) ════════════════════════════════════════
+    lines.append("\n╔══ INVITE LEADERBOARD (top 10) ══╗")
+    try:
+        inv_rows = await bot.db.get_invite_leaderboard(guild.id, 10)
+        if inv_rows:
+            for i, row in enumerate(inv_rows):
+                m    = guild.get_member(row.get("inviter_id", 0))
+                name = m.display_name if m else str(row.get("inviter_id"))
+                cnt  = row.get("total_invites", 0)
+                lines.append(f"  #{i+1} {name} — {cnt} invite{'s' if cnt != 1 else ''}")
+        else:
+            lines.append("  No invite data yet.")
+    except Exception as exc:
+        lines.append(f"  [Invite LB error: {exc}]")
+
+    # ══ 9. BOOST LEADERBOARD ══════════════════════════════════════════════════
+    lines.append("\n╔══ BOOST LEADERBOARD ══╗")
+    try:
+        boost_rows = await bot.db.get_boost_leaderboard(guild.id, 10)
+        if boost_rows:
+            for i, row in enumerate(boost_rows):
+                m    = guild.get_member(row.get("user_id", 0))
+                name = m.display_name if m else str(row.get("user_id"))
+                cnt  = row.get("boost_count", 0)
+                fb   = row.get("first_boost")
+                fb_str = fb.strftime("%Y-%m-%d") if fb else "?"
+                lines.append(f"  #{i+1} {name} — {cnt} boost{'s' if cnt != 1 else ''} | first: {fb_str}")
+        else:
+            lines.append("  No boost data yet.")
+    except Exception as exc:
+        lines.append(f"  [Boost LB error: {exc}]")
+
+    # ══ 10. ACTIVE GIVEAWAYS ══════════════════════════════════════════════════
+    lines.append("\n╔══ ACTIVE GIVEAWAYS ══╗")
+    try:
+        giveaways = await bot.db.get_active_giveaways(guild.id)
+        if giveaways:
+            for g in giveaways:
+                host = guild.get_member(g.get("host_id", 0))
+                hname = host.display_name if host else str(g.get("host_id"))
+                ends  = g.get("ends_at")
+                ends_str = ends.strftime("%Y-%m-%d %H:%M UTC") if ends else "?"
+                lines.append(
+                    f"  Prize: {g.get('prize','?')} | "
+                    f"Host: {hname} | "
+                    f"Entries: {len(g.get('entrants', []))} | "
+                    f"Winners: {g.get('winners', 1)} | "
+                    f"Ends: {ends_str}"
+                )
+        else:
+            lines.append("  No active giveaways.")
+    except Exception as exc:
+        lines.append(f"  [Giveaway error: {exc}]")
+
+    # ══ 11. OPEN TICKETS ══════════════════════════════════════════════════════
+    lines.append("\n╔══ OPEN TICKETS ══╗")
+    try:
+        open_tickets = await bot.db.tickets.find(
+            {"guild_id": guild.id, "closed": False}
+        ).to_list(length=20)
+        if open_tickets:
+            for t in open_tickets:
+                opener = guild.get_member(t.get("user_id", 0))
+                oname  = opener.display_name if opener else str(t.get("user_id"))
+                ch     = guild.get_channel(t.get("channel_id", 0))
+                ch_str = f"#{ch.name}" if ch else "deleted channel"
+                opened = t.get("opened_at")
+                opened_str = opened.strftime("%Y-%m-%d %H:%M UTC") if opened else "?"
+                lines.append(f"  Ticket #{t.get('ticket_id','?')} | {oname} | {ch_str} | opened: {opened_str}")
+        else:
+            lines.append("  No open tickets.")
+    except Exception as exc:
+        lines.append(f"  [Ticket error: {exc}]")
+
+    # ══ 12. MEMBER COUNT HISTORY (last 7 days) ════════════════════════════════
+    lines.append("\n╔══ MEMBER COUNT HISTORY (last 7 days) ══╗")
+    try:
+        history = await bot.db.get_member_count_history(guild.id, 7)
+        if history:
+            for entry in history:
+                lines.append(f"  {entry.get('date','?')}: {entry.get('member_count','?')} members")
+        else:
+            lines.append("  No analytics snapshots yet.")
+    except Exception as exc:
+        lines.append(f"  [Analytics error: {exc}]")
+
+    # ══ 13. DOUBLE XP EVENT STATUS ════════════════════════════════════════════
+    lines.append("\n╔══ DOUBLE XP EVENT ══╗")
+    dxp_until = _doublexp_until.get(guild.id, 0)
+    if time.monotonic() < dxp_until:
+        remaining_secs = int(dxp_until - time.monotonic())
+        h, rem = divmod(remaining_secs, 3600)
+        m_min, s = divmod(rem, 60)
+        lines.append(f"  🔥 ACTIVE — {h}h {m_min}m {s}s remaining")
     else:
-        lines.append(f"{member.display_name} (ID: {member.id})")
-    lines.append(f"Is owner: {getattr(ctx.bot, 'owner_id_int', 0) == member.id}")
+        lines.append("  Inactive")
 
-    if guild:
-        lines.append(f"\n=== SERVER ===\n{guild.name} | Members: {guild.member_count} | Tier {guild.premium_tier}")
-        if needs:
-            relevant = resolve_mentioned_members(ctx.message, guild)
-            if relevant:
-                lines.append("=== REFERENCED MEMBERS ===")
-                for m in relevant:
-                    if m.id != member.id:
-                        lines.append(await build_member_context(m, guild))
-                        lines.append("---")
+    # ══ 14. SERVER CONFIG SUMMARY ═════════════════════════════════════════════
+    lines.append("\n╔══ SERVER CONFIG ══╗")
+    try:
+        config = await get_config(guild.id)
+        def ch_name(key):
+            cid = config.get(key)
+            if not cid: return "not set"
+            ch  = guild.get_channel(cid)
+            return f"#{ch.name}" if ch else f"id:{cid}"
+        def role_name(key):
+            rid = config.get(key)
+            if not rid: return "not set"
+            r   = guild.get_role(rid)
+            return f"@{r.name}" if r else f"id:{rid}"
+        lines.append(
+            f"  Automod: {'✅' if config.get('automod_enabled', True) else '❌'}  |  "
+            f"Anti-nuke: {'✅' if config.get('antinuke_enabled', True) else '❌'}  |  "
+            f"Anti-spam: {'✅' if config.get('antispam_enabled', True) else '❌'}  |  "
+            f"Anti-swear: {'✅' if config.get('anti_swear_enabled', True) else '❌'}"
+        )
+        lines.append(
+            f"  Anti-caps: {'✅' if config.get('anti_caps_enabled') else '❌'}  |  "
+            f"Anti-emoji-spam: {'✅' if config.get('anti_emoji_spam_enabled') else '❌'}  |  "
+            f"Ghost-ping: {'✅' if config.get('anti_ghost_ping_enabled', True) else '❌'}  |  "
+            f"Mass-mention: {'✅' if config.get('anti_mass_mention_enabled', True) else '❌'}"
+        )
+        lines.append(
+            f"  Voice XP: {'✅' if config.get('voice_xp_enabled', True) else '❌'}  |  "
+            f"Web search in AI: {'✅' if config.get('web_search', True) else '❌'}  |  "
+            f"Owner mode: {'✅' if config.get('owner_mode_enabled', True) else '❌'}"
+        )
+        lines.append(f"  Welcome channel: {ch_name('welcome_channel_id')}  |  Welcome DM: {'✅' if config.get('welcome_dm_enabled') else '❌'}")
+        lines.append(f"  Log — messages: {ch_name('message_log_channel_id')}  |  automod: {ch_name('automod_log_channel_id')}  |  mod: {ch_name('mod_log_channel_id')}")
+        lines.append(f"  Log — entry: {ch_name('entry_log_channel_id')}  |  bot: {ch_name('bot_log_channel_id')}")
+        lines.append(f"  Ticket panel: {ch_name('ticket_panel_channel_id')}  |  Boost channel: {ch_name('boost_channel_id')}")
+        ai_channels = config.get("ai_channel_ids", [])
+        if ai_channels:
+            ai_ch_names = ", ".join(
+                f"#{guild.get_channel(cid).name}" if guild.get_channel(cid) else f"id:{cid}"
+                for cid in ai_channels
+            )
+            lines.append(f"  AI locked to: {ai_ch_names}")
+        else:
+            lines.append("  AI channels: unrestricted")
+        autoroles = config.get("autoroles", [])
+        if autoroles:
+            ar_names = ", ".join(
+                f"@{guild.get_role(e.get('role_id')).name}" if guild.get_role(e.get('role_id')) else "?"
+                for e in autoroles
+            )
+            lines.append(f"  Auto-roles: {ar_names}")
+        dxp_role_ids = config.get("double_xp_roles", [])
+        if dxp_role_ids:
+            dxp_names = ", ".join(
+                f"@{guild.get_role(rid).name}" if guild.get_role(rid) else f"id:{rid}"
+                for rid in dxp_role_ids
+            )
+            lines.append(f"  Double XP roles: {dxp_names}")
+        custom_sys = config.get("custom_system_prefix", "")
+        if custom_sys:
+            lines.append(f"  Custom AI prefix: {custom_sys[:80]}{'...' if len(custom_sys) > 80 else ''}")
+    except Exception as exc:
+        lines.append(f"  [Config error: {exc}]")
 
-    lines.append(f"\n=== CHANNEL ===\n#{ctx.channel.name} (ID: {ctx.channel.id})")
-    lines.append(f"UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
-    if recent_chat:
-        lines.append(f"\n=== RECENT CHAT ===\n{recent_chat}")
+    # ══ 15. REACTION ROLES & ROLE MENUS ══════════════════════════════════════
+    lines.append("\n╔══ REACTION ROLES & ROLE MENUS ══╗")
+    try:
+        rr_docs = await bot.db.get_all_reaction_roles(guild.id)
+        if rr_docs:
+            for doc in rr_docs[:5]:
+                ch  = guild.get_channel(doc.get("channel_id", 0))
+                mappings = doc.get("mappings", {})
+                map_str  = ", ".join(f"{emoji}→@{guild.get_role(rid).name if guild.get_role(rid) else rid}" for emoji, rid in list(mappings.items())[:5])
+                lines.append(f"  Reaction role msg {doc.get('message_id')} in {f'#{ch.name}' if ch else '?'}: {map_str}")
+        else:
+            lines.append("  No reaction roles set up.")
+    except Exception: pass
+    try:
+        rm_docs = await bot.db.get_all_role_menus(guild.id)
+        if rm_docs:
+            for doc in rm_docs[:5]:
+                roles_in_menu = [guild.get_role(r.get("role_id")) for r in doc.get("roles", [])]
+                r_names = ", ".join(f"@{r.name}" for r in roles_in_menu if r)
+                lines.append(f"  Role menu '{doc.get('menu_id')}': {r_names or 'empty'}")
+        else:
+            lines.append("  No role menus set up.")
+    except Exception: pass
+
+    # ══ TIMESTAMP ═════════════════════════════════════════════════════════════
+    lines.append(f"\n⏱ Snapshot taken: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}")
     return "\n".join(lines)
 
-async def fetch_recent_chat(channel: discord.TextChannel, before: discord.Message, limit: int = 5) -> str:
+
+async def build_context(ctx: commands.Context, recent_chat: str = "") -> str:
+    """
+    Build the full context string injected into every AI call.
+    - Always includes: requesting user full profile, channel info, recent chat
+    - Always includes: full server snapshot (everything)
+    - Extra: any @mentioned members get their own full profile too
+    """
+    member = ctx.author
+    guild  = ctx.guild
+    lines: list[str] = []
+
+    # ── Requesting user ───────────────────────────────────────────────────────
+    lines.append("╔══ REQUESTING USER ══╗")
+    if isinstance(member, discord.Member) and guild:
+        lines.append(await build_member_context(member, guild))
+    else:
+        lines.append(f"{member.display_name} (@{member.name}, ID: {member.id}) — DM context, no guild data")
+    lines.append(f"Is bot owner: {getattr(ctx.bot, 'owner_id_int', 0) == member.id}")
+
+    # ── Channel they're asking from ───────────────────────────────────────────
+    ch = ctx.channel
+    ch_info = f"#{ch.name} (ID: {ch.id})"
+    if hasattr(ch, "topic") and ch.topic:
+        ch_info += f" | topic: {ch.topic[:80]}"
+    if hasattr(ch, "slowmode_delay") and ch.slowmode_delay:
+        ch_info += f" | slowmode: {ch.slowmode_delay}s"
+    lines.append(f"\n╔══ CHANNEL ══╗\n{ch_info}")
+
+    # ── Recent chat in this channel ───────────────────────────────────────────
+    if recent_chat:
+        lines.append(f"\n╔══ RECENT CHAT (last 10 messages) ══╗\n{recent_chat}")
+
+    # ── Any @mentioned members get full profiles ───────────────────────────────
+    if guild:
+        relevant = resolve_mentioned_members(ctx.message, guild)
+        if relevant:
+            lines.append("\n╔══ MENTIONED MEMBERS ══╗")
+            for m in relevant:
+                if m.id != member.id:
+                    lines.append(await build_member_context(m, guild))
+                    lines.append("──")
+
+    # ── Full server snapshot ──────────────────────────────────────────────────
+    if guild:
+        lines.append("\n" + await build_full_server_snapshot(guild))
+
+    lines.append(f"\n⏱ Context built: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    return "\n".join(lines)
+
+
+async def fetch_recent_chat(channel: discord.TextChannel, before: discord.Message, limit: int = 10) -> str:
+    """Fetch the last `limit` non-bot messages before the given message."""
     try:
-        msgs = [m async for m in channel.history(limit=limit*4, before=before) if not m.author.bot and m.content.strip()][:limit]
+        msgs = [m async for m in channel.history(limit=limit * 3, before=before)
+                if not m.author.bot and m.content.strip()][:limit]
         if not msgs: return ""
         msgs.sort(key=lambda m: m.created_at)
-        return "\n".join(f"{m.author.display_name}: {m.content[:180]}" for m in msgs)
-    except Exception: return ""
+        return "\n".join(
+            f"[{m.created_at.strftime('%H:%M')}] {m.author.display_name}: {m.content[:200]}"
+            for m in msgs
+        )
+    except Exception:
+        return ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1471,7 +2277,7 @@ def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
         ),
         inline=False,
     )
-    e.set_footer(text="Admins only  •  Built by AJ  •  v18")
+    e.set_footer(text="Admins only  •  Built by AJ  •  v19")
     return e
 
 
@@ -3239,7 +4045,10 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "Attach an image + ask to analyze it.\n\n"
             "`.retry` — re-run your last question fresh\n"
             "`.clear` — wipe your chat history\n\n"
-            "5s cooldown between questions."
+            "5s cooldown between questions.\n\n"
+            "**🌐 Auto Web Search (v19)**\n"
+            "Ask about current events, news, prices, weather, Roblox updates — "
+            "the AI automatically searches the web when your question needs live info."
         ))
         e.title = "🤖 AI Commands"
         e.set_footer(text="LXTE's AI", icon_url=avatar)
@@ -3290,7 +4099,13 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.stats` — your AI usage\n"
             "`.about` — bot info\n"
             "`.purge <amount>` — delete messages (admins)\n"
-            "`.syncroles` — sync auto-roles and level roles for all members (admins)"
+            "`.syncroles` — sync auto-roles and level roles for all members (admins)\n\n"
+            "**🌐 Real-time (v19)**\n"
+            "`.weather <city>` — live weather\n"
+            "`.price <coin>` — live crypto price\n"
+            "`.stock <ticker>` — live stock price\n"
+            "`.roblox <game>` — live Roblox game stats\n"
+            "`.search <query>` — web search"
         ))
         e.title = "💬 Social & Utility"
         e.set_footer(text="LXTE's AI", icon_url=avatar)
@@ -3318,7 +4133,7 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
     e = make_embed(C_PRIMARY, "Pick a category below.\nBuilt by AJ.")
     e.title = "LXTE's AI"
     e.set_thumbnail(url=avatar)
-    e.set_footer(text="Built by AJ  •  LXTE's AI v18  •  Prefix: .", icon_url=avatar)
+    e.set_footer(text="Built by AJ  •  LXTE's AI v19  •  Prefix: .", icon_url=avatar)
     return e
 
 
@@ -3411,6 +4226,14 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
         await safe_react(ctx.message, "⏳")
 
         ctx_str = await build_context(ctx, recent_chat)
+
+        # v19: auto-search if question looks like it needs live info
+        web_enabled = config.get("web_search", True)
+        if web_enabled and not has_image and isinstance(user_content, str):
+            web_extra = await auto_web_search(question)
+            if web_extra:
+                ctx_str += web_extra
+
         # FIXED: simplified — ask directly, no dead JSON meta routing
         answer = await bot.ai.ask(
             user_content, history, model,
@@ -3598,11 +4421,7 @@ async def cmd_msglb(ctx: commands.Context):
         lines.append(f"{prefix} {name} — **{count:,}** message{'s' if count != 1 else ''}")
     e = make_embed(C_INFO, "\n".join(lines))
     e.title = "💬 Message Leaderboard"
-    e.set_footer(text="LXTE's AI • v18")
-    await ctx.send(embed=e)
-
-
-@bot.command(name="msgcheck", aliases=["messages", "msgstats"])
+    e.set_footer(text="LXTE's AI • v19")
 async def cmd_msgcheck(ctx: commands.Context, target: discord.Member = None):
     """Check your own (or another user's) message stats."""
     target = target or ctx.author
@@ -3636,7 +4455,7 @@ async def cmd_msgcheck(ctx: commands.Context, target: discord.Member = None):
     if last_m:  e.add_field(name="Last Message",  value=ts(last_m),       inline=True)
     if chan_lines:
         e.add_field(name="Most Active Channels", value="\n".join(chan_lines), inline=False)
-    e.set_footer(text="LXTE's AI • v18")
+    e.set_footer(text="LXTE's AI • v19")
     await ctx.send(embed=e)
 
 
@@ -3905,13 +4724,88 @@ async def cmd_setup(ctx: commands.Context):
 @bot.command(name="about", aliases=["info"])
 async def cmd_about(ctx: commands.Context):
     e = make_embed(C_AI)
-    e.title       = "LXTE's AI v18"
-    e.description = "Built by AJ. Smart AI, leveling, giveaways, Join LXTE tickets, multi-select setup, reaction roles, automod, anti-raid, boost tracking, invite tracking, analytics."
+    e.title       = "LXTE's AI v19"
+    e.description = "Built by AJ. Smart AI with real-time web search, leveling, giveaways, tickets, multi-select setup, reaction roles, automod, anti-raid, boost tracking, invite tracking, analytics."
     e.set_thumbnail(url=bot.user.display_avatar.url if bot.user else None)
     e.add_field(name="Prefix",   value="`.`",                  inline=True)
     e.add_field(name="Memory",   value="Per channel, 14 days", inline=True)
     e.add_field(name="Cooldown", value="5s",                   inline=True)
-    e.set_footer(text=f"{len(bot.guilds)} server(s)  •  Built by AJ")
+    e.add_field(name="Real-time", value="🌐 Web search · ☁️ Weather · 💹 Crypto · 🎮 Roblox", inline=False)
+    e.set_footer(text=f"{len(bot.guilds)} server(s)  •  Built by AJ  •  v19")
+    await ctx.send(embed=e)
+
+
+# ─── Real-time commands (v19) ─────────────────────────────────────────────────
+
+@bot.command(name="weather", aliases=["wx"])
+async def cmd_weather(ctx: commands.Context, *, city: str = None):
+    """Get live weather for any city. Usage: .weather London"""
+    if not city:
+        await ctx.send(embed=err("Usage: `.weather <city>`\nExample: `.weather London`")); return
+    await safe_react(ctx.message, "⏳")
+    result = await get_weather(city)
+    e = make_embed(C_INFO, result)
+    e.title = "🌦️ Live Weather"
+    e.set_footer(text="Open-Meteo • LXTE's AI v19")
+    await safe_unreact(ctx.message, "⏳", ctx.bot.user)
+    await ctx.send(embed=e)
+
+
+@bot.command(name="price", aliases=["crypto", "coin"])
+async def cmd_price(ctx: commands.Context, *, query: str = None):
+    """Get live crypto price. Usage: .price bitcoin"""
+    if not query:
+        await ctx.send(embed=err("Usage: `.price <coin>`\nExamples: `.price bitcoin` `.price eth`")); return
+    await safe_react(ctx.message, "⏳")
+    result = await get_crypto_price(query)
+    e = make_embed(C_GOLD, result)
+    e.title = "💹 Live Crypto Price"
+    e.set_footer(text="CoinGecko • LXTE's AI v19")
+    await safe_unreact(ctx.message, "⏳", ctx.bot.user)
+    await ctx.send(embed=e)
+
+
+@bot.command(name="stock")
+async def cmd_stock(ctx: commands.Context, ticker: str = None):
+    """Get live stock price. Usage: .stock AAPL"""
+    if not ticker:
+        await ctx.send(embed=err("Usage: `.stock <ticker>`\nExamples: `.stock AAPL` `.stock TSLA`")); return
+    await safe_react(ctx.message, "⏳")
+    result = await get_stock_price(ticker)
+    e = make_embed(C_INFO, result)
+    e.title = "📊 Live Stock Price"
+    e.set_footer(text="Yahoo Finance • LXTE's AI v19")
+    await safe_unreact(ctx.message, "⏳", ctx.bot.user)
+    await ctx.send(embed=e)
+
+
+@bot.command(name="roblox", aliases=["rbx", "game"])
+async def cmd_roblox(ctx: commands.Context, *, query: str = None):
+    """Look up a live Roblox game. Usage: .roblox BedWars"""
+    if not query:
+        await ctx.send(embed=err("Usage: `.roblox <game name>`\nExample: `.roblox BedWars`")); return
+    await safe_react(ctx.message, "⏳")
+    result = await get_roblox_game(query)
+    e = make_embed(C_SUCCESS, result)
+    e.title = "🎮 Roblox Game Info"
+    e.set_footer(text="Roblox API • LXTE's AI v19")
+    await safe_unreact(ctx.message, "⏳", ctx.bot.user)
+    await ctx.send(embed=e)
+
+
+@bot.command(name="search", aliases=["web", "google"])
+async def cmd_search(ctx: commands.Context, *, query: str = None):
+    """Search the web instantly. Usage: .search Roblox BedWars patch notes"""
+    if not query:
+        await ctx.send(embed=err("Usage: `.search <query>`\nExample: `.search Roblox BedWars update`")); return
+    await safe_react(ctx.message, "⏳")
+    result = await web_search(query, max_results=5)
+    if result.startswith("["):
+        await ctx.send(embed=err(f"No results found for: **{query}**")); return
+    e = make_embed(C_AI, result[:4000])
+    e.title = f"🔍 Web Search: {query[:60]}"
+    e.set_footer(text="DuckDuckGo • LXTE's AI v19")
+    await safe_unreact(ctx.message, "⏳", ctx.bot.user)
     await ctx.send(embed=e)
 
 
