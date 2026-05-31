@@ -48,18 +48,14 @@ import unicodedata as _ud
 _INVIS_RE = re.compile(
     r"[\u200b-\u200f\u00ad\ufeff\u180e\u2060-\u2064"
     r"\ufe0f\u034f\u115f\u1160\u17b4\u17b5\u3164\uffa0"
-    r"\u{E0000}-\u{E007F}]",  # tags block
+    r"\U000E0000-\U000E007F]",  # tags block
     re.UNICODE,
 )
 
 # ── Normalise: strip invisibles, NFKD decompose, drop combining marks, lowercase
 def _clean(text: str) -> str:
-    # 1. strip zero-width / invisible
-    text = re.sub(
-        r"[\u200b-\u200f\u00ad\ufeff\u180e\u2060-\u2064\ufe0f\u034f"
-        r"\u115f\u1160\u17b4\u17b5\u3164\uffa0]",
-        "", text,
-    )
+    # 1. strip zero-width / invisible (uses the compiled _INVIS_RE above)
+    text = _INVIS_RE.sub("", text)
     # 2. NFKD — decomposes fullwidth, ligatures, precomposed chars
     text = _ud.normalize("NFKD", text)
     # 3. Drop combining diacritics (accent marks etc.)
@@ -1998,10 +1994,7 @@ class RemoveLevelRoleModal(discord.ui.Modal, title="Remove Level Role"):
         await i.response.send_message(embed=ok(f"Removed level **{level}** mapping."), ephemeral=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  TICKET SYSTEM
-# ═══════════════════════════════════════════════════════════════════════════════
-  
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TICKET SYSTEM
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2308,17 +2301,6 @@ async def _automod_emoji(message: discord.Message, config: dict) -> bool:
     return False
 
 
-def _contains_slur(text: str) -> tuple[bool, str]:
-    """
-    Returns (matched, label) — label is the category name for logging.
-    Cleans the text first (strips zero-width, normalises unicode, lowercases).
-    """
-    cleaned = _clean(text)
-    for pattern, label in _SLUR_PATTERNS:
-        if pattern.search(cleaned):
-            return True, label
-    return False, ""
-
 
 async def _automod_swear(message: discord.Message, config: dict) -> bool:
     """Bypass-resistant slur/swear filter. Returns True if message was actioned."""
@@ -2515,7 +2497,7 @@ async def _punish_nuker(guild: discord.Guild, executor_id: Optional[int], config
     # Delete webhooks created in the last 5 minutes
     try:
         for wh in await guild.webhooks():
-            if wh.created_at and (datetime.now(timezone.utc) - wh.created_at.replace(tzinfo=timezone.utc)).total_seconds() < 300:
+            if wh.created_at and (datetime.now(timezone.utc) - (wh.created_at if wh.created_at.tzinfo else wh.created_at.replace(tzinfo=timezone.utc))).total_seconds() < 300:
                 try:
                     await wh.delete(reason="Anti-nuke: suspicious webhook created during nuke window")
                     logger.warning("Deleted suspicious webhook %s from %s", wh.name, guild.name)
@@ -3238,7 +3220,7 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
     e = make_embed(C_PRIMARY, "Pick a category below.\nBuilt by AJ.")
     e.title = "LXTE's AI"
     e.set_thumbnail(url=avatar)
-    e.set_footer(text="Built by AJ  •  LXTE's AI v16  •  Prefix: .", icon_url=avatar)
+    e.set_footer(text="Built by AJ  •  LXTE's AI v18  •  Prefix: .", icon_url=avatar)
     return e
 
 
@@ -3518,7 +3500,7 @@ async def cmd_msglb(ctx: commands.Context):
         lines.append(f"{prefix} {name} — **{count:,}** message{'s' if count != 1 else ''}")
     e = make_embed(C_INFO, "\n".join(lines))
     e.title = "💬 Message Leaderboard"
-    e.set_footer(text="LXTE's AI • v17")
+    e.set_footer(text="LXTE's AI • v18")
     await ctx.send(embed=e)
 
 
@@ -3556,13 +3538,13 @@ async def cmd_msgcheck(ctx: commands.Context, target: discord.Member = None):
     if last_m:  e.add_field(name="Last Message",  value=ts(last_m),       inline=True)
     if chan_lines:
         e.add_field(name="Most Active Channels", value="\n".join(chan_lines), inline=False)
-    e.set_footer(text="LXTE's AI • v17")
+    e.set_footer(text="LXTE's AI • v18")
     await ctx.send(embed=e)
 
 
 # ─── Message History Sync (v17) ───────────────────────────────────────────────
 
-@bot.command(name="msgsync", aliases=["synccmessages", "syncmsg"])
+@bot.command(name="msgsync", aliases=["syncmessages", "syncmsg"])
 @commands.has_permissions(administrator=True)
 async def cmd_msgsync(ctx: commands.Context, limit: int = 500, *, flags: str = ""):
     """
