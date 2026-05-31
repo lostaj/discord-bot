@@ -28,56 +28,73 @@ try:
 except ImportError:
     PILLOW_AVAILABLE = False
 
-# ─── Slur / Swear Filter — bypass-resistant, zero dependencies ────────────────
+# ─── Slur / Swear Filter v3 — bypass-resistant, zero dependencies ─────────────
 # Handles ALL known bypass techniques:
-#   • Repeated letters:        niiiggger, faaaggot
-#   • Separator insertion:     n.i.g.g.e.r  n-i-g  n_i_g  n i g g e r
-#   • Leetspeak:               n1gg3r  f4gg0t  k1k3  @ss
-#   • Unicode lookalikes:      Cyrillic/Greek/fullwidth chars that look like ASCII
-#   • Zero-width chars:        ni​gg​er (invisible chars between letters)
-#   • Combining diacritics:    n̈ïg̈g̈ër stripped via NFKD + combining removal
+#   • Repeated letters:        niiiggger, faaaggot        → + quantifier on every slot
+#   • Separator insertion:     n.i.g.g.e.r  n_i_g         → _SEP between every slot
+#   • Leetspeak:               n1gg3r  f4gg0t  k1k3        → leet chars in every class
+#   • Unicode lookalikes:      Cyrillic/Greek/fullwidth    → included in letter classes
+#   • Zero-width chars:        ni​gg​er                    → stripped before matching
+#   • Combining diacritics:    n̈ïg̈g̈ër                  → NFKD + Mn strip
+#   • Repeated-char spam:      nnnniiiggggeerr             → dedup pass on collapsed text
 #   • Mixed case + all above simultaneously
+#   • Purely collapsed text (no separators at all)         → second-pass on stripped text
 
 import unicodedata as _ud
 
-# ── Invisible / zero-width character stripper ─────────────────────────────────
+# ── Extended invisible / zero-width / formatting character stripper ────────────
 _INVIS_RE = re.compile(
     r"[\u200b-\u200f\u00ad\ufeff\u180e\u2060-\u2064"
     r"\ufe0f\u034f\u115f\u1160\u17b4\u17b5\u3164\uffa0"
-    r"\U000E0000-\U000E007F]",  # tags block
+    r"\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000"   # various spaces
+    r"\U000E0000-\U000E007F]",                        # tags block
     re.UNICODE,
 )
 
-# ── Normalise: strip invisibles, NFKD decompose, drop combining marks, lowercase
+# ── Repeated-char collapser: aaabbbccc → abc (catches dragged-out letters) ────
+_REPEAT_RE = re.compile(r"(.)\1{2,}")   # 3+ of same char → keep 1
+
+# ── Normalise: strip invisibles → NFKD → drop combining → lowercase → dedup ──
 def _clean(text: str) -> str:
-    # 1. strip zero-width / invisible (uses the compiled _INVIS_RE above)
-    text = _INVIS_RE.sub("", text)
-    # 2. NFKD — decomposes fullwidth, ligatures, precomposed chars
-    text = _ud.normalize("NFKD", text)
-    # 3. Drop combining diacritics (accent marks etc.)
-    text = "".join(c for c in text if _ud.category(c) != "Mn")
-    # 4. Lowercase
-    return text.lower()
+    text = _INVIS_RE.sub("", text)                              # strip zero-width / invisible
+    text = _ud.normalize("NFKD", text)                          # decompose fullwidth, ligatures
+    text = "".join(c for c in text if _ud.category(c) != "Mn") # drop combining diacritics
+    text = text.lower()
+    return text
 
-# ── Separator between letter slots (catches spaces, dots, dashes, underscores…)
-_SEP = r"[\s\W_]*"   # zero or more separator chars between every letter slot
+def _clean_collapsed(text: str) -> str:
+    """Extra-aggressive version: also collapses 3+ repeated chars and strips all non-alnum."""
+    text = _clean(text)
+    text = _REPEAT_RE.sub(r"\1\1", text)   # aaaa → aa (keep 2 so gg still works)
+    return text
 
-# ── Letter-slot character classes
-# Each string = all chars that can represent that letter (ASCII + lookalikes + leet)
-_A = r"[a@4áàâãäåæаą]"
+# ── Separator between letter slots ────────────────────────────────────────────
+# Matches any amount of non-alpha junk between letters (spaces, dots, dashes,
+# underscores, digits used as separators, asterisks, etc.)
+# IMPORTANT: does NOT match [a-z] so it cannot skip a real letter slot.
+_SEP = r"(?:[^a-z0-9]|(?<=[0-9])(?=[0-9]))*"  # zero or more non-alpha-non-digit chars
+
+# ── Repeated-letter wrapper: each slot allows 1-4 repeats of itself ───────────
+# e.g. _r(_N) → (?:n)+  so nnnnn still matches
+def _r(cls: str) -> str:
+    """Wrap a character class to allow 1–6 repetitions (catches dragged-out letters)."""
+    return f"(?:{cls})+"
+
+# ── Letter-slot character classes (ASCII + leet + Cyrillic/Greek lookalikes) ──
+_A = r"[a@4аά]"
 _B = r"[b68вбƀ]"
-_C = r"[cç¢(сċćčĉ]"
-_D = r"[dďđ]"
-_E = r"[e3éèêëęėеë€ę]"
+_C = r"[c¢(сċćčĉ]"          # no ç — causes false positives in French
+_D = r"[ddďđ∂]"              # d explicit + lookalikes (was missing plain d!)
+_E = r"[e3еëėę€ə]"
 _F = r"[fƒ]"
 _G = r"[g9ģğġĝ]"
 _H = r"[hнħĥ]"
-_I = r"[i1!|íìîïіїįĩ]"
+_I = r"[i1!líìîïіїįĩ]"
 _J = r"[jĵ]"
 _K = r"[kкķ]"
-_L = r"[l1|£ļłĺľ]"
+_L = r"[l1£ļłĺľ]"
 _M = r"[mмɱ]"
-_N = r"[nņñńňŋ]"
+_N = r"[nnņñńňŋ]"            # n explicit (belt-and-suspenders)
 _O = r"[o0óòôõöøðоőœ]"
 _P = r"[pрþ]"
 _Q = r"[q]"
@@ -92,8 +109,8 @@ _Y = r"[yýÿŷ]"
 _Z = r"[z2žżźƶ]"
 
 def _w(*slots: str) -> str:
-    """Join letter slots with optional separator between each."""
-    return _SEP.join(slots)
+    """Join letter slots with optional separator + repeat quantifier on each."""
+    return _SEP.join(_r(s) for s in slots)
 
 # ── Pattern registry ──────────────────────────────────────────────────────────
 _SLUR_PATTERNS: list[tuple[re.Pattern, str]] = []
@@ -104,26 +121,27 @@ def _add(pat: str, label: str):
     except re.error as exc:
         print(f"[slur filter] Bad pattern '{label}': {exc}")
 
-# ── Boundary helper: word must not be embedded inside a longer alpha word ─────
-# Uses negative lookbehind/lookahead for ASCII letters only (post-clean text)
-_LB = r"(?<![a-z])"   # left boundary
+# ── Boundaries: word must not be inside a longer alpha word ───────────────────
+_LB = r"(?<![a-z])"   # left boundary  (post-clean text is all lowercase)
 _RB = r"(?![a-z])"    # right boundary
 
 # ════════════════════════════════════════════════════════════════════════════════
 #  SLUR PATTERNS
 # ════════════════════════════════════════════════════════════════════════════════
 
-# ── N-word (nigger / nigga / niggah / niglet / and all variants) ───────────────
-# Core: n + i/e + g + g + (e/a)(r/h)?  — with boundaries to avoid snigger/niggardly
-_add(_LB + _w(_N,_I,_G,_G) + r"[eaа@]?" + r"[rh]?" + _RB, "n-word")
-# Catch spaced-out: n word, n-word, n****r
-_add(r"(?<![a-z])" + _N + r"[\s\-_\*\.]{1,3}" + r"w[o0]r[dl]" + r"(?![a-z])", "n-word-phrase")
-# n + (any junk) + igger/igga pattern — catches deliberate letter insertions
-_add(_LB + _N + _SEP + r"[i1!|íìîïії]" + _SEP + _G + r"+" + _SEP + r"[eaа@]" + r"[rh]?" + _RB, "n-word-sep")
+# ── N-word family ─────────────────────────────────────────────────────────────
+# nigg + er/a/ah/let/az/as — boundaries exclude: snigger, niggardly, bigger
+_add(_LB + _w(_N,_I,_G,_G) + r"(?:" + _SEP + r"[eaа@]+" + r"(?:" + _SEP + r"[rhszdt]+" + r")?" + r")?" + _RB, "n-word")
+# spaced-out "n word" / "n-word" / "n****r"
+_add(r"(?<![a-z])" + _r(_N) + r"[\s\-_\*\.]{1,4}" + r"w[o0]r[dl]" + r"(?![a-z])", "n-word-phrase")
+# deliberate letter insertions between n…igger
+_add(_LB + _r(_N) + r"[^a-z]{0,4}" + _r(_I) + _SEP + _r(_G) + r"+" + _SEP + r"[eaа@]+" + r"(?:" + _SEP + r"[rh]+" + r")?" + _RB, "n-word-insert")
+# niglet / nigling variants
+_add(_LB + _w(_N,_I,_G) + _SEP + r"(?:let|ling|ger|ga|gah|gz|z)" + _RB, "n-word-variant")
 
-# ── F-slur (faggot / fag / fgt / fagz) ───────────────────────────────────────
+# ── F-slur family ─────────────────────────────────────────────────────────────
 _add(_LB + _w(_F,_A,_G) + r"(?:" + _SEP + _w(_G,_O,_T) + r")?" + _RB, "f-slur")
-_add(_LB + _F + _SEP + _G + _SEP + _T + _RB, "fgt")
+_add(_LB + _r(_F) + _SEP + _r(_G) + _SEP + _r(_T) + _RB, "fgt")
 
 # ── K-slur (kike) ─────────────────────────────────────────────────────────────
 _add(_LB + _w(_K,_I,_K,_E) + _RB, "k-slur")
@@ -131,8 +149,8 @@ _add(_LB + _w(_K,_I,_K,_E) + _RB, "k-slur")
 # ── C-slur (ch*nk) ────────────────────────────────────────────────────────────
 _add(_LB + _w(_C,_H,_I,_N,_K) + r"s?" + _RB, "chink")
 
-# ── Sp*c / sp*ck ──────────────────────────────────────────────────────────────
-_add(_LB + _w(_S,_P) + r"[iae]" + _SEP + _w(_C,_K) + r"s?" + _RB, "spick")
+# ── Sp*c / sp*ck / sp*k ───────────────────────────────────────────────────────
+_add(_LB + _r(_S) + _SEP + _r(_P) + _SEP + _r(_I) + _SEP + _r(_C) + r"[ks]?" + _RB, "spick")
 
 # ── W*tback ───────────────────────────────────────────────────────────────────
 _add(_LB + _w(_W,_E,_T,_B,_A,_C,_K) + _RB, "wetback")
@@ -141,22 +159,22 @@ _add(_LB + _w(_W,_E,_T,_B,_A,_C,_K) + _RB, "wetback")
 _add(_LB + _w(_B,_E,_A,_N,_E,_R) + r"s?" + _RB, "beaner")
 
 # ── G**k ──────────────────────────────────────────────────────────────────────
-_add(_LB + _G + _SEP + r"[ou0]" + _SEP + _O + _SEP + _K + r"s?" + _RB, "gook")
+_add(_LB + _r(_G) + _SEP + r"[ou0]+" + _SEP + _r(_O) + _SEP + _r(_K) + r"s?" + _RB, "gook")
 
 # ── J*p ───────────────────────────────────────────────────────────────────────
-_add(_LB + _J + _SEP + r"[a@]" + _SEP + _P + r"s?" + _RB, "jap")
+_add(_LB + _r(_J) + _SEP + r"[a@]+" + _SEP + _r(_P) + r"s?" + _RB, "jap")
 
-# ── R-slur (ret*rd) ───────────────────────────────────────────────────────────
+# ── R-slur (ret*rd / retarded) ────────────────────────────────────────────────
 _add(_LB + _w(_R,_E,_T,_A,_R,_D) + r"(?:e[ds]?)?" + _RB, "r-slur")
 
 # ── Tr*nny ────────────────────────────────────────────────────────────────────
-_add(_LB + _w(_T,_R,_A,_N,_N) + r"(?:ie|y|ies)?" + _RB, "t-slur-tranny")
+_add(_LB + _w(_T,_R,_A,_N,_N) + r"(?:ie|y|ies|ys)?" + _RB, "t-slur-tranny")
 
 # ── Sh*male ───────────────────────────────────────────────────────────────────
 _add(_LB + _w(_S,_H,_E,_M,_A,_L,_E) + _RB, "t-slur-shemale")
 
 # ── D*ke ──────────────────────────────────────────────────────────────────────
-_add(_LB + _D + _SEP + r"[yi1!]" + _SEP + _K + _SEP + _E + r"s?" + _RB, "d-slur")
+_add(_LB + _r(_D) + _SEP + r"[yi1!]+" + _SEP + _r(_K) + _SEP + _r(_E) + r"s?" + _RB, "d-slur")
 
 # ── C**t ──────────────────────────────────────────────────────────────────────
 _add(_LB + _w(_C,_U,_N,_T) + r"s?" + _RB, "c-word")
@@ -164,20 +182,20 @@ _add(_LB + _w(_C,_U,_N,_T) + r"s?" + _RB, "c-word")
 # ── Cr*cker (racial) ──────────────────────────────────────────────────────────
 _add(_LB + _w(_C,_R,_A,_C,_K,_E,_R) + r"s?" + _RB, "cracker")
 
-# ── H*aji ─────────────────────────────────────────────────────────────────────
+# ── H*aji / H*ji ──────────────────────────────────────────────────────────────
 _add(_LB + _w(_H,_A,_J,_I) + r"s?" + _RB, "haji")
 
 # ── Towelhead ─────────────────────────────────────────────────────────────────
 _add(_LB + _w(_T,_O,_W,_E,_L) + _SEP + _w(_H,_E,_A,_D) + _RB, "towelhead")
 
-# ── Sandnigger ────────────────────────────────────────────────────────────────
-_add(_LB + _w(_S,_A,_N,_D) + _SEP + _N + _SEP + r"[i1!|íì]" + _SEP + _G, "sand-n-word")
+# ── Sand + n-word ─────────────────────────────────────────────────────────────
+_add(_LB + _w(_S,_A,_N,_D) + _SEP + _r(_N) + _SEP + _r(_I) + _SEP + _r(_G) + r"+" + _RB, "sand-n-word")
 
 # ── P*ki ──────────────────────────────────────────────────────────────────────
 _add(_LB + _w(_P,_A,_K,_I) + r"s?" + _RB, "paki")
 
-# ── G*psy (slur usage) ────────────────────────────────────────────────────────
-_add(_LB + _w(_G,_Y+r"|[ie]",_P,_S) + r"(?:y|ie|ies)?" + _RB, "gypo")
+# ── G*psy / gypo ──────────────────────────────────────────────────────────────
+_add(_LB + _r(_G) + _SEP + r"[yie]+" + _SEP + _r(_P) + _SEP + r"[so]" + r"(?:y|ie|ies)?" + _RB, "gypo")
 
 # ── Zipperhead ────────────────────────────────────────────────────────────────
 _add(_LB + _w(_Z,_I,_P,_P,_E,_R) + _SEP + _w(_H,_E,_A,_D) + _RB, "zipperhead")
@@ -200,49 +218,77 @@ _add(_LB + _w(_J,_U,_N,_G,_L,_E) + _SEP + _w(_B,_U,_N,_N) + r"(?:y|ies)?" + _RB,
 # ── Porch monkey ──────────────────────────────────────────────────────────────
 _add(_LB + r"porch" + _SEP + _w(_M,_O,_N,_K) + r"(?:ey|ies)?" + _RB, "porch-monkey")
 
-# ── Mud duck (anti-Black) ─────────────────────────────────────────────────────
-_add(_LB + r"mud" + _SEP + r"duck" + _RB, "mud-duck")
+# ── Mud duck / mud shark (anti-Black) ────────────────────────────────────────
+_add(_LB + r"mud" + _SEP + r"(?:duck|shark)" + _RB, "mud-slur")
 
-# ── Rice ball / rice eye (anti-Asian) ────────────────────────────────────────
+# ── Rice ball / rice eye / slit-eye (anti-Asian) ─────────────────────────────
 _add(_LB + r"rice" + _SEP + r"(?:ball|eye)" + _RB, "rice-slur")
+_add(_LB + r"slit" + _SEP + r"eye" + _RB, "sliteye")
 
-# ── Rag ?head ─────────────────────────────────────────────────────────────────
+# ── Raghead / Rag ?head ───────────────────────────────────────────────────────
 _add(_LB + r"rag" + _SEP + r"head" + _RB, "raghead")
 
 # ── Camel jockey ──────────────────────────────────────────────────────────────
 _add(_LB + r"camel" + _SEP + r"jockey" + _RB, "camel-jockey")
 
-# ── White power / 1488 / 14 words ────────────────────────────────────────────
-_add(r"\b14\s*88\b", "1488")
+# ── White power / 1488 / 14 words / HH ────────────────────────────────────────
+_add(r"(?<!\d)14\s*88(?!\d)", "1488")
 _add(r"\bwhite\s+power\b", "white-power")
-_add(r"\b88\b.*\b88\b", "hh-double")   # heil hitler coded
 _add(r"\bsieg\s+heil\b", "sieg-heil")
-_add(r"[hн][hн]\s*[hн][hн]", "hh")   # HH / heil hitler shorthand
+_add(r"\b88\b[^.!?\n]{0,40}\b88\b", "hh-double")
+_add(r"(?<![a-z])[hн]{2}\s*[hн]{2}(?![a-z])", "hh")
+
+# ── Misc racial compound slurs ────────────────────────────────────────────────
+_add(_LB + _w(_N,_I,_G) + _SEP + r"nogg(?:in)?" + _RB, "noggin-slur")
+_add(_LB + r"buck" + _SEP + r"wheat" + _RB, "buckwheat")         # anti-Black
+_add(_LB + r"moon" + _SEP + r"cricket" + _RB, "moon-cricket")    # anti-Black
+_add(_LB + r"nig" + _SEP + r"nog" + _RB, "nig-nog")              # anti-Black
+_add(_LB + r"spear" + _SEP + r"chucke?r" + _RB, "spearchucker")  # anti-Black
+_add(_LB + r"tar" + _SEP + r"bab" + _RB, "tarbaby")              # anti-Black
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  GENERAL SWEAR WORDS (same bypass-resistant engine)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_add(r"\b" + _w(_F,_U,_C,_K) + r"\b", "fuck")
-_add(r"\b" + _w(_S,_H,_I,_T) + r"\b", "shit")
-_add(r"\b" + _w(_B,_I,_T,_C,_H) + r"\b", "bitch")
-_add(r"\b" + _w(_D,_I,_C,_K) + r"\b", "dick")
-_add(r"\b" + _w(_C,_O,_C,_K) + r"\b", "cock")
-_add(r"\b" + _w(_W,_A,_N,_K,_E,_R) + r"\b", "wanker")
-_add(r"\b" + _w(_T,_W,_A,_T) + r"\b", "twat")
-_add(r"\b" + _w(_B,_O,_L,_L,_O,_C,_K) + r"s?\b", "bollocks")
-_add(r"\b" + _w(_M,_O,_T,_H,_E,_R) + _SEP + _w(_F,_U,_C,_K) + r"\b", "motherfucker")
-_add(r"\b" + _w(_A,_S,_S) + r"(?:" + _SEP + _w(_H,_O,_L,_E) + r")?\b", "ass")
+_add(_LB + _w(_F,_U,_C,_K) + _RB, "fuck")
+_add(_LB + _w(_S,_H,_I,_T) + _RB, "shit")
+_add(_LB + _w(_B,_I,_T,_C,_H) + _RB, "bitch")
+_add(_LB + _w(_D,_I,_C,_K) + _RB, "dick")
+_add(_LB + _w(_C,_O,_C,_K) + _RB, "cock")
+_add(_LB + _w(_W,_A,_N,_K,_E,_R) + _RB, "wanker")
+_add(_LB + _w(_T,_W,_A,_T) + _RB, "twat")
+_add(_LB + _w(_B,_O,_L,_L,_O,_C,_K) + r"s?" + _RB, "bollocks")
+_add(_LB + _w(_M,_O,_T,_H,_E,_R) + _SEP + _w(_F,_U,_C,_K) + _RB, "motherfucker")
+_add(_LB + _w(_A,_S,_S) + r"(?:" + _SEP + _w(_H,_O,_L,_E) + r")?" + _RB, "ass")
+_add(_LB + _w(_P,_U,_S,_S,_Y) + _RB, "pussy")
+_add(_LB + _w(_W,_H,_O,_R,_E) + _RB, "whore")
+_add(_LB + _w(_S,_L,_U,_T) + _RB, "slut")
+
+# ── Censored-form bypass patterns (f**k, s**t, b***h, c**t …) ─────────────────────────
+# Users replace inner letters with * _ - . x to dodge word-match filters.
+_CENSOR = r'[\*_\-\.x]{1,6}'
+_add(r'(?<![a-z])[fƒ]' + _CENSOR + r'[kкķ](?![a-z])', 'fuck-censored')
+_add(r'(?<![a-z])[s5\$]' + _CENSOR + r'[t7](?![a-z])', 'shit-censored')
+_add(r'(?<![a-z])[b68]' + _CENSOR + r'[t7]' + _CENSOR + r'[hн](?![a-z])', 'bitch-censored')
+_add(r'(?<![a-z])[c¢(]' + _CENSOR + r'[nņñ][t7](?![a-z])', 'cunt-censored')
+_add(r'(?<![a-z])[dď]' + _CENSOR + r'[c¢][kк](?![a-z])', 'dick-censored')
+_add(r'(?<![a-z])[c¢(]' + _CENSOR + r'[c¢][kк](?![a-z])', 'cock-censored')
 
 PROFANITY_AVAILABLE = True
-print(f"✅ Slur filter v2 loaded — {len(_SLUR_PATTERNS)} patterns active")
+print(f"✅ Slur filter v3 loaded — {len(_SLUR_PATTERNS)} patterns active")
 
-# ── Detection function ────────────────────────────────────────────────────────
+# ── Detection function — dual-pass for maximum bypass resistance ───────────────
 def _contains_slur(text: str) -> tuple[bool, str]:
-    """Returns (matched, label). Cleans text before matching."""
-    cleaned = _clean(text)
+    """
+    Returns (matched, label).
+    Pass 1: standard clean (separators allowed between letters).
+    Pass 2: collapsed clean (dedup repeated chars, strip all non-alpha) —
+            catches things like 'nnnniiiggggeeeerrrr' that slip past pass 1.
+    """
+    cleaned  = _clean(text)
+    cleaned2 = _clean_collapsed(text)
     for pattern, label in _SLUR_PATTERNS:
-        if pattern.search(cleaned):
+        if pattern.search(cleaned) or pattern.search(cleaned2):
             return True, label
     return False, ""
 
@@ -3278,21 +3324,34 @@ async def _automod_emoji(message: discord.Message, config: dict) -> bool:
 
 
 async def _automod_swear(message: discord.Message, config: dict) -> bool:
-    """Bypass-resistant slur/swear filter. Returns True if message was actioned."""
-    if not config.get("anti_swear_enabled", True): return False
+    """Bypass-resistant slur/swear filter. Returns True if actioned.
+
+    Uses master automod_enabled key (fixes the old anti_swear_enabled bug).
+    Actions: delete message → public warning → automod log.
+    """
+    if not config.get("automod_enabled", True): return False
     matched, label = _contains_slur(message.content)
     if not matched: return False
-    try: await message.delete()
-    except Exception: pass
+
+    # 1. Delete the offending message
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    # 2. Public warning in channel
     try:
         await message.channel.send(
-            embed=err(f"{message.author.mention} that language isn't allowed here."),
-            delete_after=6,
+            embed=err(f"{message.author.mention} that language isn't allowed here. Your message was removed."),
+            delete_after=8,
         )
-    except Exception: pass
+    except Exception:
+        pass
+
+    # 3. Automod log
     _log_automod(
         message.guild, config,
-        f"🤬 **Slur/swear filter** — {message.author.mention} triggered `{label}` filter",
+        f"🤬 **Slur/Swear Filter** — {message.author.mention}\n**Filter:** `{label}`\n**Action:** message deleted",
         C_WARNING,
     )
     return True
