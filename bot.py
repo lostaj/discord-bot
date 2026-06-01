@@ -6,7 +6,7 @@ v19.1.0 — Changes from v19:
   - IMPROVED: owner_id passed cleanly through run_automod and _automod_swear via param (no globals hack)
 """
 
-import io, os, re, json, math, time, asyncio, logging, itertools, signal, collections, random
+import io, os, re, json, math, time, asyncio, logging, itertools, signal, collections, random, functools
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from urllib.parse import quote, urlencode
@@ -43,6 +43,7 @@ _INVIS_RE = re.compile(
 )
 
 # ── Normalise: strip invisibles, NFKD decompose, drop combining marks, lowercase
+@functools.lru_cache(maxsize=512)
 def _clean(text: str) -> str:
     # 1. strip zero-width / invisible (uses the compiled _INVIS_RE above)
     text = _INVIS_RE.sub("", text)
@@ -247,10 +248,11 @@ C_WARNING = 0xFEE75C
 C_GOLD    = 0xFFD700
 
 # ─── Groq ─────────────────────────────────────────────────────────────────────
-GROQ_TEXT   = "llama-3.3-70b-versatile"
-GROQ_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"
-MAX_TOKENS  = 800
-TEMPERATURE = 0.55
+GROQ_TEXT     = "openai/gpt-oss-20b"                          # 1000 t/s — main model
+GROQ_VISION   = "meta-llama/llama-4-scout-17b-16e-instruct"   # vision queries
+GROQ_COMPOUND = "groq/compound-mini"                           # built-in web search for realtime queries
+MAX_TOKENS    = 800
+TEMPERATURE   = 0.55
 
 # ─── Real-time / Web Search ───────────────────────────────────────────────────
 # DuckDuckGo Instant Answer API — no key needed
@@ -376,7 +378,7 @@ _ghost_ping_strikes: dict[int, int] = collections.defaultdict(int)
 
 # ─── Config cache ─────────────────────────────────────────────────────────────
 _config_cache: dict[int, tuple[dict, float]] = {}
-CONFIG_CACHE_TTL = 5.0
+CONFIG_CACHE_TTL = 30.0
 
 # ─── Automod ──────────────────────────────────────────────────────────────────
 INVITE_RE = re.compile(r"(discord\.gg/|discord\.com/invite/|discordapp\.com/invite/)\S+", re.I)
@@ -768,35 +770,54 @@ def get_log_channel(guild: discord.Guild, config: dict, category: str) -> Option
 class KeyRotator:
     def __init__(self, keys: list[str]):
         if not keys: raise ValueError("Need at least one API key.")
-        self._keys  = keys
-        self._cycle = itertools.cycle(range(len(keys)))
-        self._cur   = next(self._cycle)
-        self.count  = len(keys)
+        self._keys   = keys
+        self._cycle  = itertools.cycle(range(len(keys)))
+        self._cur    = next(self._cycle)
+        self.count   = len(keys)
+        # Persistent client — avoids TCP handshake overhead on every API call
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
         logger.info("Loaded %d API key(s)", self.count)
 
     def get(self) -> str: return self._keys[self._cur]
     def rotate(self): self._cur = next(self._cycle)
 
+    async def close(self):
+        """Cleanly close the persistent HTTP client on shutdown."""
+        try: await self._client.aclose()
+        except Exception: pass
+
     async def call(self, **kwargs) -> str:
         last_exc = None
-        for _ in range(self.count):
+        attempts = self.count + 1   # +1 to allow one 429-retry across the key cycle
+        for _ in range(attempts):
+            key = self.get(); self.rotate()
             try:
-                key = self.get(); self.rotate()
-                async with httpx.AsyncClient(timeout=30) as c:
-                    r = await c.post(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                        json=kwargs,
-                    )
-                    if r.status_code == 429:
-                        await asyncio.sleep(0.5); continue
-                    r.raise_for_status()
-                    content = r.json()["choices"][0]["message"]["content"]
-                    if isinstance(content, list):
-                        return "".join(b.get("text", "") for b in content).strip()
-                    return (content or "").strip()
+                r = await self._client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json=kwargs,
+                )
+                if r.status_code == 429:
+                    # Rate-limited — sleep briefly and let the loop try the next key
+                    await asyncio.sleep(1.0)
+                    continue
+                if r.status_code in (401, 403):
+                    # Auth failure = this key is bad; rotate and try the next one
+                    last_exc = Exception(f"Auth error {r.status_code} — bad key")
+                    continue
+                r.raise_for_status()
+                content = r.json()["choices"][0]["message"]["content"]
+                if isinstance(content, list):
+                    return "".join(b.get("text", "") for b in content).strip()
+                return (content or "").strip()
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                # Transient network error — don't blame the key, just record and continue
+                last_exc = e
             except Exception as e:
-                last_exc = e; self.rotate()
+                last_exc = e
         raise last_exc or Exception("All API keys failed.")
 
 
@@ -1339,6 +1360,9 @@ class AIEngine:
     def __init__(self, rotator: KeyRotator):
         self._r = rotator
 
+    async def close(self):
+        await self._r.close()
+
     async def ask(self, question, history: list[dict], model: str, context: str = "",
                   is_owner: bool = False, custom_system: str = "") -> str:
         system = (custom_system + "\n\n" if custom_system else "") + SYSTEM_PROMPT
@@ -1346,7 +1370,10 @@ class AIEngine:
         if context:  system += f"\n\n## LIVE SERVER CONTEXT\n{context}"
 
         messages = [{"role": "system", "content": system}] + list(history) + [{"role": "user", "content": question}]
-        kwargs   = dict(model=model, messages=messages, max_tokens=MAX_TOKENS, temperature=TEMPERATURE)
+        kwargs   = dict(model=model, messages=messages, max_tokens=MAX_TOKENS)
+        # compound/* models handle temperature internally — don't pass it
+        if not model.startswith("groq/"):
+            kwargs["temperature"] = TEMPERATURE
         return await self._r.call(**kwargs)
 
 
@@ -4159,8 +4186,13 @@ class LXTEBot(commands.Bot):
         cutoff = time.monotonic() - 3600
         for d in (_last_used, _xp_cooldowns, _cmd_cooldowns):
             for k in [k for k, v in d.items() if v < cutoff]: del d[k]
-        # Also decay ghost-ping strikes older than 24h (rough: clear on hourly cleanup)
-        # We keep it simple — strikes reset after enough time passes between events
+        # Prune stale user entries from spam/dup trackers — prevents unbounded growth
+        now_m = time.monotonic()
+        for uid in [k for k, v in list(_spam_tracker.items()) if not v or now_m - max(v) > SPAM_WINDOW_SECS * 10]:
+            del _spam_tracker[uid]
+        for uid in [k for k in list(_dup_tracker) if not _dup_tracker[k]]:
+            del _dup_tracker[uid]
+        # Reset ghost-ping strike counters (soft reset — strikes decay after 1h quiet)
         _ghost_ping_strikes.clear()
 
     @tasks.loop(seconds=SPAM_PERSIST_INTERVAL)
@@ -4503,19 +4535,18 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
             model = GROQ_VISION
         else:
             user_content = question
-            model        = GROQ_TEXT
+            web_enabled  = config.get("web_search", True)
+            # compound-mini has built-in web search — use it for realtime questions
+            # instead of the DuckDuckGo scraper which is unreliable
+            if web_enabled and _REALTIME_RE.search(question):
+                model = GROQ_COMPOUND
+            else:
+                model = GROQ_TEXT
 
         await safe_unreact(ctx.message, "👀", ctx.bot.user)
         await safe_react(ctx.message, "⏳")
 
         ctx_str = await build_context(ctx, recent_chat)
-
-        # v19: auto-search if question looks like it needs live info
-        web_enabled = config.get("web_search", True)
-        if web_enabled and not has_image and isinstance(user_content, str):
-            web_extra = await auto_web_search(question)
-            if web_extra:
-                ctx_str += web_extra
 
         # FIXED: simplified — ask directly, no dead JSON meta routing
         answer = await bot.ai.ask(
@@ -5404,6 +5435,9 @@ async def _startup():
                         await lc.send(embed=e)
         except Exception: pass
         await db.close()
+        if bot.ai:
+            try: await bot.ai.close()
+            except Exception: pass
         logger.info("DB closed.")
 
 def main():
