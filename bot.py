@@ -1,4 +1,4 @@
-"""
+  """
 LXTE's AI — built by AJ
 v20.0.0 — Changes from v19:
   - REMOVED: groq/compound-mini routing — replaced with DDG web search context injection
@@ -345,7 +345,7 @@ _REALTIME_RE = re.compile(
 )
 
 # ─── Limits ───────────────────────────────────────────────────────────────────
-MAX_HISTORY_TURNS  = 30
+MAX_HISTORY_TURNS  = 10  # was 30 — 30 turns × big context = key exhaustion
 HISTORY_TTL_DAYS   = 14
 USER_COOLDOWN_SECS = 5.0
 _last_used:       dict[int, float] = {}
@@ -1499,8 +1499,32 @@ async def auto_web_search(question: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  AI ENGINE  (FIXED: simplified, no more dead JSON meta routing)
+#  AI ENGINE  (v21: token-budget history trimming to prevent key exhaustion)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# Keep history well under the model's context window.
+# System prompt + context ≈ 5–18k chars; leave only 6k for history.
+# This is the single biggest fix for "all API keys exhausted" errors.
+_HISTORY_CHAR_BUDGET = 6_000
+
+def _trim_history(history: list[dict], budget: int = _HISTORY_CHAR_BUDGET) -> list[dict]:
+    """
+    Return only the most recent turns that fit within `budget` characters.
+    Walks newest → oldest so the freshest context is always kept.
+    """
+    trimmed: list[dict] = []
+    used = 0
+    for turn in reversed(history):
+        content = turn.get("content", "")
+        size = len(content) if isinstance(content, str) else sum(
+            len(b.get("text", "")) for b in content if isinstance(b, dict)
+        )
+        if used + size > budget:
+            break
+        trimmed.append(turn)
+        used += size
+    return list(reversed(trimmed))
+
 
 class AIEngine:
     def __init__(self, rotator: KeyRotator):
@@ -1514,11 +1538,15 @@ class AIEngine:
         system = (custom_system + "\n\n" if custom_system else "") + SYSTEM_PROMPT
         if is_owner: system += OWNER_ADDITION
         if context:
-            # Cap context to ~100k chars so we don't blow the model's context window
             context = context[:_CTX_CHAR_BUDGET]
             system += f"\n\n## LIVE SERVER CONTEXT\n{context}"
 
-        messages = [{"role": "system", "content": system}] + list(history) + [{"role": "user", "content": question}]
+        # KEY FIX: trim history to budget before building the payload.
+        # Without this, 30 turns of chat + 18k server context blows the token
+        # limit and hammers every key with 8x backoff multipliers.
+        trimmed_history = _trim_history(list(history))
+
+        messages = [{"role": "system", "content": system}] + trimmed_history + [{"role": "user", "content": question}]
         kwargs   = dict(model=model, messages=messages, max_tokens=MAX_TOKENS, temperature=TEMPERATURE)
         return await self._r.call(**kwargs)
 
@@ -4972,9 +5000,14 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
         await safe_unreact(ctx.message, "👀", ctx.bot.user)
         await safe_react(ctx.message, "⏳")
 
+        # Build server context + append live web search results if enabled
         ctx_str = await build_context(ctx, recent_chat)
+        if config.get('web_search', True) and not has_image:
+            web_ctx = await auto_web_search(question)
+            if web_ctx:
+                ctx_str = ctx_str + web_ctx
 
-        # FIXED: simplified — ask directly, no dead JSON meta routing
+        # Ask the AI — history is trimmed inside AIEngine.ask
         answer = await bot.ai.ask(
             user_content, history, model,
             context=ctx_str,
