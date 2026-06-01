@@ -330,6 +330,9 @@ COINGECKO_PRICE  = "https://api.coingecko.com/api/v3/simple/price"
 # Roblox public API — no key
 ROBLOX_SEARCH    = "https://games.roblox.com/v1/games/list"
 ROBLOX_DETAIL    = "https://games.roblox.com/v1/games"
+# Roblox client version — no key needed. Studio ~30-60min before Player.
+ROBLOX_VERSION_URL = "https://clientsettingscdn.roblox.com/v2/client-version/{channel}"
+ROBLOX_CHANNELS    = ["WindowsStudio", "WindowsPlayer"]
 # Yahoo Finance scrape-free endpoint
 YAHOO_QUOTE      = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
 # Web search result limit
@@ -4069,10 +4072,11 @@ async def find_used_invite(guild: discord.Guild) -> Optional[discord.Invite]:
 class LXTEBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix=".", intents=discord.Intents.all(), help_command=None, case_insensitive=True)
-        self.db:           Database           = None
-        self.ai:           AIEngine           = None
-        self.owner_id_int: int                = 0
-        self.start_time:   Optional[datetime] = None
+        self.db:               Database           = None
+        self.ai:               AIEngine           = None
+        self.owner_id_int:     int                = 0
+        self.start_time:       Optional[datetime] = None
+        self._roblox_versions: dict               = {}  # channel -> last hash
 
     async def on_ready(self):
         await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=".help"), status=discord.Status.online)
@@ -4107,6 +4111,7 @@ class LXTEBot(commands.Bot):
         self.ticket_autoclose_task.start()
         self.giveaway_task.start()
         self.spam_persist_task.start()
+        self.roblox_version_task.start()
         # Restore double-XP events that were active before restart
         now_utc = datetime.now(timezone.utc)
         for guild in self.guilds:
@@ -4783,6 +4788,65 @@ class LXTEBot(commands.Bot):
         except Exception as exc:
             logger.error("giveaway_task: %s", exc)
 
+    @tasks.loop(minutes=2)
+    async def roblox_version_task(self):
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                for channel in ROBLOX_CHANNELS:
+                    try:
+                        r = await client.get(
+                            ROBLOX_VERSION_URL.format(channel=channel),
+                            headers={"User-Agent": "LXTEBot/21"},
+                        )
+                        r.raise_for_status()
+                        data = r.json()
+                    except Exception as exc:
+                        logger.warning("roblox_version_task %s: %s", channel, exc)
+                        continue
+
+                    new_hash = data.get("clientVersionUpload", "")
+                    if not new_hash:
+                        continue
+
+                    last_hash = self._roblox_versions.get(channel)
+                    if last_hash is None:
+                        self._roblox_versions[channel] = new_hash
+                        await bot.db.update_config(0, "roblox_version_" + channel, new_hash)
+                        continue
+
+                    if new_hash == last_hash:
+                        continue
+
+                    self._roblox_versions[channel] = new_hash
+                    await bot.db.update_config(0, "roblox_version_" + channel, new_hash)
+
+                    now = datetime.now(timezone.utc)
+                    platform = "Windows (Studio)" if "Studio" in channel else "Windows"
+                    e = discord.Embed(color=0xFF0000)
+                    e.title = "\U0001F6A8 Roblox Update Detected!"
+                    e.description = "This is a live update, Roblox is **patched**."
+                    e.add_field(name="Platform",     value=platform,        inline=False)
+                    e.add_field(name="Version Hash", value="`" + new_hash + "`", inline=False)
+                    e.add_field(name="Date",         value=now.strftime("%A, %B %d, %Y %I:%M %p") + " UTC", inline=False)
+                    e.set_footer(text=now.strftime("%m/%d/%Y %I:%M %p") + "  •  " + now.strftime("%d/%m/%Y %H:%M"))
+
+                    for g in self.guilds:
+                        try:
+                            cfg = await bot.db.get_config(g.id)
+                            ch_id = cfg.get("roblox_update_channel_id")
+                            if not ch_id:
+                                continue
+                            ch = g.get_channel(ch_id)
+                            if not ch:
+                                continue
+                            ping_id = cfg.get("roblox_update_role_id")
+                            ping_str = "<@&" + str(ping_id) + ">" if ping_id else None
+                            await ch.send(content=ping_str, embed=e)
+                        except Exception as exc:
+                            logger.warning("roblox alert %s: %s", g.name, exc)
+        except Exception as exc:
+            logger.error("roblox_version_task: %s", exc)
+
     @cleanup_task.before_loop
     @voice_xp_task.before_loop
     @xp_decay_task.before_loop
@@ -4790,6 +4854,7 @@ class LXTEBot(commands.Bot):
     @ticket_autoclose_task.before_loop
     @giveaway_task.before_loop
     @spam_persist_task.before_loop
+    @roblox_version_task.before_loop
     async def before_tasks(self): await self.wait_until_ready()
 
 
@@ -5043,6 +5108,34 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
         mention_author=False,
         allowed_mentions=discord.AllowedMentions.none(),
     )
+
+@bot.command(name="robloxnotify", aliases=["rbnoti", "robloxalert"], hidden=True)
+@commands.has_permissions(administrator=True)
+async def cmd_robloxnotify(ctx: commands.Context, channel: discord.TextChannel = None, role: discord.Role = None):
+    args = ctx.message.content.split()[1:]
+    if args and args[0].lower() == "off":
+        await bot.db.update_config(ctx.guild.id, "roblox_update_channel_id", None)
+        await bot.db.update_config(ctx.guild.id, "roblox_update_role_id", None)
+        await ctx.send(embed=ok("Roblox update alerts **disabled**.")); return
+    if channel is None:
+        cfg    = await get_config(ctx.guild.id)
+        ch_id  = cfg.get("roblox_update_channel_id")
+        rl_id  = cfg.get("roblox_update_role_id")
+        ch_obj = ctx.guild.get_channel(ch_id) if ch_id else None
+        rl_obj = ctx.guild.get_role(rl_id)    if rl_id else None
+        ch_str = ch_obj.mention if ch_obj else "not set"
+        rl_str = rl_obj.mention if rl_obj else "none"
+        await ctx.send(embed=make_embed(C_INFO, "Channel: " + ch_str + "\nRole ping: " + rl_str)); return
+    await bot.db.update_config(ctx.guild.id, "roblox_update_channel_id", channel.id)
+    if role:
+        await bot.db.update_config(ctx.guild.id, "roblox_update_role_id", role.id)
+    else:
+        await bot.db.update_config(ctx.guild.id, "roblox_update_role_id", None)
+    msg = "Roblox update alerts \u2192 " + channel.mention
+    if role:
+        msg += " | pinging " + role.mention
+    await ctx.send(embed=ok(msg))
+
 
 @bot.command(name="roles")
 async def cmd_roles(ctx: commands.Context):
@@ -5905,6 +5998,12 @@ async def _startup():
     db = Database(mongo_uri)
     if not await db.ping(): raise ConnectionError("MongoDB unreachable.")
     logger.info("MongoDB connected.")
+    # Restore saved Roblox version hashes so restart doesn't re-alert
+    _saved = await db.get_config(0)
+    for _c in ROBLOX_CHANNELS:
+        _v = _saved.get("roblox_version_" + _c)
+        if _v: bot._roblox_versions[_c] = _v
+
     rotator          = KeyRotator(groq_keys)
     bot.db           = db
     bot.ai           = AIEngine(rotator)
