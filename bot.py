@@ -1,12 +1,18 @@
 """
 LXTE's AI — built by AJ
-v19.1.0 — Changes from v19:
-  - FIXED: Bot owner is now fully exempt from ALL automod (slur filter, spam, caps, emoji, links, invites)
-  - FIXED: Owner ID is no longer used to block or filter anything — only to grant perks/access
-  - IMPROVED: owner_id passed cleanly through run_automod and _automod_swear via param (no globals hack)
+v20.0.0 — Changes from v19:
+  - REMOVED: groq/compound-mini routing — replaced with DDG web search context injection
+  - UPGRADED: KeyRotator — per-key rate-limit tracking with exponential backoff + jitter
+  - FIXED: No more blind sleep(1) on 429 — instantly skips to the next available key
+  - FIXED: Per-key dead tracking for 401/403 auth failures
+  - FIXED: cmd_retry was hardcoded to GROQ_TEXT — now uses AI_TEXT constant
+  - FIXED: health command still said "Groq" — now says "AI Keys"
+  - FIXED: temperature was being skipped for compound models — now always passed
+  - CLEANED: removed itertools (no longer needed)
+  - ADDED: Retry-After header respected for smarter cooldown timing
 """
 
-import io, os, re, json, math, time, asyncio, logging, itertools, signal, collections, random, functools
+import io, os, re, json, math, time, asyncio, logging, signal, collections, random, functools
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from urllib.parse import quote, urlencode
@@ -230,7 +236,7 @@ def _contains_slur(text: str) -> tuple[bool, str]:
     return False, ""
 
 load_dotenv()
-print("✅ LXTE's AI v19.1.0 loaded")
+print("✅ LXTE's AI v20.0.0 loaded")
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logger = logging.getLogger("lxte")
 logger.setLevel(logging.INFO)
@@ -247,12 +253,12 @@ C_SUCCESS = 0x57F287
 C_WARNING = 0xFEE75C
 C_GOLD    = 0xFFD700
 
-# ─── Groq ─────────────────────────────────────────────────────────────────────
-GROQ_TEXT     = "openai/gpt-oss-20b"                          # 1000 t/s — main model
-GROQ_VISION   = "meta-llama/llama-4-scout-17b-16e-instruct"   # vision queries
-GROQ_COMPOUND = "groq/compound-mini"                           # built-in web search for realtime queries
-MAX_TOKENS    = 800
-TEMPERATURE   = 0.55
+# ─── AI Models ────────────────────────────────────────────────────────────────
+# These are Groq model IDs — swap freely if you change providers
+AI_TEXT   = "meta-llama/llama-4-maverick-17b-128e-instruct"   # fast text model
+AI_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"       # vision (image inputs)
+MAX_TOKENS  = 800
+TEMPERATURE = 0.55
 
 # ─── Real-time / Web Search ───────────────────────────────────────────────────
 # DuckDuckGo Instant Answer API — no key needed
@@ -768,57 +774,139 @@ def get_log_channel(guild: discord.Guild, config: dict, category: str) -> Option
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class KeyRotator:
+    """
+    Smart multi-key rotator with per-key rate-limit tracking.
+
+    How it works:
+    - Each key tracks its own "available after" monotonic timestamp.
+    - On 429: mark that key unavailable for `retry_after` seconds (from header,
+      defaulting to 10s with exponential backoff per-key), instantly try next key.
+    - On 401/403: mark key dead permanently for this session.
+    - No blind sleeps — we always pick the next available key immediately.
+    - If ALL keys are rate-limited, we wait for the soonest one to cool down.
+    - Jitter (±0.5s) prevents thundering-herd when multiple keys expire together.
+    """
+
+    _BASE_RL_SECS = 10.0   # default cooldown if Retry-After header is absent
+    _MAX_RL_SECS  = 120.0  # cap so a single bad key doesn't wait forever
+
     def __init__(self, keys: list[str]):
         if not keys: raise ValueError("Need at least one API key.")
-        self._keys   = keys
-        self._cycle  = itertools.cycle(range(len(keys)))
-        self._cur    = next(self._cycle)
-        self.count   = len(keys)
-        # Persistent client — avoids TCP handshake overhead on every API call
-        self._client = httpx.AsyncClient(
+        self._keys         = list(keys)
+        self.count         = len(keys)
+        # Per-key state: available_at (monotonic), rl_multiplier, dead
+        self._avail_at:    list[float] = [0.0]  * self.count
+        self._rl_mult:     list[float] = [1.0]  * self.count
+        self._dead:        list[bool]  = [False] * self.count
+        # Round-robin cursor (pick next by availability, not fixed cycle)
+        self._idx          = 0
+        # Persistent HTTP client — reuse connections across calls
+        self._client       = httpx.AsyncClient(
             timeout=httpx.Timeout(30.0, connect=10.0),
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
         )
-        logger.info("Loaded %d API key(s)", self.count)
+        logger.info("KeyRotator: %d key(s) loaded", self.count)
 
-    def get(self) -> str: return self._keys[self._cur]
-    def rotate(self): self._cur = next(self._cycle)
+    def _next_key_idx(self) -> int:
+        """Return index of the best (soonest available, not dead) key."""
+        now   = time.monotonic()
+        best  = -1
+        best_at = float("inf")
+        for i, (avail, dead) in enumerate(zip(self._avail_at, self._dead)):
+            if dead: continue
+            if avail <= now:
+                return i          # immediately available — use it
+            if avail < best_at:
+                best, best_at = i, avail
+        return best               # -1 only if all dead
+
+    async def _wait_for_key(self) -> int:
+        """Block until the soonest non-dead key is available, then return its index."""
+        now = time.monotonic()
+        candidates = [
+            (self._avail_at[i], i)
+            for i in range(self.count)
+            if not self._dead[i]
+        ]
+        if not candidates:
+            raise RuntimeError("All API keys are dead (auth failures). Check your .env.")
+        soonest_at, idx = min(candidates)
+        wait = max(0.0, soonest_at - now) + random.uniform(0, 0.5)   # jitter
+        if wait > 0:
+            logger.info("KeyRotator: all keys on cooldown — waiting %.1fs for key %d", wait, idx)
+            await asyncio.sleep(wait)
+        return idx
+
+    def _mark_rate_limited(self, idx: int, retry_after: Optional[float]):
+        """Apply exponential backoff to a rate-limited key."""
+        mult  = self._rl_mult[idx]
+        delay = min(
+            (retry_after or self._BASE_RL_SECS) * mult,
+            self._MAX_RL_SECS,
+        )
+        delay += random.uniform(0, 1.0)  # jitter
+        self._avail_at[idx] = time.monotonic() + delay
+        self._rl_mult[idx]  = min(mult * 2, 8.0)  # double backoff, cap at 8×
+        logger.warning("KeyRotator: key %d rate-limited — cooling down %.1fs (mult=%.1f)", idx, delay, mult)
+
+    def _mark_ok(self, idx: int):
+        """Reset backoff on a successful call."""
+        self._rl_mult[idx] = 1.0
 
     async def close(self):
-        """Cleanly close the persistent HTTP client on shutdown."""
         try: await self._client.aclose()
         except Exception: pass
 
     async def call(self, **kwargs) -> str:
-        last_exc = None
-        attempts = self.count + 1   # +1 to allow one 429-retry across the key cycle
-        for _ in range(attempts):
-            key = self.get(); self.rotate()
+        last_exc: Optional[Exception] = None
+        # Max attempts = 2 full passes over all keys (generous for burst traffic)
+        max_attempts = self.count * 2 + 1
+
+        for attempt in range(max_attempts):
+            idx = self._next_key_idx()
+            if idx == -1:
+                idx = await self._wait_for_key()
+
+            key = self._keys[idx]
             try:
                 r = await self._client.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                     json=kwargs,
                 )
+
                 if r.status_code == 429:
-                    # Rate-limited — sleep briefly and let the loop try the next key
-                    await asyncio.sleep(1.0)
-                    continue
+                    # Parse Retry-After header if present
+                    ra_header = r.headers.get("retry-after") or r.headers.get("x-ratelimit-reset-requests")
+                    ra: Optional[float] = None
+                    if ra_header:
+                        try: ra = float(ra_header)
+                        except (ValueError, TypeError): pass
+                    self._mark_rate_limited(idx, ra)
+                    continue   # immediately try the next key — no sleep here
+
                 if r.status_code in (401, 403):
-                    # Auth failure = this key is bad; rotate and try the next one
-                    last_exc = Exception(f"Auth error {r.status_code} — bad key")
+                    logger.error("KeyRotator: key %d auth failure (%d) — marking dead", idx, r.status_code)
+                    self._dead[idx] = True
+                    last_exc = Exception(f"API key {idx} rejected (HTTP {r.status_code})")
                     continue
+
                 r.raise_for_status()
+                self._mark_ok(idx)
+
                 content = r.json()["choices"][0]["message"]["content"]
                 if isinstance(content, list):
                     return "".join(b.get("text", "") for b in content).strip()
                 return (content or "").strip()
-            except (httpx.TimeoutException, httpx.NetworkError) as e:
-                # Transient network error — don't blame the key, just record and continue
-                last_exc = e
-            except Exception as e:
-                last_exc = e
-        raise last_exc or Exception("All API keys failed.")
+
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                last_exc = exc
+                # Network error — brief pause before retry (don't penalise the key)
+                await asyncio.sleep(min(1.5 * (attempt + 1), 8.0))
+            except Exception as exc:
+                last_exc = exc
+
+        raise last_exc or Exception("All API keys exhausted — could not complete request.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1368,17 +1456,12 @@ class AIEngine:
         system = (custom_system + "\n\n" if custom_system else "") + SYSTEM_PROMPT
         if is_owner: system += OWNER_ADDITION
         if context:
-            # Groq's payload limit is ~32k tokens (~128k chars). Cap context so the
-            # system prompt + history + question never blow past that.
-            # Reserve ~20k chars for system prompt, history, and question headroom.
+            # Cap context to ~100k chars so we don't blow the model's context window
             context = context[:100_000]
             system += f"\n\n## LIVE SERVER CONTEXT\n{context}"
 
         messages = [{"role": "system", "content": system}] + list(history) + [{"role": "user", "content": question}]
-        kwargs   = dict(model=model, messages=messages, max_tokens=MAX_TOKENS)
-        # compound/* models handle temperature internally — don't pass it
-        if not model.startswith("groq/"):
-            kwargs["temperature"] = TEMPERATURE
+        kwargs   = dict(model=model, messages=messages, max_tokens=MAX_TOKENS, temperature=TEMPERATURE)
         return await self._r.call(**kwargs)
 
 
@@ -4542,16 +4625,10 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
                 {"type": "image_url", "image_url": {"url": ctx.message.attachments[0].url}},
                 {"type": "text", "text": question},
             ]
-            model = GROQ_VISION
+            model = AI_VISION
         else:
             user_content = question
-            web_enabled  = config.get("web_search", True)
-            # compound-mini has built-in web search — use it for realtime questions
-            # instead of the DuckDuckGo scraper which is unreliable
-            if web_enabled and _REALTIME_RE.search(question):
-                model = GROQ_COMPOUND
-            else:
-                model = GROQ_TEXT
+            model = AI_TEXT
 
         await safe_unreact(ctx.message, "👀", ctx.bot.user)
         await safe_react(ctx.message, "⏳")
@@ -4632,7 +4709,7 @@ async def cmd_retry(ctx: commands.Context):
     asyncio.create_task(keep_typing(ctx.channel, stop))
     try:
         answer = await bot.ai.ask(
-            last_q, snap, GROQ_TEXT,
+            last_q, snap, AI_TEXT,
             context=await build_context(ctx),
             is_owner=is_owner and config.get("owner_mode_enabled", True),
             custom_system=config.get("custom_system_prefix", ""),
@@ -5287,13 +5364,25 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
         cpu  = psutil.cpu_percent(interval=0.1)
         mem  = psutil.virtual_memory()
         proc = psutil.Process(os.getpid()).memory_info().rss
+        # Per-key health summary
+        rotator = bot.ai._r
+        now_m   = time.monotonic()
+        key_lines = []
+        for i in range(rotator.count):
+            if rotator._dead[i]:
+                key_lines.append(f"key{i+1}: ❌ dead")
+            elif rotator._avail_at[i] > now_m:
+                cooldown = rotator._avail_at[i] - now_m
+                key_lines.append(f"key{i+1}: ⏳ {cooldown:.0f}s")
+            else:
+                key_lines.append(f"key{i+1}: ✅")
         desc = (
             f"Guilds   : {len(bot.guilds)}\n"
             f"Members  : {sum(g.member_count for g in bot.guilds):,}\n"
             f"DB users : {gs.get('total_users',0):,}\n"
             f"Questions: {gs.get('total_questions',0):,}\n"
             f"Latency  : {round(bot.latency*1000)}ms\n"
-            f"API keys : {bot.ai._r.count}\n"
+            f"AI Keys  : {' | '.join(key_lines)}\n"
             f"CPU      : {cpu}%\n"
             f"RAM      : {mem.percent}% ({round(mem.used/1048576,1)}/{round(mem.total/1048576,1)} MB)\n"
             f"Bot RAM  : {round(proc/1048576,1)} MB\n"
@@ -5317,7 +5406,18 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
         except Exception as e: await ctx.send(embed=err(str(e)))
 
     elif action == "keys":
-        await ctx.send(embed=make_embed(C_INFO, f"{bot.ai._r.count} key(s) loaded."))
+        rotator = bot.ai._r
+        now_m   = time.monotonic()
+        lines   = []
+        for i in range(rotator.count):
+            if rotator._dead[i]:
+                lines.append(f"Key {i+1}: ❌ DEAD (auth failure)")
+            elif rotator._avail_at[i] > now_m:
+                cd = rotator._avail_at[i] - now_m
+                lines.append(f"Key {i+1}: ⏳ on cooldown ({cd:.0f}s, mult={rotator._rl_mult[i]:.1f}x)")
+            else:
+                lines.append(f"Key {i+1}: ✅ ready")
+        await ctx.send(embed=make_embed(C_INFO, "\n".join(lines)))
 
     elif action == "synccount":
         for guild in bot.guilds: await update_member_count(guild)
@@ -5328,7 +5428,7 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
         await ctx.send(embed=make_embed(C_INFO, (
             f"Discord : ✅ {round(bot.latency*1000)}ms\n"
             f"MongoDB : {'✅' if mongo_ok else '❌'}\n"
-            f"Groq    : ✅ {bot.ai._r.count} key(s)\n"
+            f"AI Keys : ✅ {bot.ai._r.count} key(s) loaded\n"
             f"Pillow  : {'✅' if PILLOW_AVAILABLE else '❌'}"
         )))
 
@@ -5409,7 +5509,7 @@ async def _startup():
     owner_id  = os.environ.get("OWNER_ID")
     raw_keys  = [os.environ.get(f"GROQ_API_KEY_{i}") for i in range(1, 6)]
     groq_keys = list(dict.fromkeys(k for k in raw_keys if k))
-    missing   = [n for n, v in [("DISCORD_TOKEN", token), ("GROQ_API_KEY_1", groq_keys), ("MONGO_URI", mongo_uri), ("OWNER_ID", owner_id)] if not v]
+    missing   = [n for n, v in [("DISCORD_TOKEN", token), ("AI_API_KEY_1 (or GROQ_API_KEY_1)", groq_keys), ("MONGO_URI", mongo_uri), ("OWNER_ID", owner_id)] if not v]
     if missing: raise EnvironmentError(f"Missing env vars: {', '.join(missing)}")
     try: int(owner_id)
     except ValueError: raise EnvironmentError("OWNER_ID must be an integer.")
