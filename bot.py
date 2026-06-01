@@ -114,13 +114,71 @@ _RB = r"(?![a-z])"    # right boundary
 #  SLUR PATTERNS
 # ════════════════════════════════════════════════════════════════════════════════
 
-# ── N-word (nigger / nigga / niggah / niglet / and all variants) ───────────────
-# Core: n + i/e + g + g + (e/a)(r/h)?  — with boundaries to avoid snigger/niggardly
-_add(_LB + _w(_N,_I,_G,_G) + r"[eaа@]?" + r"[rh]?" + _RB, "n-word")
-# Catch spaced-out: n word, n-word, n****r
-_add(r"(?<![a-z])" + _N + r"[\s\-_\*\.]{1,3}" + r"w[o0]r[dl]" + r"(?![a-z])", "n-word-phrase")
-# n + (any junk) + igger/igga pattern — catches deliberate letter insertions
-_add(_LB + _N + _SEP + r"[i1!|íìîïії]" + _SEP + _G + r"+" + _SEP + r"[eaа@]" + r"[rh]?" + _RB, "n-word-sep")
+# ── N-word suite (v3 — comprehensive bypass-resistant) ────────────────────────
+#
+# Bypass vectors covered:
+#   Standard:   nigga nigger niggah nigguh niggaz niggr
+#   Leet-i:     n1gga n!gga n|gga
+#   Leet-g/q:   ni99a ni9ga niqqa niqqer n1qqa
+#   Separators: n.i.g.g.a  n-i-g-g-e-r  n i g g a
+#   Censored:   n*gga n*gger n**ga n**ger n****r n*gg*r n#gga n#gger
+#   Short:      nig nigu niguh niglet
+#   Repeated:   niiigga niggggga niiiigger
+#   Unicode:    nïgga ñigga ńigga (all normalised before matching)
+#   Leet nums:  n1663r n16g3r
+#   Phrase:     "n word" "n-word" "the n word"
+#   Compound:   nignog nig nog
+#   Still safe: snigger niggardly trigger bigger digger niggle rigging
+
+# _G already includes 'q' for niqqa/niqqer substitution
+_G = r"[g9ģğġĝq]"   # shadow the module-level _G for these patterns
+
+# Censor-char class: * # ^ ~ used for self-censoring like n*gga
+_CX = r"[\*#\^~]{1,3}"
+
+# Shared tail: optional vowel, optional trailing consonant
+_N_TAIL = r"(?:[eaаu@uo0])?(?:[rhzs])?"
+
+# P1 — Full double-g core (nigga/nigger/niqqa etc.) with repeated-letter support
+_add(
+    _LB + _N + _SEP + _I + r"+" + _SEP + _G + r"+" + _SEP + _G + r"+" + _N_TAIL + _RB,
+    "n-word-core",
+)
+
+# P2 — Short form: nig / nigu / niguh / niglet (single g, optional suffix)
+_add(
+    _LB + _N + _SEP + _I + r"+" + _SEP + _G + r"+"
+    + r"(?:" + _SEP + r"(?:let|[uhlest]))?"
+    + _RB,
+    "n-word-short",
+)
+
+# P3 — Censored slots: n*gga  n**ger  n#gga  n*gg*r  n*gg*
+_I_OR_CX = r"(?:" + _I + r"+|" + _CX + r")"
+_G_OR_CX = r"(?:" + _G + r"+|" + _CX + r")"
+_add(
+    _LB + _N + _I_OR_CX + _G_OR_CX + _G_OR_CX + r"?" + _N_TAIL + _RB,
+    "n-word-censored-slot",
+)
+
+# P4 — Fully censored body: n + 1-6 non-word chars + terminal a/e/r
+#      Catches: n****r  n***a  n**a  n*r
+_add(
+    _LB + _N + r"[\W_]{1,6}" + r"(?:" + _A + r"|" + _E + r"|" + _R + r")" + _RB,
+    "n-word-full-censor",
+)
+
+# P5 — "n word" / "n-word" phrase
+_add(
+    r"(?<![a-z])" + _N + r"[\s\-_\*\.]{1,3}" + r"w[o0]r[dl](?![a-z])",
+    "n-word-phrase",
+)
+
+# P6 — Leet-number encoding: 1663 = i g g e
+_add(_LB + _N + r"1[6g][6g][3e][rh]?" + _RB, "n-word-1663")
+
+# P7 — Nig nog / nignog
+_add(_LB + r"nig" + _SEP + r"nog" + _RB, "nignog")
 
 # ── F-slur (faggot / fag / fgt / fagz) ───────────────────────────────────────
 _add(_LB + _w(_F,_A,_G) + r"(?:" + _SEP + _w(_G,_O,_T) + r")?" + _RB, "f-slur")
@@ -224,7 +282,7 @@ _add(r"[hн][hн]\s*[hн][hн]", "hh")   # HH / heil hitler shorthand
 # This filter targets SLURS ONLY. Basic profanity is not caught here.
 
 PROFANITY_AVAILABLE = True
-print(f"✅ Slur filter v2 loaded — {len(_SLUR_PATTERNS)} patterns active")
+print(f"✅ Slur filter v3 loaded — {len(_SLUR_PATTERNS)} patterns active")
 
 # ── Detection function ────────────────────────────────────────────────────────
 def _contains_slur(text: str) -> tuple[bool, str]:
@@ -255,7 +313,7 @@ C_GOLD    = 0xFFD700
 
 # ─── AI Models ────────────────────────────────────────────────────────────────
 # These are Groq model IDs — swap freely if you change providers
-AI_TEXT   = "openai/gpt-oss-20b"   # fast text model
+AI_TEXT   = "meta-llama/llama-4-maverick-17b-128e-instruct"   # fast text model
 AI_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"       # vision (image inputs)
 MAX_TOKENS  = 800
 TEMPERATURE = 0.55
@@ -1457,7 +1515,7 @@ class AIEngine:
         if is_owner: system += OWNER_ADDITION
         if context:
             # Cap context to ~100k chars so we don't blow the model's context window
-            context = context[:100_000]
+            context = context[:_CTX_CHAR_BUDGET]
             system += f"\n\n## LIVE SERVER CONTEXT\n{context}"
 
         messages = [{"role": "system", "content": system}] + list(history) + [{"role": "user", "content": question}]
@@ -1999,39 +2057,294 @@ async def build_full_server_snapshot(guild: discord.Guild) -> str:
     return snapshot
 
 
+
+# ── Context section triggers ──────────────────────────────────────────────────
+# Each key maps to a regex that, if matched in the question, pulls that section.
+# Sections are built lazily — only fetched when actually needed.
+
+_CTX_TRIGGERS: dict[str, re.Pattern] = {
+    "leaderboard_xp": re.compile(
+        r"\b(leaderboard|top\s*\d*|highest\s+(xp|level)|most\s+xp|xp\s+rank|lb)\b", re.I),
+    "leaderboard_msg": re.compile(
+        r"\b(most\s+(active|messages?)|message\s+leaderboard|who\s+(talks?|chats?|messages?)\s+most)\b", re.I),
+    "leaderboard_inv": re.compile(
+        r"\b(invite\s+leaderboard|most\s+invites?|top\s+inviters?)\b", re.I),
+    "leaderboard_boost": re.compile(
+        r"\b(boost\s+leaderboard|most\s+boost|top\s+boosters?)\b", re.I),
+    "members_online": re.compile(
+        r"\b(who.{0,20}(online|here|active|present)|online\s+members?|how\s+many\s+(online|people|members?)|member\s+(count|list))\b", re.I),
+    "voice": re.compile(
+        r"\b(voice\s+channel|who.{0,20}voice|in\s+vc|vc\s+members?|voice\s+chat)\b", re.I),
+    "roles": re.compile(
+        r"\b(roles?|permissions?|rank\s+list|what\s+roles?)\b", re.I),
+    "channels": re.compile(
+        r"\b(channels?|categories|channel\s+list|text\s+channels?)\b", re.I),
+    "giveaways": re.compile(
+        r"\b(giveaway|giveaways|prize|raffle)\b", re.I),
+    "tickets": re.compile(
+        r"\b(tickets?|support\s+ticket|open\s+tickets?)\b", re.I),
+    "config": re.compile(
+        r"\b(config|settings?|automod|anti.?spam|anti.?nuke|setup|configured|enabled|disabled)\b", re.I),
+    "analytics": re.compile(
+        r"\b(member\s+count\s+history|growth|analytics|members?\s+over\s+time)\b", re.I),
+    "boosts": re.compile(
+        r"\b(boost|boosting|boosted|nitro\s+boost|server\s+boost)\b", re.I),
+    "double_xp": re.compile(
+        r"\b(double\s*xp|2x\s*xp|xp\s+event|xp\s+boost)\b", re.I),
+    "server_identity": re.compile(
+        r"\b(server\s+(name|id|info|stats|created|owner)|guild\s+(info|id)|about\s+the\s+server)\b", re.I),
+}
+
+# Sections that are always lightweight and always included
+_ALWAYS_SECTIONS = {"requesting_user", "channel", "recent_chat", "mentioned_members"}
+
+# Hard payload budget: chars before hitting API.
+# gpt-oss-20b context window is 32k tokens ≈ ~120k chars total.
+# System prompt ~4k + history ~10k + question ~1k = ~15k overhead.
+# Leave ~20k for context. Stay well under with 18k.
+_CTX_CHAR_BUDGET = 18_000
+
+
+async def _build_server_sections(
+    guild: discord.Guild,
+    needed: set[str],
+    budget: int,
+) -> str:
+    """Build only the requested server snapshot sections, within `budget` chars."""
+    lines: list[str] = []
+    used = 0
+
+    def _add_section(header: str, content: str) -> bool:
+        nonlocal used
+        chunk = f"\n{header}\n{content}"
+        if used + len(chunk) > budget:
+            return False
+        lines.append(chunk)
+        used += len(chunk)
+        return True
+
+    # ── Server identity (lightweight — always include if any server section needed)
+    if needed or "server_identity" in needed:
+        owner = guild.owner
+        owner_str = f"{owner.display_name} (@{owner.name})" if owner else "unknown"
+        _add_section("╔══ SERVER ══╗", (
+            f"Name: {guild.name} | ID: {guild.id} | Owner: {owner_str}\n"
+            f"Members: {guild.member_count} | Boost tier: {guild.premium_tier} "
+            f"| Boosts: {guild.premium_subscription_count or 0} "
+            f"| Created: {guild.created_at.strftime('%Y-%m-%d')}"
+        ))
+
+    # ── Online members
+    if "members_online" in needed:
+        humans   = [m for m in guild.members if not m.bot]
+        online_h = [m for m in humans if m.status == discord.Status.online]
+        idle_h   = [m for m in humans if m.status == discord.Status.idle]
+        dnd_h    = [m for m in humans if m.status == discord.Status.dnd]
+        boosters = [m for m in humans if m.premium_since]
+        content  = (
+            f"Total: {len(guild.members)} | Humans: {len(humans)} | Bots: {sum(1 for m in guild.members if m.bot)}\n"
+            f"🟢 Online: {len(online_h)} | 🌙 Idle: {len(idle_h)} | 🔴 DND: {len(dnd_h)}\n"
+        )
+        if online_h:
+            names = ", ".join(m.display_name for m in online_h[:30])
+            extra = f" +{len(online_h)-30} more" if len(online_h) > 30 else ""
+            content += f"Online now: {names}{extra}\n"
+        if idle_h:
+            content += f"Idle: {', '.join(m.display_name for m in idle_h[:15])}\n"
+        if boosters:
+            content += f"Boosters: {', '.join(m.display_name for m in boosters)}\n"
+        _add_section("╔══ MEMBERS ONLINE ══╗", content.rstrip())
+
+    # ── Voice channels
+    if "voice" in needed:
+        vc_lines = []
+        for vc in sorted(guild.voice_channels, key=lambda c: c.position):
+            if vc.members:
+                parts = []
+                for m in vc.members:
+                    vs = m.voice
+                    flags = []
+                    if vs and (vs.self_mute or vs.mute):   flags.append("muted")
+                    if vs and (vs.self_deaf or vs.deaf):   flags.append("deaf")
+                    if vs and vs.self_stream:              flags.append("streaming")
+                    parts.append(f"{m.display_name}{'['+','.join(flags)+']' if flags else ''}")
+                vc_lines.append(f"  #{vc.name}: {', '.join(parts)}")
+        _add_section("╔══ VOICE CHANNELS ══╗", "\n".join(vc_lines) or "  All empty")
+
+    # ── Roles
+    if "roles" in needed:
+        sorted_roles = sorted([r for r in guild.roles if r.name != "@everyone"], key=lambda r: r.position, reverse=True)
+        role_lines = []
+        for r in sorted_roles[:40]:  # cap at 40 roles
+            members_preview = ", ".join(m.display_name for m in r.members[:4] if not m.bot)
+            extra = f" +{len(r.members)-4}" if len(r.members) > 4 else ""
+            role_lines.append(f"  @{r.name} ({len(r.members)} members): {members_preview or 'none'}{extra}")
+        _add_section("╔══ ROLES ══╗", "\n".join(role_lines))
+
+    # ── Channels list
+    if "channels" in needed:
+        ch_lines = []
+        for cat in sorted(guild.categories, key=lambda c: c.position):
+            txt = [c for c in cat.channels if isinstance(c, discord.TextChannel)]
+            ch_str = ", ".join(f"#{c.name}" for c in txt)
+            ch_lines.append(f"  [{cat.name}]: {ch_str or '(no text)'}")
+        uncategorised = [c for c in guild.text_channels if c.category is None]
+        if uncategorised:
+            ch_lines.insert(0, f"  [No category]: {', '.join(f'#{c.name}' for c in uncategorised)}")
+        _add_section("╔══ CHANNELS ══╗", "\n".join(ch_lines))
+
+    # ── XP Leaderboard
+    if "leaderboard_xp" in needed:
+        try:
+            rows = await bot.db.get_leaderboard(guild.id, 10)
+            lb_lines = []
+            for i, row in enumerate(rows):
+                m    = guild.get_member(row["user_id"])
+                name = m.display_name if m else f"<id:{row['user_id']}>"
+                lb_lines.append(f"  #{i+1} {name} — Lv {row.get('level',0)} | {row.get('total_xp',0):,} XP | 🔥{row.get('streak',0)}d")
+            _add_section("╔══ XP LEADERBOARD ══╗", "\n".join(lb_lines) or "  No data")
+        except Exception as exc:
+            _add_section("╔══ XP LEADERBOARD ══╗", f"  [error: {exc}]")
+
+    # ── Message Leaderboard
+    if "leaderboard_msg" in needed:
+        try:
+            rows = await bot.db.get_msg_leaderboard(guild.id, 10)
+            lb_lines = []
+            for i, row in enumerate(rows):
+                m    = guild.get_member(row["user_id"])
+                name = m.display_name if m else f"<id:{row['user_id']}>"
+                lb_lines.append(f"  #{i+1} {name} — {row.get('total_messages',0):,} messages")
+            _add_section("╔══ MESSAGE LEADERBOARD ══╗", "\n".join(lb_lines) or "  No data")
+        except Exception as exc:
+            _add_section("╔══ MESSAGE LEADERBOARD ══╗", f"  [error: {exc}]")
+
+    # ── Invite Leaderboard
+    if "leaderboard_inv" in needed:
+        try:
+            rows = await bot.db.get_invite_leaderboard(guild.id, 10)
+            lb_lines = []
+            for i, row in enumerate(rows):
+                m    = guild.get_member(row.get("inviter_id", 0))
+                name = m.display_name if m else str(row.get("inviter_id"))
+                lb_lines.append(f"  #{i+1} {name} — {row.get('total_invites',0)} invites")
+            _add_section("╔══ INVITE LEADERBOARD ══╗", "\n".join(lb_lines) or "  No data")
+        except Exception as exc:
+            _add_section("╔══ INVITE LEADERBOARD ══╗", f"  [error: {exc}]")
+
+    # ── Boost Leaderboard
+    if "leaderboard_boost" in needed or "boosts" in needed:
+        try:
+            rows = await bot.db.get_boost_leaderboard(guild.id, 10)
+            lb_lines = []
+            for i, row in enumerate(rows):
+                m    = guild.get_member(row.get("user_id", 0))
+                name = m.display_name if m else str(row.get("user_id"))
+                lb_lines.append(f"  #{i+1} {name} — {row.get('boost_count',0)} boosts")
+            _add_section("╔══ BOOST LEADERBOARD ══╗", "\n".join(lb_lines) or "  No data")
+        except Exception as exc:
+            _add_section("╔══ BOOST LEADERBOARD ══╗", f"  [error: {exc}]")
+
+    # ── Giveaways
+    if "giveaways" in needed:
+        try:
+            giveaways = await bot.db.get_active_giveaways(guild.id)
+            gw_lines = []
+            for g in giveaways:
+                host  = guild.get_member(g.get("host_id", 0))
+                ends  = g.get("ends_at")
+                gw_lines.append(
+                    f"  {g.get('prize','?')} | host: {host.display_name if host else '?'} "
+                    f"| entries: {len(g.get('entrants',[]))} | ends: {ends.strftime('%Y-%m-%d %H:%M UTC') if ends else '?'}"
+                )
+            _add_section("╔══ ACTIVE GIVEAWAYS ══╗", "\n".join(gw_lines) or "  None")
+        except Exception as exc:
+            _add_section("╔══ ACTIVE GIVEAWAYS ══╗", f"  [error: {exc}]")
+
+    # ── Tickets
+    if "tickets" in needed:
+        try:
+            open_tickets = await bot.db.tickets.find({"guild_id": guild.id, "closed": False}).to_list(length=10)
+            t_lines = []
+            for t in open_tickets:
+                opener = guild.get_member(t.get("user_id", 0))
+                ch     = guild.get_channel(t.get("channel_id", 0))
+                t_lines.append(
+                    f"  #{t.get('ticket_id','?')} | {opener.display_name if opener else '?'} "
+                    f"| {f'#{ch.name}' if ch else 'deleted'}"
+                )
+            _add_section("╔══ OPEN TICKETS ══╗", "\n".join(t_lines) or "  None")
+        except Exception as exc:
+            _add_section("╔══ OPEN TICKETS ══╗", f"  [error: {exc}]")
+
+    # ── Config (lightweight)
+    if "config" in needed:
+        try:
+            config = await get_config(guild.id)
+            cfg_str = (
+                f"  Automod: {'✅' if config.get('automod_enabled', True) else '❌'} | "
+                f"Anti-spam: {'✅' if config.get('antispam_enabled', True) else '❌'} | "
+                f"Anti-nuke: {'✅' if config.get('antinuke_enabled', True) else '❌'} | "
+                f"Anti-swear: {'✅' if config.get('anti_swear_enabled', True) else '❌'}\n"
+                f"  Voice XP: {'✅' if config.get('voice_xp_enabled', True) else '❌'} | "
+                f"Web search: {'✅' if config.get('web_search', True) else '❌'}"
+            )
+            _add_section("╔══ SERVER CONFIG ══╗", cfg_str)
+        except Exception as exc:
+            _add_section("╔══ SERVER CONFIG ══╗", f"  [error: {exc}]")
+
+    # ── Analytics
+    if "analytics" in needed:
+        try:
+            history = await bot.db.get_member_count_history(guild.id, 7)
+            an_lines = [f"  {e.get('date','?')}: {e.get('member_count','?')} members" for e in history]
+            _add_section("╔══ MEMBER COUNT HISTORY ══╗", "\n".join(an_lines) or "  No snapshots yet")
+        except Exception as exc:
+            _add_section("╔══ MEMBER COUNT HISTORY ══╗", f"  [error: {exc}]")
+
+    # ── Double XP
+    if "double_xp" in needed:
+        dxp_until = _doublexp_until.get(guild.id, 0)
+        if time.monotonic() < dxp_until:
+            remaining = int(dxp_until - time.monotonic())
+            h, rem = divmod(remaining, 3600); m_min, s = divmod(rem, 60)
+            _add_section("╔══ DOUBLE XP ══╗", f"  🔥 ACTIVE — {h}h {m_min}m {s}s remaining")
+
+    return "\n".join(lines)
+
+
 async def build_context(ctx: commands.Context, recent_chat: str = "") -> str:
     """
-    Build the full context string injected into every AI call.
-    - Always includes: requesting user full profile, channel info, recent chat
-    - Always includes: full server snapshot (everything)
-    - Extra: any @mentioned members get their own full profile too
+    Smart context builder — only fetches server sections relevant to the question.
+    Always includes: requesting user profile, channel, recent chat, mentioned members.
+    Lazily fetches: leaderboards, voice, roles, channels, giveaways, etc. only when asked about.
+    Hard-capped at _CTX_CHAR_BUDGET chars total to prevent 413 payload errors.
     """
-    member = ctx.author
-    guild  = ctx.guild
+    member   = ctx.author
+    guild    = ctx.guild
+    question = ctx.message.content
     lines: list[str] = []
 
-    # ── Requesting user ───────────────────────────────────────────────────────
+    # ── Always: requesting user ───────────────────────────────────────────────
     lines.append("╔══ REQUESTING USER ══╗")
     if isinstance(member, discord.Member) and guild:
         lines.append(await build_member_context(member, guild))
     else:
-        lines.append(f"{member.display_name} (@{member.name}, ID: {member.id}) — DM context, no guild data")
+        lines.append(f"{member.display_name} (@{member.name}, ID: {member.id}) — DM")
     lines.append(f"Is bot owner: {getattr(ctx.bot, 'owner_id_int', 0) == member.id}")
 
-    # ── Channel they're asking from ───────────────────────────────────────────
+    # ── Always: channel ───────────────────────────────────────────────────────
     ch = ctx.channel
     ch_info = f"#{ch.name} (ID: {ch.id})"
     if hasattr(ch, "topic") and ch.topic:
         ch_info += f" | topic: {ch.topic[:80]}"
-    if hasattr(ch, "slowmode_delay") and ch.slowmode_delay:
-        ch_info += f" | slowmode: {ch.slowmode_delay}s"
     lines.append(f"\n╔══ CHANNEL ══╗\n{ch_info}")
 
-    # ── Recent chat in this channel ───────────────────────────────────────────
+    # ── Always: recent chat ───────────────────────────────────────────────────
     if recent_chat:
-        lines.append(f"\n╔══ RECENT CHAT (last 10 messages) ══╗\n{recent_chat}")
+        lines.append(f"\n╔══ RECENT CHAT ══╗\n{recent_chat}")
 
-    # ── Any @mentioned members get full profiles ───────────────────────────────
+    # ── Always: mentioned members ─────────────────────────────────────────────
     if guild:
         relevant = resolve_mentioned_members(ctx.message, guild)
         if relevant:
@@ -2041,12 +2354,38 @@ async def build_context(ctx: commands.Context, recent_chat: str = "") -> str:
                     lines.append(await build_member_context(m, guild))
                     lines.append("──")
 
-    # ── Full server snapshot ──────────────────────────────────────────────────
-    if guild:
-        lines.append("\n" + await build_full_server_snapshot(guild))
+    # ── Work out remaining budget for server sections ─────────────────────────
+    base = "\n".join(lines)
+    remaining_budget = max(0, _CTX_CHAR_BUDGET - len(base))
 
-    lines.append(f"\n⏱ Context built: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    return "\n".join(lines)
+    # ── Detect which server sections are needed ───────────────────────────────
+    if guild and remaining_budget > 500:
+        needed: set[str] = set()
+
+        # Always include lightweight server identity
+        needed.add("server_identity")
+
+        # Check each trigger
+        for section, pattern in _CTX_TRIGGERS.items():
+            if pattern.search(question):
+                needed.add(section)
+
+        # If nothing specific triggered, add the most commonly useful sections
+        if len(needed) == 1:  # only server_identity
+            needed.update({"members_online", "voice"})
+
+        server_ctx = await _build_server_sections(guild, needed, remaining_budget)
+        if server_ctx:
+            lines.append(server_ctx)
+
+    lines.append(f"\n⏱ Context built: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
+    result = "\n".join(lines)
+
+    # Final hard-cap safety net
+    if len(result) > _CTX_CHAR_BUDGET:
+        result = result[:_CTX_CHAR_BUDGET] + "\n… [truncated]"
+
+    return result
 
 
 async def fetch_recent_chat(channel: discord.TextChannel, before: discord.Message, limit: int = 10) -> str:
