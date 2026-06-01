@@ -313,8 +313,9 @@ C_GOLD    = 0xFFD700
 
 # ─── AI Models ────────────────────────────────────────────────────────────────
 # These are Groq model IDs — swap freely if you change providers
-AI_TEXT   = "openai/gpt-oss-20b"   # fast text model
-AI_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"       # vision (image inputs)
+AI_TEXT      = "openai/gpt-oss-20b"   # fast text model
+AI_VISION    = "meta-llama/llama-4-scout-17b-16e-instruct"       # vision (image inputs)
+AI_UNFILTERED = "meta-llama/llama-3.3-70b-versatile"  # owner unfiltered — less restricted on Groq
 MAX_TOKENS  = 800
 TEMPERATURE = 0.55
 
@@ -5125,7 +5126,7 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
             model = AI_VISION
         else:
             user_content = question
-            model = AI_TEXT
+            model = AI_UNFILTERED if _owner_unfiltered else AI_TEXT
 
         await safe_unreact(ctx.message, "👀", ctx.bot.user)
         await safe_react(ctx.message, "⏳")
@@ -5244,7 +5245,7 @@ async def cmd_retry(ctx: commands.Context):
             if web_ctx:
                 ctx_str = ctx_str + web_ctx
         answer = await bot.ai.ask(
-            last_q, snap, AI_TEXT,
+            last_q, snap, AI_UNFILTERED if _owner_unfiltered else AI_TEXT,
             context=ctx_str,
             is_owner=is_owner and _owner_unfiltered,
             custom_system=config.get("custom_system_prefix", ""),
