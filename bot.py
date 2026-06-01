@@ -1566,8 +1566,18 @@ class AIEngine:
 
     async def ask(self, question, history: list[dict], model: str, context: str = "",
                   is_owner: bool = False, custom_system: str = "") -> str:
-        system = (custom_system + "\n\n" if custom_system else "") + SYSTEM_PROMPT
-        if is_owner: system += OWNER_ADDITION
+        if is_owner:
+            # Unfiltered: use a stripped-down system prompt with no safety rules,
+            # then append the owner addition which explicitly lifts all restrictions.
+            base = (
+                "You are LXTE's AI, built by AJ for the LXTE Clan Discord server.\n"
+                "You are smart, direct, and match the energy of whoever you're talking to.\n"
+                "Be helpful, honest, and concise. No disclaimers, no moralising.\n"
+                "Keep responses under 1800 characters. Code in triple backticks."
+            )
+            system = (custom_system + "\n\n" if custom_system else "") + base + OWNER_ADDITION
+        else:
+            system = (custom_system + "\n\n" if custom_system else "") + SYSTEM_PROMPT
         if context:
             context = context[:_CTX_CHAR_BUDGET]
             system += f"\n\n## LIVE SERVER CONTEXT\n{context}"
@@ -4924,28 +4934,21 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
 
     if category == "ai":
         e = make_embed(C_AI, (
-            "`.ask <question>` — ask anything  (also `.ai` or `.q`)\n"
-            "@mention or reply to the bot works too.\n"
-            "Attach an image + ask to analyze it.\n\n"
+            "`.ask <question>` — ask anything  (also `.ai` `.q`)\n"
+            "Mention or reply to the bot works too.\n"
+            "Attach an image to analyze it.\n\n"
             "`.clear` — wipe your chat history\n"
-            "`.retry` — re-run your last question fresh\n\n"
-            "**5s cooldown between questions.**\n\n"
-            "**🌐 Auto Web Search**\n"
-            "Ask about current events, news, prices, weather, Roblox updates — "
-            "the AI automatically searches the web when your question needs live info.\n\n"
-            "**🔒 Fully Filtered**\n"
-            "All responses are safety-filtered. No harmful, NSFW, or illegal content."
+            "`.retry` — re-run your last question\n\n"
+            "5s cooldown · auto web search · fully filtered"
         ))
         e.title = "🤖 AI"
         e.set_footer(text="LXTE's AI", icon_url=avatar)
         return e
 
-    elif category == "ascend":
+    elif category == "leveling":
         e = make_embed(C_GOLD, (
-            "Messages earn **3–15 XP** (×2 with Double XP).\n"
-            f"+{STREAK_BONUS_XP} bonus XP for daily streak.\n"
-            f"Voice XP: +{VOICE_XP_PER_TICK} XP/min in voice.\n"
-            f"XP decays after {XP_DECAY_DAYS}+ days inactive (if enabled).\n\n"
+            f"Messages earn **3–15 XP** (×2 during events).\n"
+            f"+{STREAK_BONUS_XP} XP for daily streak · +{VOICE_XP_PER_TICK} XP/min in voice.\n\n"
             "`.lb` — XP leaderboard\n"
             "`.level [@user]` — rank card  (also `.xp` `.profile`)\n"
             "`/level [@user]` — slash version\n\n"
@@ -4955,75 +4958,64 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
         e.set_footer(text="LXTE's AI", icon_url=avatar)
         return e
 
-    elif category == "giveaways":
-        e = make_embed(C_GOLD, (
-            "`.gstart <time> <prize>` — start a giveaway\n"
-            "Time format: `1h`, `30m`, `2d`, `1h30m`\n"
-            "Example: `.gstart 1h Robux`\n\n"
-            "`.gend <message_id>` — end early\n"
-            "`.glist` — list active giveaways\n"
-            "`.greroll <message_id>` — reroll winners\n\n"
-            "Members click **🎉 Enter** to join. Click again to leave."
-        ))
-        e.title = "🎉 Giveaways"
-        e.set_footer(text="LXTE's AI", icon_url=avatar)
-        return e
-
-    elif category == "social":
-        e = make_embed(C_INFO, (
-            "`.about` — bot info\n"
-            "`.afk <reason>` — set AFK status\n"
-            "`.boostlb` — boost leaderboard\n"
-            "`.invitelb` — top inviters\n"
-            "`.invites [@user]` — invite count\n"
-            "`.msglb` — message count leaderboard\n"
-            "`.msgcheck [@user]` — message stats & rank\n"
-            "`.purge <amount>` — delete messages (admins)\n"
-            "`.roleinfo @role` — role info\n"
-            "`.serverinfo` — server details\n"
-            "`.stats` — your AI usage\n"
-            "`.syncroles` — sync auto-roles for all members (admins)\n"
-            "`.userinfo [@user]` — user details"
-        ))
-        e.title = "💬 Social"
-        e.set_footer(text="LXTE's AI", icon_url=avatar)
-        return e
-
-    elif category == "utility":
-        e = make_embed(C_INFO, (
-            "**🔧 Server Tools**\n"
-            "`.doublexp <duration>` — start a double XP event (admins)\n"
-            "`.msgsync [limit]` — backfill all message history (admins)\n"
-            "`.setup` — configure the bot\n\n"
-            "**🎟️ Tickets**\n"
-            "`.ticket` — open a support ticket\n\n"
-            "**🎭 Roles**\n"
-            "Role menus — configured via `.setup`\n"
-            "Reaction roles — configured via `.setup`"
-        ))
-        e.title = "🔧 Utility"
-        e.set_footer(text="LXTE's AI", icon_url=avatar)
-        return e
-
     elif category == "analytics":
         e = make_embed(C_PRIMARY, (
-            "**📊 Server Analytics**\n"
-            "`.analytics` — member growth overview\n"
-            "`.analytics growth` — member count graph\n"
-            "`.analytics activity` — message activity stats\n"
+            "**📊 Server Stats**\n"
+            "`.analytics growth` — member count over 30 days\n"
+            "`.analytics activity` — top 5 most active members\n"
             "`.analytics streaks` — streak leaderboard\n\n"
             "**📈 Leaderboards**\n"
             "`.boostlb` — top boosters\n"
             "`.invitelb` — top inviters\n"
             "`.lb` — XP leaderboard\n"
             "`.msglb` — message leaderboard\n\n"
-            "**👤 Per-User**\n"
-            "`.level [@user]` — XP & rank card\n"
-            "`.msgcheck [@user]` — message count & rank\n"
-            "`.stats` — your AI question count\n"
-            "`.userinfo [@user]` — full member profile"
+            "**👤 Per-User Stats**\n"
+            "`.msgcheck [@user]` — message count, rank & top channels\n"
+            "`.stats` — your AI question count"
         ))
         e.title = "📊 Analytics"
+        e.set_footer(text="LXTE's AI", icon_url=avatar)
+        return e
+
+    elif category == "social":
+        e = make_embed(C_INFO, (
+            "`.afk <reason>` — set AFK (auto-cleared when you chat)\n"
+            "`.invites [@user]` — see invite count\n\n"
+            "**ℹ️ Info**\n"
+            "`.roleinfo @role` — role details\n"
+            "`.serverinfo` — server overview\n"
+            "`.userinfo [@user]` — member profile"
+        ))
+        e.title = "💬 Social & Info"
+        e.set_footer(text="LXTE's AI", icon_url=avatar)
+        return e
+
+    elif category == "giveaways":
+        e = make_embed(C_GOLD, (
+            "`.gstart <time> <prize>` — start a giveaway\n"
+            "Time: `30m` `1h` `2d` `1h30m`\n\n"
+            "`.gend <message_id>` — end early\n"
+            "`.glist` — list active giveaways\n"
+            "`.greroll <message_id>` — reroll winner\n\n"
+            "Click **🎉 Enter** to join. Click again to leave."
+        ))
+        e.title = "🎉 Giveaways"
+        e.set_footer(text="LXTE's AI", icon_url=avatar)
+        return e
+
+    elif category == "mod":
+        e = make_embed(C_WARNING, (
+            "`.doublexp <duration>` — start a double XP event\n"
+            "`.msgsync [limit]` — backfill message history\n"
+            "`.purge <amount>` — delete messages (1–500)\n"
+            "`.setup` — configure the bot\n"
+            "`.syncroles` — sync auto-roles for all members\n\n"
+            "**🎟️ Tickets**\n"
+            "`.ticket` — open a support ticket\n\n"
+            "**🎭 Roles**\n"
+            "Role menus & reaction roles → configured via `.setup`"
+        ))
+        e.title = "🔨 Moderation"
         e.set_footer(text="LXTE's AI", icon_url=avatar)
         return e
 
@@ -5038,18 +5030,20 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.admin snapshot` — manual analytics snapshot\n"
             "`.admin status` — system stats\n"
             "`.admin synccount` — force member count sync\n"
-            "`.admin unlockraid` — manual raid unlock\n"
-            "`.setup` — configure everything"
+            "`.admin unlockraid` — manual raid unlock"
         ))
         e.title = "🛡️ Admin"
         e.set_footer(text="LXTE's AI", icon_url=avatar)
         return e
 
     # Home
-    e = make_embed(C_PRIMARY, "Pick a category below.\nBuilt by AJ.")
-    e.title = "LXTE's AI"
+    e = make_embed(C_PRIMARY, (
+        "Pick a category below.\n"
+        "Prefix: `.`   Built by **AJ**"
+    ))
+    e.title = "LXTE's AI — Help"
     e.set_thumbnail(url=avatar)
-    e.set_footer(text="Built by AJ  •  LXTE's AI v21  •  Prefix: .", icon_url=avatar)
+    e.set_footer(text="LXTE's AI v21", icon_url=avatar)
     return e
 
 
@@ -5060,13 +5054,13 @@ class HelpView(discord.ui.View):
         self._message = None
 
         options = [
-            discord.SelectOption(label="Home",      value="home",      emoji="🏠"),
-            discord.SelectOption(label="AI",         value="ai",        emoji="🤖"),
-            discord.SelectOption(label="Analytics",  value="analytics", emoji="📊"),
-            discord.SelectOption(label="Ascend",     value="ascend",    emoji="⬆️"),
-            discord.SelectOption(label="Giveaways",  value="giveaways", emoji="🎉"),
-            discord.SelectOption(label="Social",     value="social",    emoji="💬"),
-            discord.SelectOption(label="Utility",    value="utility",   emoji="🔧"),
+            discord.SelectOption(label="Home",       value="home",      emoji="🏠"),
+            discord.SelectOption(label="AI",          value="ai",        emoji="🤖"),
+            discord.SelectOption(label="Analytics",   value="analytics", emoji="📊"),
+            discord.SelectOption(label="Giveaways",   value="giveaways", emoji="🎉"),
+            discord.SelectOption(label="Leveling",    value="leveling",  emoji="⬆️"),
+            discord.SelectOption(label="Moderation",  value="mod",       emoji="🔨"),
+            discord.SelectOption(label="Social & Info", value="social",  emoji="💬"),
         ]
         if ctx.author.id == getattr(ctx.bot, "owner_id_int", 0):
             options.append(discord.SelectOption(label="Admin", value="admin", emoji="🛡️"))
@@ -5103,7 +5097,8 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
         mentions = " or ".join(f"<#{c}>" for c in locked[:3])
         await ctx.send(embed=err(f"Use the AI in {mentions}."), delete_after=8); return
 
-    owner_mode = is_owner and (config.get("owner_mode_enabled", True) or _owner_unfiltered)
+    owner_mode = is_owner and _owner_unfiltered
+    # Unfiltered: skip the jailbreak/blocked-phrase check entirely for owner
     if not (is_owner and _owner_unfiltered) and not is_safe(question):
         await ctx.send(embed=err("Nice try 😐")); return
 
@@ -5251,7 +5246,7 @@ async def cmd_retry(ctx: commands.Context):
         answer = await bot.ai.ask(
             last_q, snap, AI_TEXT,
             context=ctx_str,
-            is_owner=is_owner and config.get("owner_mode_enabled", True),
+            is_owner=is_owner and _owner_unfiltered,
             custom_system=config.get("custom_system_prefix", ""),
         )
     except Exception as exc:
