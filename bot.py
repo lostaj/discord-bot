@@ -1,6 +1,6 @@
-  """
+"""
 LXTE's AI — built by AJ
-v20.0.0 — Changes from v19:
+v21.0.0 — Changes from v19:
   - REMOVED: groq/compound-mini routing — replaced with DDG web search context injection
   - UPGRADED: KeyRotator — per-key rate-limit tracking with exponential backoff + jitter
   - FIXED: No more blind sleep(1) on 429 — instantly skips to the next available key
@@ -4643,17 +4643,20 @@ class LXTEBot(commands.Bot):
 
     @tasks.loop(hours=1)
     async def cleanup_task(self):
-        cutoff = time.monotonic() - 3600
-        for d in (_last_used, _xp_cooldowns, _cmd_cooldowns):
-            for k in [k for k, v in d.items() if v < cutoff]: del d[k]
-        # Prune stale user entries from spam/dup trackers — prevents unbounded growth
-        now_m = time.monotonic()
-        for uid in [k for k, v in list(_spam_tracker.items()) if not v or now_m - max(v) > SPAM_WINDOW_SECS * 10]:
-            del _spam_tracker[uid]
-        for uid in [k for k in list(_dup_tracker) if not _dup_tracker[k]]:
-            del _dup_tracker[uid]
-        # Reset ghost-ping strike counters (soft reset — strikes decay after 1h quiet)
-        _ghost_ping_strikes.clear()
+        try:
+            cutoff = time.monotonic() - 3600
+            for d in (_last_used, _xp_cooldowns, _cmd_cooldowns):
+                for k in [k for k, v in d.items() if v < cutoff]: del d[k]
+            # Prune stale user entries from spam/dup trackers — prevents unbounded growth
+            now_m = time.monotonic()
+            for uid in [k for k, v in list(_spam_tracker.items()) if not v or now_m - max(v) > SPAM_WINDOW_SECS * 10]:
+                del _spam_tracker[uid]
+            for uid in [k for k in list(_dup_tracker) if not _dup_tracker[k]]:
+                del _dup_tracker[uid]
+            # Reset ghost-ping strike counters (soft reset — strikes decay after 1h quiet)
+            _ghost_ping_strikes.clear()
+        except Exception as exc:
+            logger.warning("cleanup_task: %s", exc)
 
     @tasks.loop(seconds=SPAM_PERSIST_INTERVAL)
     async def spam_persist_task(self):
@@ -4757,12 +4760,18 @@ class LXTEBot(commands.Bot):
 
     @tasks.loop(seconds=30)
     async def giveaway_task(self):
-        due = await self.db.get_due_giveaways()
-        for giveaway in due:
-            guild = self.get_guild(giveaway.get("guild_id"))
-            if not guild: continue
-            await self.db.end_giveaway(giveaway["message_id"])
-            await do_end_giveaway(giveaway, guild)
+        try:
+            due = await self.db.get_due_giveaways()
+            for giveaway in due:
+                guild = self.get_guild(giveaway.get("guild_id"))
+                if not guild: continue
+                try:
+                    await self.db.end_giveaway(giveaway["message_id"])
+                    await do_end_giveaway(giveaway, guild)
+                except Exception as exc:
+                    logger.warning("giveaway_task per-item error: %s", exc)
+        except Exception as exc:
+            logger.error("giveaway_task: %s", exc)
 
     @cleanup_task.before_loop
     @voice_xp_task.before_loop
@@ -4954,14 +4963,6 @@ async def cmd_help(ctx: commands.Context):
 @bot.command(name="ask", aliases=["ai", "q"])
 async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this image?"):
     is_owner = ctx.author.id == bot.owner_id_int
-    if not is_owner:
-        now_ts    = time.monotonic()
-        remaining = USER_COOLDOWN_SECS - (now_ts - _last_used.get(ctx.author.id, 0.0))
-        if remaining > 0:
-            ready_at = int(time.time() + remaining)
-            await ctx.send(embed=err(f"You can ask again <t:{ready_at}:R>."), delete_after=6); return
-        _last_used[ctx.author.id] = now_ts
-
     config = await get_config(ctx.guild.id) if ctx.guild else {}
     locked = config.get("ai_channel_ids", [])
     if locked and ctx.channel.id not in locked and not is_owner:
@@ -5080,9 +5081,14 @@ async def cmd_retry(ctx: commands.Context):
     stop = asyncio.Event()
     asyncio.create_task(keep_typing(ctx.channel, stop))
     try:
+        ctx_str = await build_context(ctx)
+        if config.get("web_search", True):
+            web_ctx = await auto_web_search(last_q)
+            if web_ctx:
+                ctx_str = ctx_str + web_ctx
         answer = await bot.ai.ask(
             last_q, snap, AI_TEXT,
-            context=await build_context(ctx),
+            context=ctx_str,
             is_owner=is_owner and config.get("owner_mode_enabled", True),
             custom_system=config.get("custom_system_prefix", ""),
         )
