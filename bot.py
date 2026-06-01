@@ -213,20 +213,8 @@ _add(r"\b88\b.*\b88\b", "hh-double")   # heil hitler coded
 _add(r"\bsieg\s+heil\b", "sieg-heil")
 _add(r"[hн][hн]\s*[hн][hн]", "hh")   # HH / heil hitler shorthand
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  GENERAL SWEAR WORDS (same bypass-resistant engine)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_add(r"\b" + _w(_F,_U,_C,_K) + r"\b", "fuck")
-_add(r"\b" + _w(_S,_H,_I,_T) + r"\b", "shit")
-_add(r"\b" + _w(_B,_I,_T,_C,_H) + r"\b", "bitch")
-_add(r"\b" + _w(_D,_I,_C,_K) + r"\b", "dick")
-_add(r"\b" + _w(_C,_O,_C,_K) + r"\b", "cock")
-_add(r"\b" + _w(_W,_A,_N,_K,_E,_R) + r"\b", "wanker")
-_add(r"\b" + _w(_T,_W,_A,_T) + r"\b", "twat")
-_add(r"\b" + _w(_B,_O,_L,_L,_O,_C,_K) + r"s?\b", "bollocks")
-_add(r"\b" + _w(_M,_O,_T,_H,_E,_R) + _SEP + _w(_F,_U,_C,_K) + r"\b", "motherfucker")
-_add(r"\b" + _w(_A,_S,_S) + r"(?:" + _SEP + _w(_H,_O,_L,_E) + r")?\b", "ass")
+# ── General swear words (fuck, shit, bitch, ass, etc.) intentionally excluded ─
+# This filter targets SLURS ONLY. Basic profanity is not caught here.
 
 PROFANITY_AVAILABLE = True
 print(f"✅ Slur filter v2 loaded — {len(_SLUR_PATTERNS)} patterns active")
