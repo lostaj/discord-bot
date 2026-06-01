@@ -1367,7 +1367,12 @@ class AIEngine:
                   is_owner: bool = False, custom_system: str = "") -> str:
         system = (custom_system + "\n\n" if custom_system else "") + SYSTEM_PROMPT
         if is_owner: system += OWNER_ADDITION
-        if context:  system += f"\n\n## LIVE SERVER CONTEXT\n{context}"
+        if context:
+            # Groq's payload limit is ~32k tokens (~128k chars). Cap context so the
+            # system prompt + history + question never blow past that.
+            # Reserve ~20k chars for system prompt, history, and question headroom.
+            context = context[:100_000]
+            system += f"\n\n## LIVE SERVER CONTEXT\n{context}"
 
         messages = [{"role": "system", "content": system}] + list(history) + [{"role": "user", "content": question}]
         kwargs   = dict(model=model, messages=messages, max_tokens=MAX_TOKENS)
@@ -1903,7 +1908,12 @@ async def build_full_server_snapshot(guild: discord.Guild) -> str:
 
     # ══ TIMESTAMP ═════════════════════════════════════════════════════════════
     lines.append(f"\n⏱ Snapshot taken: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    return "\n".join(lines)
+    snapshot = "\n".join(lines)
+    # Hard cap — large servers can generate 200k+ char snapshots which blow Groq's payload limit.
+    # 80k chars ≈ ~20k tokens, leaving plenty of room for system prompt + history + question.
+    if len(snapshot) > 80_000:
+        snapshot = snapshot[:80_000] + "\n… [snapshot truncated]"
+    return snapshot
 
 
 async def build_context(ctx: commands.Context, recent_chat: str = "") -> str:
