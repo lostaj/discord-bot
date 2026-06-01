@@ -315,7 +315,7 @@ C_GOLD    = 0xFFD700
 # These are Groq model IDs — swap freely if you change providers
 AI_TEXT      = "openai/gpt-oss-20b"   # fast text model
 AI_VISION    = "meta-llama/llama-4-scout-17b-16e-instruct"       # vision (image inputs)
-AI_UNFILTERED = "meta-llama/llama-3.3-70b-versatile"  # owner unfiltered — less restricted on Groq
+AI_UNFILTERED = "llama-3.3-70b-versatile"  # owner unfiltered — less restricted on Groq
 MAX_TOKENS  = 800
 TEMPERATURE = 0.55
 
