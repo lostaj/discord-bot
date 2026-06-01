@@ -313,7 +313,7 @@ C_GOLD    = 0xFFD700
 
 # ─── AI Models ────────────────────────────────────────────────────────────────
 # These are Groq model IDs — swap freely if you change providers
-AI_TEXT   = "meta-llama/llama-4-maverick-17b-128e-instruct"   # fast text model
+AI_TEXT   = "openai/gpt-oss-20b"   # fast text model
 AI_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"       # vision (image inputs)
 MAX_TOKENS  = 800
 TEMPERATURE = 0.55
