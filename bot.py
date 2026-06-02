@@ -5880,12 +5880,21 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
 
     stop.set()
     await safe_unreact(ctx.message, "⏳", ctx.bot.user)
-    # Send clean embed with the answer
-    e = make_embed(C_PRIMARY, answer[:4096])
+    # Send clean embed — matches screenshot style exactly
+    e = discord.Embed(description=answer[:4096], color=0x2b2d31)
+    e.set_author(
+        name=ctx.bot.user.display_name,
+        icon_url=ctx.bot.user.display_avatar.url if ctx.bot.user.display_avatar else None,
+    )
+    e.set_footer(
+        text=f"asked by {ctx.author.display_name}",
+        icon_url=ctx.author.display_avatar.url if ctx.author.display_avatar else None,
+    )
+    e.timestamp = ctx.message.created_at
     try:
-        await ctx.reply(embed=e, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
-    except Exception:
         await ctx.send(embed=e)
+    except Exception:
+        await ctx.send(answer[:2000])
 
 @bot.command(name="robloxnotify", aliases=["rbnoti", "robloxalert"], hidden=True)
 @commands.has_permissions(administrator=True)
