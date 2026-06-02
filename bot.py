@@ -411,6 +411,32 @@ _voice_join_times: dict[tuple[int, int], float] = {}
 # ─── Tickets ──────────────────────────────────────────────────────────────────
 TICKET_AUTOCLOSE_HOURS = 48
 
+# ─── Staff Application Q&A ────────────────────────────────────────────────────
+STAFF_APP_OWNER_ID = 1509005864726560919
+
+STAFF_APP_QUESTIONS = [
+    "How old are you?",
+    "What is your timezone? (e.g. GMT, EST, PST)",
+    "How many hours per week can you dedicate to being staff?",
+    "What is your Roblox username?",
+    "What is your Roblox BedWars rank?",
+    "How long have you been in this server?",
+    "Have you ever been warned or punished in this server? If yes, explain.",
+    "Why do you want to be staff in LXTE?",
+    "What previous moderation or staff experience do you have? (Write \'None\' if none)",
+    "What makes you stand out from other applicants?",
+    "What would you do if a member bypassed the word filter to say a blacklisted word?",
+    "A member is spamming the chat — what do you do?",
+    "You find out a staff member is abusing their powers — what steps do you take?",
+    "A member DMs you asking for special treatment — how do you respond?",
+    "How long do you plan to stay as staff if accepted?",
+    "Are you currently applying for staff in any other servers?",
+    "Is there anything else you\'d like to add about yourself?",
+]
+
+# channel_id -> {"user_id": int, "question_index": int, "answers": list[str]}
+_staff_app_sessions: dict[int, dict] = {}
+
 # ─── Anti-Raid ────────────────────────────────────────────────────────────────
 RAID_JOIN_WINDOW  = 10
 RAID_JOIN_THRESH  = 8
@@ -4004,7 +4030,7 @@ class RemoveLevelRoleModal(discord.ui.Modal, title="Remove Level Role"):
 
 TICKET_CATEGORIES = [
     {"id": "join",  "label": "⚔️ Join LXTE", "desc": "Apply to join the LXTE Clan"},
-    {"id": "staff", "label": "🛡️ Staff",      "desc": "Report an issue or contact staff"},
+    {"id": "staff", "label": "🛡️ Staff Application", "desc": "Apply for a staff position in LXTE"},
     {"id": "other", "label": "💬 Other",      "desc": "Anything else"},
 ]
 
@@ -4024,7 +4050,7 @@ class TicketCategorySelect(discord.ui.View):
         if cid == "join":
             await i.response.send_modal(JoinLXTEModal())
         elif cid == "staff":
-            await i.response.send_modal(StaffTicketModal())
+            await _create_ticket(i, "staff", {})
         else:
             await i.response.send_modal(OtherTicketModal())
 
@@ -4035,16 +4061,50 @@ class JoinLXTEModal(discord.ui.Modal, title="Join LXTE Clan"):
     async def on_submit(self, i):
         await _create_ticket(i, "join", {"roblox": self.roblox.value, "bw_stats": self.bw_stats.value})
 
-class StaffTicketModal(discord.ui.Modal, title="Contact Staff"):
-    issue   = discord.ui.TextInput(label="What do you need to report or discuss?", style=discord.TextStyle.paragraph, max_length=500)
-    against = discord.ui.TextInput(label="Who is involved? (if anyone)", placeholder="Username(s) or leave blank", required=False, max_length=100)
-    async def on_submit(self, i):
-        await _create_ticket(i, "staff", {"issue": self.issue.value, "against": self.against.value})
+# StaffTicketModal removed — staff apps now use in-channel Q&A (_staff_app_sessions)
 
 class OtherTicketModal(discord.ui.Modal, title="Open a Ticket"):
     reason = discord.ui.TextInput(label="What do you need help with?", style=discord.TextStyle.paragraph, max_length=500)
     async def on_submit(self, i):
         await _create_ticket(i, "other", {"reason": self.reason.value})
+
+async def _send_staff_app_question(channel: discord.TextChannel, session: dict):
+    q_idx    = session["question_index"]
+    total    = len(STAFF_APP_QUESTIONS)
+    question = STAFF_APP_QUESTIONS[q_idx]
+    e = make_embed(C_INFO, f"**{question}**")
+    e.title = f"Question {q_idx + 1} of {total}"
+    e.set_footer(text="Type your answer in chat  •  LXTE Staff Application")
+    await channel.send(embed=e)
+
+async def _finish_staff_app(channel: discord.TextChannel, session: dict, guild: discord.Guild):
+    user = guild.get_member(session["user_id"])
+    name = user.display_name if user else f"<@{session['user_id']}>"
+
+    # ── Summary embed ──────────────────────────────────────────────────────
+    e = make_embed(C_GOLD)
+    e.title = f"🛡️ Staff Application — {name}"
+    e.description = (
+        f"**Applicant:** {user.mention if user else f'<@{session["user_id"]}>'} "
+        f"(`{str(user)}` | `{session['user_id']}`)"
+    )
+    if user and user.display_avatar:
+        e.set_thumbnail(url=user.display_avatar.url)
+    for idx, (q, a) in enumerate(zip(STAFF_APP_QUESTIONS, session["answers"]), 1):
+        e.add_field(name=f"Q{idx}. {q}", value=a or "*(no answer)*", inline=False)
+    e.set_footer(text="LXTE's AI — Staff Applications")
+
+    # ── Tell applicant they're done ────────────────────────────────────────
+    done = make_embed(C_SUCCESS,
+        f"✅ {user.mention if user else 'Applicant'}, your application is complete!\n"
+        "The owner has been notified and will review your answers. **Good luck!**"
+    )
+    done.title = "Application Submitted!"
+    done.set_footer(text="LXTE's AI — Staff Applications")
+    await channel.send(embed=done)
+
+    # ── Ping owner with full summary ───────────────────────────────────────
+    await channel.send(content=f"<@{STAFF_APP_OWNER_ID}>", embed=e)
 
 async def _create_ticket(i: discord.Interaction, cid: str, answers: dict):
     guild  = i.guild
@@ -4098,12 +4158,31 @@ async def _create_ticket(i: discord.Interaction, cid: str, answers: dict):
         e.add_field(name="🎮 Roblox Username", value=answers.get("roblox", "?"),   inline=True)
         e.add_field(name="⚔️ BedWars Stats",   value=answers.get("bw_stats", "?"), inline=False)
     elif cid == "staff":
-        e.title       = f"🛡️ Staff Ticket #{ticket_num:04d}"
-        e.description = f"Hey {user.mention}! Staff have been notified and will be with you shortly."
-        e.add_field(name="📋 Issue",    value=answers.get("issue", "No details given."), inline=False)
-        involved = answers.get("against", "").strip()
-        if involved:
-            e.add_field(name="👤 Involving", value=involved, inline=True)
+        # ── Register Q&A session and send intro ───────────────────────────────
+        _staff_app_sessions[channel.id] = {
+            "user_id":        user.id,
+            "question_index": 0,
+            "answers":        [],
+        }
+        intro = make_embed(C_PRIMARY)
+        intro.title = "🛡️ LXTE Staff Application"
+        intro.description = (
+            f"Welcome {user.mention}! You've opened a **staff application**.\n\n"
+            "**Here's how this works:**\n"
+            "• The bot will ask you **17 questions** one by one\n"
+            "• Answer **each question in a single message** directly in this channel\n"
+            "• Be **honest and detailed** — low effort answers will get you denied\n"
+            "• Make sure your answers **make sense and count** — no copy-paste spam\n"
+            "• Once all questions are answered, your application is sent straight to the owner\n\n"
+            "**Take your time, be yourself, and good luck! First question below ↓**"
+        )
+        intro.set_footer(text="LXTE's AI — Staff Applications")
+        await channel.send(content=user.mention, embed=intro)
+        await asyncio.sleep(1)
+        await _send_staff_app_question(channel, _staff_app_sessions[channel.id])
+        # Early return — no bottom embed/close view needed yet for staff apps
+        await i.response.send_message(embed=ok(f"Application ticket opened: {channel.mention}"), ephemeral=True)
+        return
     else:
         e.title       = f"💬 Ticket #{ticket_num:04d}"
         e.description = f"Hey {user.mention}! We'll be with you shortly."
@@ -4139,6 +4218,8 @@ class TicketCloseView(discord.ui.View):
         if not is_staff: await i.response.send_message("Only staff or the ticket opener can close this.", ephemeral=True); return
         await i.response.send_message(embed=make_embed(C_WARNING, "Closing in 5 seconds…"))
         await bot.db.close_ticket(channel.id)
+        # Clean up any active staff app session for this channel
+        _staff_app_sessions.pop(channel.id, None)
         config    = await get_config(i.guild.id)
         log_ch_id = config.get("ticket_log_channel_id")
         if log_ch_id:
@@ -4844,6 +4925,26 @@ class LXTEBot(commands.Bot):
                     {"channel_id": message.channel.id},
                     {"$set": {"last_activity": datetime.now(timezone.utc), "warned": False}},
                 )
+
+        # ── Staff application Q&A handler ──────────────────────────────────────
+        if message.guild and message.channel.id in _staff_app_sessions and not is_command:
+            session = _staff_app_sessions[message.channel.id]
+            if message.author.id == session["user_id"]:
+                answer = content.strip()
+                if len(answer) < 2:
+                    await message.channel.send(
+                        embed=make_embed(C_WARNING, "❗ Please give a proper answer — don't leave it blank!"),
+                        delete_after=6,
+                    )
+                    return
+                session["answers"].append(answer)
+                session["question_index"] += 1
+                if session["question_index"] < len(STAFF_APP_QUESTIONS):
+                    await _send_staff_app_question(message.channel, session)
+                else:
+                    await _finish_staff_app(message.channel, session, message.guild)
+                    _staff_app_sessions.pop(message.channel.id, None)
+                return
 
         await self.process_commands(message)
 
@@ -5749,40 +5850,20 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
         if mem:
             ctx_str = f"[MEMORY ABOUT THIS USER: {mem}]\n\n" + ctx_str
 
-        # Ask the AI — streaming so the response types out live
-        answer_parts: list[str] = []
-        placeholder  = await ctx.reply(
-            "▌",
-            mention_author=False,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        last_edit = time.monotonic()
-        EDIT_INTERVAL = 1.2   # seconds between Discord edits (avoid rate limit)
-
+        # Ask the AI — simple single response, no streaming
         try:
-            async for chunk in bot.ai.ask_stream(
+            answer = await bot.ai.ask(
                 user_content, history, model,
                 context=ctx_str,
                 is_owner=is_owner and _owner_unfiltered,
                 custom_system=custom_system,
-            ):
-                answer_parts.append(chunk)
-                now_m = time.monotonic()
-                if now_m - last_edit >= EDIT_INTERVAL:
-                    current = "".join(answer_parts)
-                    if len(current) > 1990: current = current[:1990] + "…"
-                    try:
-                        await placeholder.edit(content=current + " ▌")
-                        last_edit = now_m
-                    except Exception: pass
+            )
         except Exception as exc:
             stop.set()
-            logger.error("AI stream: %s", exc, exc_info=exc)
-            try: await placeholder.edit(content=f"❌ Something went wrong: `{str(exc)[:200]}`")
-            except Exception: pass
-            return
+            logger.error("AI: %s", exc, exc_info=exc)
+            await ctx.send(embed=err(f"Something went wrong: `{str(exc)[:200]}`")); return
 
-        answer = "".join(answer_parts).strip()
+        answer = (answer or "").strip()
         if not answer: answer = "…"
 
         history.append({"role": "user",      "content": question if isinstance(question, str) else "[image]"})
@@ -5799,15 +5880,12 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
 
     stop.set()
     await safe_unreact(ctx.message, "⏳", ctx.bot.user)
-    # Edit the placeholder to the final answer (avoids a second message)
+    # Send clean embed with the answer
+    e = make_embed(C_PRIMARY, answer[:4096])
     try:
-        await placeholder.edit(content=ai_reply_content(answer))
+        await ctx.reply(embed=e, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
     except Exception:
-        await ctx.reply(
-            ai_reply_content(answer),
-            mention_author=False,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        await ctx.send(embed=e)
 
 @bot.command(name="robloxnotify", aliases=["rbnoti", "robloxalert"], hidden=True)
 @commands.has_permissions(administrator=True)
