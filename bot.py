@@ -1,4 +1,4 @@
-#"""
+"""
 LXTE's AI — built by AJ
 v22.0.0 — Changes from v21:
   - UPGRADED: KeyRotator — circuit-breaker pattern, smarter jitter, health-probe auto-recovery,
