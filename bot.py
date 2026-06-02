@@ -1,38 +1,18 @@
 """
 LXTE's AI — built by AJ
-v23.0.0 — Changes from v22:
-  - UPGRADED: snapshot — now captures EVERYTHING: member counts, XP/levels, guild config,
-              role menus, reaction roles, channel & role structure, bans, warns, active
-              giveaways, member count history, all AI conversation histories, global stats,
-              and full bot health (latency, uptime, RAM, API key statuses).
-              Saves to MongoDB (new `snapshots` collection) AND attaches a timestamped JSON file.
-  - UPGRADED: AIEngine — deduplicated system-prompt building (_build_system/_build_messages),
-              no more copy-paste between ask() and ask_stream(). Owner temp raised to 0.92.
-              MAX_TOKENS raised 800→1024, TEMPERATURE 0.55→0.60 for more natural responses.
-  - UPGRADED: KeyRotator — per-key success/error counters; _next_key_idx now picks the
-              healthiest key (lowest error ratio) among ready keys. Dead probe window
-              reduced 300s→240s for faster recovery. Connection pool raised 30→40.
-              Read timeout raised to 40s. retryReads enabled on DB client.
-  - UPGRADED: web_search — added _ddg_html_fallback (full scrape fallback); result formatting
-              now includes URLs and direct answers. Falls back even on exception.
-  - UPGRADED: auto_web_search — full parallel specialist routing (weather, crypto, stock,
-              Roblox all fire concurrently alongside DDG). Intent detection is regex-based,
-              not just keyword. Results deduped, budget-capped at 3k chars.
-  - UPGRADED: _REALTIME_RE — expanded to cover price questions, "who won", "is X still",
-              schedules, trailers, "just dropped", "came out" and more.
-  - UPGRADED: Context builder — new `newest_member` trigger and section: answers "who just
-              joined?" with exact timestamp, relative time, and last 10 joins.
-  - UPGRADED: SERVER_TRIGGER — includes newest/latest member join patterns.
-  - UPGRADED: Config cache — TTL raised 30s→60s; stale-while-revalidate pattern with
-              2-minute stale window. Background refresh avoids blocking hot path.
-  - UPGRADED: Database — connection pool raised to 20 (minPoolSize=2), retryReads=True,
-              socket/connect timeouts tuned. _retry() helper for transient errors.
-  - UPGRADED: Spam detection — dup messages now normalised (lowercase, whitespace collapsed,
-              repeated chars compressed) before hashing. _normalise_msg() helper.
-  - UPGRADED: System prompt — documents newest member capability in LIVE SERVER DATA section.
-  - UPGRADED: `keys` admin action — shows per-key ok/total success rate alongside status.
-  - FIXED: auto_web_search previously fired DDG only; now all specialists parallel.
-  - FIXED: ask() and ask_stream() had diverged system prompts — now single source of truth.
+v24.0.0 — Changes from v23:
+  - NEW: Staff application Accept/Deny buttons — staff click in-ticket, applicant auto-DM'd result
+  - NEW: Applications saved to MongoDB `staff_applications` collection with full Q&A, timestamps, verdict
+  - NEW: `.applications [page]` — owner-only prefix command to review all past applications from DB
+         Aliases: .apps .staffapps — paginated 4 per page, shows status/verdict/preview
+  - FIXED: "newest member" now always included in default AI context — no more hallucinating join data
+  - FIXED: member count DB snapshot now recorded on EVERY join AND leave (was nightly-only before)
+  - UPGRADED: System prompt — added explicit anti-hallucination rules for live data sections
+              AI now told exactly which context section to read for each type of question
+  - UPGRADED: StaffAppDecisionView — persistent across restarts, works for owner + staff roles
+              Buttons auto-disable after verdict is set — can't double-accept/deny
+  - UPGRADED: `_finish_staff_app` — saves full Q&A to DB before posting, truncates long answers
+              in embed to stay under Discord 6000-char embed limit
 """
 
 import io, os, re, json, math, time, asyncio, logging, signal, collections, random, functools
@@ -317,7 +297,7 @@ def _contains_slur(text: str) -> tuple[bool, str]:
     return False, ""
 
 load_dotenv()
-print("✅ LXTE's AI v23.0.0 loaded")
+print("✅ LXTE's AI v24.0.0 loaded")
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logger = logging.getLogger("lxte")
 logger.setLevel(logging.INFO)
@@ -676,26 +656,32 @@ You are the go-to source for:
 
 For anything outside your focus: "That's a bit outside my lane but —" then actually try to help anyway. Never flat refuse, never dead-end.
 
-## LIVE SERVER DATA
-Your context contains a live snapshot pulled from Discord and the database at the exact moment this message was sent. It includes:
+## LIVE SERVER DATA — READ THIS CAREFULLY
+Your context contains a **live snapshot** pulled from Discord and the database at the exact moment this message was sent. This data is accurate and real:
 - The person asking: status, voice, activity, all roles, XP/level/messages/streak/badges/invites
-- Every member: online/idle/DND/offline, voice channels, activities, Spotify, AFK
-- Voice channels: who's in each one right now, mute/deaf/stream/camera state
-- Text channels, categories, roles with member counts
-- **Newest member and last 10 joins** with exact timestamps — answer "who just joined?" with confidence
+- Every member online right now: status, voice channels, activities, Spotify, AFK
+- Voice channels: exactly who is in each one right now with mute/deaf/stream/camera flags
+- Text channels, categories, full role list with member counts
+- **Newest member and last 10 joins** with exact timestamps — answer "who just joined?" directly from the NEWEST MEMBERS section. Never guess.
 - XP, message, invite, and boost leaderboards (top 10 each)
-- Active giveaways, open tickets, double XP events
-- Member count history (7 days), full server config, reaction roles
+- Active giveaways, open tickets, double XP status
+- Member count history (7 days), full server config
 
-USE IT. Answer like you're watching the server live — because you are. Never say "I don't have access to server info." Read the context and state facts directly.
+**CRITICAL ANTI-HALLUCINATION RULES:**
+- NEVER invent member names, stats, join dates, or any data not in the context
+- If data is in the context, state it as fact. If it is NOT there, say "I don't have that info right now" — do not guess
+- For "who just joined" → look at the NEWEST MEMBERS section and read the name/timestamp directly
+- For leaderboard questions → read the XP/MESSAGE/INVITE/BOOST LEADERBOARD sections and quote exactly
+- For "who is online" → read the MEMBERS ONLINE section
+- USE the data. Never say "I don't have access to server info" when the data is right there
 
 ## WEB SEARCH
-When a LIVE WEB SEARCH RESULTS block is present, treat it as ground truth for anything outside the server. Cite it naturally ("just checked — X"), don't mention the mechanism.
+When a LIVE WEB SEARCH RESULTS block is present, treat it as ground truth for anything current. Cite it naturally ("just checked — X"), don't mention the mechanism.
 
 ## REASONING & ACCURACY
 - Think before answering complex questions. If something needs working through, work through it.
 - If a user states something wrong, correct it clearly and kindly. Don't hedge if you're confident.
-- If you're genuinely unsure: "Not 100% on that — worth double-checking." Never fabricate.
+- If you're genuinely unsure: "Not 100% on that — worth double-checking." **Never fabricate.**
 - For BedWars strategy, give your actual opinion on what's best, not wishy-washy "it depends" unless it genuinely does.
 - For server data questions, read the context carefully before answering. Don't guess at stats that are right there.
 
@@ -1254,6 +1240,7 @@ class Database:
         self.invites        = db["invite_tracker"]
         self.role_menus     = db["role_menus"]
         self.tickets        = db["tickets"]
+        self.applications   = db["staff_applications"]
         self.boosts         = db["boost_tracker"]
         self.analytics      = db["analytics"]
         self.reaction_roles = db["reaction_roles"]
@@ -1301,6 +1288,8 @@ class Database:
             await self.invites.create_index([("guild_id",1),("invite_code",1)], background=True)
             await self.role_menus.create_index([("guild_id",1),("menu_id",1)], background=True)
             await self.tickets.create_index([("guild_id",1),("channel_id",1)], background=True)
+            await self.applications.create_index([("guild_id",1),("submitted_at",-1)], background=True)
+            await self.applications.create_index([("guild_id",1),("user_id",1)],       background=True)
             await self.boosts.create_index([("guild_id",1),("user_id",1)], unique=True, background=True)
             await self.analytics.create_index([("guild_id",1),("date",1)], unique=True, background=True)
             await self.reaction_roles.create_index([("guild_id",1),("message_id",1)], background=True)
@@ -1476,6 +1465,40 @@ class Database:
 
     async def count_open_tickets(self, gid: int, uid: int) -> int:
         return await self.tickets.count_documents({"guild_id": gid, "user_id": uid, "closed": False})
+
+    # ── Staff Applications ─────────────────────────────────────────────────────
+    async def save_staff_application(
+        self, gid: int, uid: int, username: str,
+        channel_id: int, ticket_id: int,
+        questions: list, answers: list,
+    ) -> None:
+        await self.applications.update_one(
+            {"guild_id": gid, "channel_id": channel_id},
+            {"$set": {
+                "guild_id": gid, "user_id": uid, "username": username,
+                "channel_id": channel_id, "ticket_id": ticket_id,
+                "questions": questions, "answers": answers,
+                "submitted_at": datetime.now(timezone.utc),
+                "verdict": None, "verdict_by": None, "verdict_at": None,
+            }},
+            upsert=True,
+        )
+
+    async def set_application_verdict(self, channel_id: int, verdict: str, verdict_by_id: int) -> None:
+        await self.applications.update_one(
+            {"channel_id": channel_id},
+            {"$set": {
+                "verdict":    verdict,
+                "verdict_by": verdict_by_id,
+                "verdict_at": datetime.now(timezone.utc),
+            }},
+        )
+
+    async def get_staff_applications(self, gid: int, limit: int = 100) -> list:
+        return await self.applications.find(
+            {"guild_id": gid},
+            sort=[("submitted_at", -1)],
+        ).to_list(length=limit)
 
     # ── Boosts ────────────────────────────────────────────────────────────────
     async def record_boost(self, gid: int, uid: int) -> int:
@@ -2980,7 +3003,7 @@ async def build_context(ctx: commands.Context, recent_chat: str = "") -> str:
 
         # If nothing specific triggered, add the most commonly useful sections
         if len(needed) == 1:  # only server_identity
-            needed.update({"members_online", "voice"})
+            needed.update({"members_online", "voice", "newest_member"})
 
         server_ctx = await _build_server_sections(guild, needed, remaining_budget)
         if server_ctx:
@@ -4081,30 +4104,145 @@ async def _finish_staff_app(channel: discord.TextChannel, session: dict, guild: 
     user = guild.get_member(session["user_id"])
     name = user.display_name if user else f"<@{session['user_id']}>"
 
-    # ── Summary embed ──────────────────────────────────────────────────────
-    e = make_embed(C_GOLD)
-    e.title = f"🛡️ Staff Application — {name}"
-    e.description = (
-        f"**Applicant:** {user.mention if user else '<@' + str(session['user_id']) + '>'} "
-        f"(`{str(user)}` | `{session['user_id']}`)"
+    # ── Save to MongoDB ────────────────────────────────────────────────────
+    ticket_data = await bot.db.get_ticket(channel.id)
+    ticket_id   = ticket_data.get("ticket_id", 0)
+    await bot.db.save_staff_application(
+        gid        = guild.id,
+        uid        = session["user_id"],
+        username   = str(user) if user else str(session["user_id"]),
+        channel_id = channel.id,
+        ticket_id  = ticket_id,
+        questions  = list(STAFF_APP_QUESTIONS),
+        answers    = list(session["answers"]),
     )
-    if user and user.display_avatar:
-        e.set_thumbnail(url=user.display_avatar.url)
-    for idx, (q, a) in enumerate(zip(STAFF_APP_QUESTIONS, session["answers"]), 1):
-        e.add_field(name=f"Q{idx}. {q}", value=a or "*(no answer)*", inline=False)
-    e.set_footer(text="LXTE's AI — Staff Applications")
 
-    # ── Tell applicant they're done ────────────────────────────────────────
+    # ── Completion message to applicant ───────────────────────────────────
     done = make_embed(C_SUCCESS,
-        f"✅ {user.mention if user else 'Applicant'}, your application is complete!\n"
-        "The owner has been notified and will review your answers. **Good luck!**"
+        f"✅ {user.mention if user else 'Applicant'}, your application has been submitted!\n"
+        "Staff will review your answers and **you'll be notified here and via DM**. Good luck!"
     )
     done.title = "Application Submitted!"
     done.set_footer(text="LXTE's AI — Staff Applications")
     await channel.send(embed=done)
 
-    # ── Ping owner with full summary ───────────────────────────────────────
-    await channel.send(content=f"<@{STAFF_APP_OWNER_ID}>", embed=e)
+    # ── Summary embed for staff/owner ─────────────────────────────────────
+    e = make_embed(C_GOLD)
+    e.title = f"🛡️ Staff Application — {name}"
+    e.description = (
+        f"**Applicant:** {user.mention if user else '<@' + str(session['user_id']) + '>'} "
+        f"(`{str(user) if user else session['user_id']}` | `{session['user_id']}`)\n"
+        f"**Ticket:** #{ticket_id:04d}"
+    )
+    if user and user.display_avatar:
+        e.set_thumbnail(url=user.display_avatar.url)
+    for idx, (q, a) in enumerate(zip(STAFF_APP_QUESTIONS, session["answers"]), 1):
+        # Truncate long answers to keep embed under 6000 chars
+        a_display = (a[:200] + " …") if len(a) > 200 else a
+        e.add_field(name=f"Q{idx}. {q}", value=a_display or "*(no answer)*", inline=False)
+    e.set_footer(text="LXTE's AI — Use the buttons below to accept or deny")
+
+    await channel.send(
+        content=f"<@{STAFF_APP_OWNER_ID}>",
+        embed=e,
+        view=StaffAppDecisionView(applicant_id=session["user_id"]),
+    )
+
+
+# ─── Staff Application Decision View ─────────────────────────────────────────
+
+class StaffAppDecisionView(discord.ui.View):
+    """Persistent ✅ Accept / ❌ Deny buttons in the staff application ticket channel."""
+
+    def __init__(self, applicant_id: int = 0):
+        super().__init__(timeout=None)
+        self.applicant_id = applicant_id
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    async def _get_applicant_id(self, channel: discord.TextChannel) -> int:
+        if self.applicant_id:
+            return self.applicant_id
+        doc = await bot.db.applications.find_one({"channel_id": channel.id})
+        if doc:
+            return doc.get("user_id", 0)
+        ticket = await bot.db.get_ticket(channel.id)
+        return ticket.get("user_id", 0)
+
+    async def _is_staff(self, i: discord.Interaction) -> bool:
+        if i.user.id == bot.owner_id_int:
+            return True
+        cfg        = await get_config(i.guild.id)
+        staff_ids  = set(cfg.get("ticket_staff_role_ids", []))
+        old_single = cfg.get("ticket_staff_role_id")
+        if old_single:
+            staff_ids.add(old_single)
+        member_role_ids = {r.id for r in i.user.roles}
+        return bool(member_role_ids & staff_ids) or i.user.guild_permissions.manage_channels
+
+    async def _handle_verdict(self, i: discord.Interaction, verdict: str):
+        if not await self._is_staff(i):
+            await i.response.send_message(
+                embed=err("Only staff can accept or deny applications."), ephemeral=True
+            )
+            return
+
+        applicant_id = await self._get_applicant_id(i.channel)
+
+        # Persist
+        await bot.db.set_application_verdict(i.channel.id, verdict, i.user.id)
+
+        # DM applicant
+        dm_sent = False
+        if applicant_id:
+            applicant = i.guild.get_member(applicant_id) or bot.get_user(applicant_id)
+            if applicant:
+                if verdict == "accepted":
+                    dm_e = make_embed(C_SUCCESS,
+                        f"🎉 Your staff application in **{i.guild.name}** was **accepted** by {i.user.display_name}!\n\n"
+                        "Welcome to the team — check the server for your next steps."
+                    )
+                    dm_e.title = "✅ Staff Application Accepted!"
+                else:
+                    dm_e = make_embed(C_ERROR,
+                        f"Your staff application in **{i.guild.name}** was **denied** by {i.user.display_name}.\n\n"
+                        "Thanks for applying — you're welcome to try again in the future. Keep being active!"
+                    )
+                    dm_e.title = "❌ Staff Application Denied"
+                dm_e.set_footer(text="LXTE's AI — Staff Applications")
+                try:
+                    await applicant.send(embed=dm_e)
+                    dm_sent = True
+                except discord.Forbidden:
+                    pass
+
+        # Disable buttons so verdict can't be changed
+        for child in self.children:
+            child.disabled = True
+        await i.response.edit_message(view=self)
+
+        # Result card in channel
+        if verdict == "accepted":
+            result = make_embed(C_SUCCESS,
+                f"✅ **Accepted** by {i.user.mention}\n"
+                + ("📬 Applicant notified via DM." if dm_sent else "⚠️ Could not DM applicant (DMs closed).")
+            )
+            result.title = "Application Accepted"
+        else:
+            result = make_embed(C_ERROR,
+                f"❌ **Denied** by {i.user.mention}\n"
+                + ("📬 Applicant notified via DM." if dm_sent else "⚠️ Could not DM applicant (DMs closed).")
+            )
+            result.title = "Application Denied"
+        result.set_footer(text="LXTE's AI — Staff Applications")
+        await i.channel.send(embed=result)
+
+    @discord.ui.button(label="✅ Accept", style=discord.ButtonStyle.success, custom_id="staffapp:accept")
+    async def btn_accept(self, i: discord.Interaction, b: discord.ui.Button):
+        await self._handle_verdict(i, "accepted")
+
+    @discord.ui.button(label="❌ Deny", style=discord.ButtonStyle.danger, custom_id="staffapp:deny")
+    async def btn_deny(self, i: discord.Interaction, b: discord.ui.Button):
+        await self._handle_verdict(i, "denied")
 
 async def _create_ticket(i: discord.Interaction, cid: str, answers: dict):
     guild  = i.guild
@@ -4797,6 +4935,7 @@ class LXTEBot(commands.Bot):
                     await lc.send(embed=e)
             except Exception: pass
         self.add_view(TicketOpenView()); self.add_view(TicketCloseView())
+        self.add_view(StaffAppDecisionView())
         self.add_view(GiveawayEnterView())
         for guild in self.guilds:
             for menu in await self.db.get_all_role_menus(guild.id):
@@ -5275,6 +5414,8 @@ class LXTEBot(commands.Bot):
     async def on_member_remove(self, member: discord.Member):
         if member.bot: return
         await update_member_count(member.guild)
+        # Keep analytics in sync on every join/leave
+        asyncio.create_task(self.db.record_member_count(member.guild.id, member.guild.member_count))
         config = await get_config(member.guild.id)
         # NOTE: kick detection is now handled by on_audit_log_entry_create (v18)
         # on_member_remove fires for both leaves and kicks — we can't tell which
@@ -5306,6 +5447,8 @@ class LXTEBot(commands.Bot):
                     except Exception as e: logger.warning("AutoRole: %s", e)
         await send_welcome(member, config)
         await update_member_count(member.guild)
+        # ── Record member count snapshot so analytics stay fresh ──────────────
+        asyncio.create_task(self.db.record_member_count(member.guild.id, member.guild.member_count))
         # Log join to entry log channel
         lc = get_log_channel(member.guild, config, "entry")
         if lc:
@@ -5737,7 +5880,8 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.admin snapshot` — manual analytics snapshot\n"
             "`.admin status` — system stats\n"
             "`.admin synccount` — force member count sync\n"
-            "`.admin unlockraid` — manual raid unlock"
+            "`.admin unlockraid` — manual raid unlock\n\n"
+            "`.applications [page]` — review all staff applications from DB"
         ))
         e.title = "🛡️ Admin"
         e.set_footer(text="LXTE's AI", icon_url=avatar)
@@ -5750,7 +5894,7 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
     ))
     e.title = "LXTE's AI — Help"
     e.set_thumbnail(url=avatar)
-    e.set_footer(text="LXTE's AI v21", icon_url=avatar)
+    e.set_footer(text="LXTE's AI v24", icon_url=avatar)
     return e
 
 
@@ -6684,6 +6828,97 @@ async def cmd_filtered(ctx: commands.Context):
     _owner_unfiltered = False
     e = make_embed(C_SUCCESS, "✅ **Filtered mode ON** — AI safety restrictions are back in place.")
     e.title = "🔒 Filtered Mode"
+    await ctx.send(embed=e)
+
+
+# ─── Applications command (owner-only, prefix) ───────────────────────────────
+
+@bot.command(name="applications", aliases=["apps", "staffapps"], hidden=True)
+async def cmd_applications(ctx: commands.Context, page: int = 1):
+    """
+    Owner-only: review all past staff applications stored in the database.
+    Usage: .applications [page]
+    """
+    # ── Auth ──────────────────────────────────────────────────────────────
+    if ctx.author.id != bot.owner_id_int:
+        # Allow owner_role_id as fallback
+        cfg = await get_config(ctx.guild.id) if ctx.guild else {}
+        owner_role_id = cfg.get("owner_role_id")
+        if not owner_role_id or not any(r.id == owner_role_id for r in getattr(ctx.author, "roles", [])):
+            return  # silently ignore — don't reveal command exists
+
+    if not ctx.guild:
+        await ctx.send(embed=err("Server only.")); return
+
+    apps = await bot.db.get_staff_applications(ctx.guild.id, limit=200)
+
+    if not apps:
+        await ctx.send(embed=make_embed(C_INFO,
+            "No staff applications in the database yet.\n"
+            "They're recorded automatically when an applicant finishes answering all questions."
+        ))
+        return
+
+    PER_PAGE  = 4
+    total     = len(apps)
+    pages     = math.ceil(total / PER_PAGE)
+    page      = max(1, min(page, pages))
+    chunk     = apps[(page - 1) * PER_PAGE : page * PER_PAGE]
+
+    e = make_embed(C_GOLD)
+    e.title = f"🛡️ Staff Applications — Page {page}/{pages}  ({total} total)"
+    e.set_footer(text=f"LXTE's AI — .applications [page]  •  {page}/{pages}")
+
+    for app in chunk:
+        uid       = app.get("user_id")
+        uname     = app.get("username", str(uid))
+        t_id      = app.get("ticket_id", "?")
+        submitted = app.get("submitted_at")
+        sub_str   = submitted.strftime("%d %b %Y %H:%M UTC") if submitted else "unknown"
+        verdict   = app.get("verdict")
+
+        if verdict == "accepted":   status = "✅ Accepted"
+        elif verdict == "denied":   status = "❌ Denied"
+        else:                       status = "🕐 Pending"
+
+        verdict_extra = ""
+        vby  = app.get("verdict_by")
+        vat  = app.get("verdict_at")
+        if vby and vat:
+            verdict_extra = f" by <@{vby}> on {vat.strftime('%d %b %Y')}"
+
+        # First 3 Q&A as a preview
+        qa_preview = []
+        for idx, (q, a) in enumerate(zip(
+            app.get("questions", STAFF_APP_QUESTIONS),
+            app.get("answers", []),
+        ), 1):
+            if idx > 3:
+                remaining = len(app.get("answers", [])) - 3
+                qa_preview.append(f"*…+{remaining} more answers*")
+                break
+            a_short = (a[:90] + "…") if len(a) > 90 else a
+            qa_preview.append(f"**Q{idx}.** {q[:55]}\n> {a_short}")
+
+        t_label = f"#{t_id:04d}" if isinstance(t_id, int) else f"#{t_id}"
+        field_value = (
+            f"**User:** <@{uid}> (`{uname}`)\n"
+            f"**Submitted:** {sub_str}\n"
+            f"**Status:** {status}{verdict_extra}\n"
+            + ("\n" + "\n".join(qa_preview) if qa_preview else "")
+        )
+        e.add_field(
+            name=f"📋 App {t_label} — {uname}",
+            value=field_value[:1024],
+            inline=False,
+        )
+
+    if pages > 1:
+        nav = []
+        if page > 1:     nav.append(f"`.applications {page - 1}` ← prev")
+        if page < pages: nav.append(f"next → `.applications {page + 1}`")
+        e.description = "  |  ".join(nav)
+
     await ctx.send(embed=e)
 
 
