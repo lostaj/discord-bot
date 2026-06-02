@@ -4085,7 +4085,7 @@ async def _finish_staff_app(channel: discord.TextChannel, session: dict, guild: 
     e = make_embed(C_GOLD)
     e.title = f"🛡️ Staff Application — {name}"
     e.description = (
-        f"**Applicant:** {user.mention if user else f'<@{session["user_id"]}>'} "
+        f"**Applicant:** {user.mention if user else '<@' + str(session['user_id']) + '>'} "
         f"(`{str(user)}` | `{session['user_id']}`)"
     )
     if user and user.display_avatar:
