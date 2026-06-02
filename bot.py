@@ -4004,6 +4004,7 @@ class RemoveLevelRoleModal(discord.ui.Modal, title="Remove Level Role"):
 
 TICKET_CATEGORIES = [
     {"id": "join",  "label": "⚔️ Join LXTE", "desc": "Apply to join the LXTE Clan"},
+    {"id": "staff", "label": "🛡️ Staff",      "desc": "Report an issue or contact staff"},
     {"id": "other", "label": "💬 Other",      "desc": "Anything else"},
 ]
 
@@ -4022,6 +4023,8 @@ class TicketCategorySelect(discord.ui.View):
         cid = i.data["values"][0]
         if cid == "join":
             await i.response.send_modal(JoinLXTEModal())
+        elif cid == "staff":
+            await i.response.send_modal(StaffTicketModal())
         else:
             await i.response.send_modal(OtherTicketModal())
 
@@ -4031,6 +4034,12 @@ class JoinLXTEModal(discord.ui.Modal, title="Join LXTE Clan"):
                                     placeholder="e.g. Diamond, 500 wins, 2.5 KD, favourite kit: Barbarian", max_length=400)
     async def on_submit(self, i):
         await _create_ticket(i, "join", {"roblox": self.roblox.value, "bw_stats": self.bw_stats.value})
+
+class StaffTicketModal(discord.ui.Modal, title="Contact Staff"):
+    issue   = discord.ui.TextInput(label="What do you need to report or discuss?", style=discord.TextStyle.paragraph, max_length=500)
+    against = discord.ui.TextInput(label="Who is involved? (if anyone)", placeholder="Username(s) or leave blank", required=False, max_length=100)
+    async def on_submit(self, i):
+        await _create_ticket(i, "staff", {"issue": self.issue.value, "against": self.against.value})
 
 class OtherTicketModal(discord.ui.Modal, title="Open a Ticket"):
     reason = discord.ui.TextInput(label="What do you need help with?", style=discord.TextStyle.paragraph, max_length=500)
@@ -4088,6 +4097,13 @@ async def _create_ticket(i: discord.Interaction, cid: str, answers: dict):
         e.description = f"Hey {user.mention}! Your application is in. We'll review it and get back to you here."
         e.add_field(name="🎮 Roblox Username", value=answers.get("roblox", "?"),   inline=True)
         e.add_field(name="⚔️ BedWars Stats",   value=answers.get("bw_stats", "?"), inline=False)
+    elif cid == "staff":
+        e.title       = f"🛡️ Staff Ticket #{ticket_num:04d}"
+        e.description = f"Hey {user.mention}! Staff have been notified and will be with you shortly."
+        e.add_field(name="📋 Issue",    value=answers.get("issue", "No details given."), inline=False)
+        involved = answers.get("against", "").strip()
+        if involved:
+            e.add_field(name="👤 Involving", value=involved, inline=True)
     else:
         e.title       = f"💬 Ticket #{ticket_num:04d}"
         e.description = f"Hey {user.mention}! We'll be with you shortly."
