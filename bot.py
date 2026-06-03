@@ -438,21 +438,28 @@ STAFF_APP_QUESTIONS = [
 _staff_app_sessions: dict[int, dict] = {}
 
 # ─── Anti-Raid ────────────────────────────────────────────────────────────────
-RAID_JOIN_WINDOW  = 10
-RAID_JOIN_THRESH  = 8
+RAID_JOIN_WINDOW  = 15    # raised from 10 — less likely to false-positive on promo surges
+RAID_JOIN_THRESH  = 10    # raised from 8
 RAID_LOCK_MINUTES = 10
 _join_timestamps: dict[int, list[float]] = collections.defaultdict(list)
 _raid_active:     dict[int, bool]        = {}
+_raid_locks:      dict[int, asyncio.Lock] = {}  # per-guild lock prevents concurrent raid checks
+
+def _get_raid_lock(gid: int) -> asyncio.Lock:
+    if gid not in _raid_locks:
+        _raid_locks[gid] = asyncio.Lock()
+    return _raid_locks[gid]
 
 # ─── Anti-Spam ────────────────────────────────────────────────────────────────
-SPAM_WINDOW_SECS   = 5      # seconds to watch for rapid messages
-SPAM_MSG_THRESH    = 5      # messages in window = spam
-SPAM_DUP_THRESH    = 3      # same message repeated N times = dup spam
+SPAM_WINDOW_SECS   = 6      # seconds to watch for rapid messages (was 5)
+SPAM_MSG_THRESH    = 6      # messages in window = spam (was 5)
+SPAM_DUP_THRESH    = 5      # same message repeated N times = dup spam (was 3 — too strict)
+SPAM_DUP_MIN_LEN   = 8      # ignore dup check for messages shorter than this (catches "?", "lol", "ok")
 _spam_tracker: dict[int, list[float]]  = collections.defaultdict(list)   # uid -> timestamps
 _dup_tracker:  dict[int, list[str]]    = collections.defaultdict(list)    # uid -> recent normalised hashes
 
 def _normalise_msg(text: str) -> str:
-    """v23: normalise for dup detection — strip extra whitespace, lowercase, collapse repeated chars."""
+    """Normalise for dup detection — strip extra whitespace, lowercase, collapse repeated chars."""
     text = text.lower().strip()
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"(.)\1{2,}", r"\1\1", text)  # aaaaaa → aa
@@ -462,16 +469,17 @@ def _normalise_msg(text: str) -> str:
 NUKE_WINDOW_SECS        = 10   # seconds
 NUKE_CHANNEL_DEL_THRESH = 3    # channels deleted in window
 NUKE_ROLE_DEL_THRESH    = 3    # roles deleted in window
-NUKE_BAN_THRESH         = 5    # bans in window
+NUKE_BAN_THRESH         = 7    # raised from 5 — avoid false positive when owner bans raiders fast
 NUKE_KICK_THRESH        = 5    # kicks in window
 NUKE_CHANNEL_CREATE_THRESH = 5  # channels created in window
-NUKE_ROLE_GRANT_THRESH  = 3    # dangerous role grants in window (v18)
+NUKE_ROLE_GRANT_THRESH  = 3    # dangerous role grants in window
 _nuke_chan_del:    dict[int, list[float]] = collections.defaultdict(list)
 _nuke_role_del:    dict[int, list[float]] = collections.defaultdict(list)
 _nuke_ban:         dict[int, list[float]] = collections.defaultdict(list)
 _nuke_kick:        dict[int, list[float]] = collections.defaultdict(list)
 _nuke_chan_create: dict[int, list[float]] = collections.defaultdict(list)
-_nuke_role_grant:  dict[int, list[float]] = collections.defaultdict(list)  # v18
+_nuke_role_grant:  dict[int, list[float]] = collections.defaultdict(list)
+_nuke_active:      dict[int, bool]        = {}  # separate from _raid_active so they don't block each other
 
 # ─── Anti-Raid (v18) ─────────────────────────────────────────────────────────
 # Track executors seen in the current nuke window so we can act on them
@@ -1261,6 +1269,8 @@ class Database:
         self.msg_tracking   = db["msg_tracking"]
         self.warns          = db["warns"]
         self.user_memory    = db["user_memory"]
+        self.cases          = db["cases"]
+        self.tempmutes      = db["tempmutes"]
 
     async def _retry(self, coro_fn, *args, retries: int = 3, **kwargs):
         """
@@ -1312,6 +1322,9 @@ class Database:
             await self.warns.create_index([("guild_id",1),("user_id",1)], background=True)
             await self.warns.create_index("created_at", background=True)
             await self.user_memory.create_index([("user_id",1)], unique=True, background=True)
+            await self.cases.create_index([("guild_id",1),("case_number",1)], unique=True, background=True)
+            await self.cases.create_index([("guild_id",1),("target_id",1)], background=True)
+            await self.tempmutes.create_index("unmute_at", background=True)
             logger.info("Indexes ready")
         except Exception as exc:
             logger.error("Index error: %s", exc)
@@ -1508,6 +1521,47 @@ class Database:
         """Return all warns for a guild."""
         return await self.warns.find({"guild_id": gid}).to_list(length=None)
 
+    # ── Case System ───────────────────────────────────────────────────────────
+    async def add_case(self, gid: int, action: str, mod_id: int, target_id: int, reason: str, extra: dict = None) -> int:
+        """Add a mod case and return the new case number."""
+        last = await self.cases.find_one({"guild_id": gid}, sort=[("case_number", -1)])
+        num  = (last.get("case_number", 0) + 1) if last else 1
+        doc  = {
+            "guild_id": gid, "case_number": num, "action": action,
+            "mod_id": mod_id, "target_id": target_id, "reason": reason,
+            "created_at": datetime.now(timezone.utc),
+        }
+        if extra: doc.update(extra)
+        await self.cases.insert_one(doc)
+        return num
+
+    async def get_case(self, gid: int, num: int) -> dict:
+        return await self.cases.find_one({"guild_id": gid, "case_number": num}) or {}
+
+    async def get_user_cases(self, gid: int, uid: int, limit: int = 20) -> list[dict]:
+        return await self.cases.find(
+            {"guild_id": gid, "target_id": uid},
+            sort=[("created_at", -1)]
+        ).to_list(length=limit)
+
+    # ── Temp Mutes ────────────────────────────────────────────────────────────
+    async def add_tempmute(self, gid: int, uid: int, mod_id: int, reason: str, unmute_at: datetime):
+        await self.tempmutes.update_one(
+            {"guild_id": gid, "user_id": uid},
+            {"$set": {"mod_id": mod_id, "reason": reason, "unmute_at": unmute_at, "active": True}},
+            upsert=True,
+        )
+
+    async def remove_tempmute(self, gid: int, uid: int):
+        await self.tempmutes.update_one(
+            {"guild_id": gid, "user_id": uid},
+            {"$set": {"active": False}},
+        )
+
+    async def get_due_tempmutes(self) -> list[dict]:
+        now = datetime.now(timezone.utc)
+        return await self.tempmutes.find({"active": True, "unmute_at": {"$lte": now}}).to_list(length=100)
+
     async def get_all_level_data(self, gid: int) -> list[dict]:
         """Return all XP/level documents for a guild."""
         return await self.levels.find({"guild_id": gid}).to_list(length=None)
@@ -1626,38 +1680,6 @@ class Database:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  REAL-TIME DATA HELPERS  (v19)
 # ═══════════════════════════════════════════════════════════════════════════════
-
-async def web_search(query: str, max_results: int = WEB_SEARCH_RESULTS) -> str:
-    """Search DuckDuckGo Instant Answer API + HTML scrape fallback. Returns formatted string."""
-    try:
-        params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True,
-                                     headers={"User-Agent": "LXTEBot/19 Discord"}) as c:
-            r = await c.get(DDG_API, params=params)
-            data = r.json()
-
-        lines: list[str] = []
-        if data.get("AbstractText"):
-            lines.append(f"📖 {data['AbstractText'][:400]}")
-            if data.get("AbstractURL"):
-                lines.append(f"   Source: {data['AbstractURL']}")
-
-        for topic in data.get("RelatedTopics", [])[:max_results]:
-            text = topic.get("Text") or (topic.get("Topics") and topic["Topics"][0].get("Text"))
-            if text:
-                lines.append(f"• {text[:200]}")
-
-        if not lines and data.get("Answer"):
-            lines.append(f"💡 {data['Answer']}")
-
-        if not lines:
-            return f"[No instant answer found for: {query}]"
-
-        return "\n".join(lines[:max_results + 2])
-    except Exception as exc:
-        logger.warning("web_search error: %s", exc)
-        return f"[Search failed: {exc}]"
-
 
 async def get_weather(city: str) -> str:
     """Fetch current weather for a city using Open-Meteo (free, no key)."""
@@ -1836,7 +1858,7 @@ async def _ddg_html_fallback(query: str, max_results: int = 4) -> str:
         ) as c:
             r = await c.get(url)
         # Extract result snippets via regex — no HTML parser needed
-        snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', r.text, re.S)
+        snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</(?:a|span)>', r.text, re.S)
         clean = [re.sub(r"<[^>]+>", "", s).strip() for s in snippets[:max_results] if s.strip()]
         return "\n".join(f"• {s[:200]}" for s in clean) if clean else ""
     except Exception as exc:
@@ -2085,7 +2107,7 @@ class AIEngine:
                 if resp.status_code == 429:
                     rotator._mark_rate_limited(idx, None)
                     # fallback to non-streaming
-                    del kwargs["stream"]
+                    kwargs.pop("stream", None)
                     yield await rotator.call(**kwargs)
                     return
                 resp.raise_for_status()
@@ -2102,7 +2124,7 @@ class AIEngine:
                     except Exception: continue
         except Exception:
             # Any streaming failure — fall back to regular call
-            del kwargs["stream"]
+            kwargs.pop("stream", None)
             yield await rotator.call(**kwargs)
 
 
@@ -2712,7 +2734,7 @@ async def _build_server_sections(
         return True
 
     # ── Server identity (lightweight — always include if any server section needed)
-    if needed or "server_identity" in needed:
+    if "server_identity" in needed:
         owner = guild.owner
         owner_str = f"{owner.display_name} (@{owner.name})" if owner else "unknown"
         _add_section("╔══ SERVER ══╗", (
@@ -2930,7 +2952,9 @@ async def build_context(ctx: commands.Context, recent_chat: str = "") -> str:
     """
     member   = ctx.author
     guild    = ctx.guild
-    question = ctx.message.content
+    # Strip command prefix so trigger matching works on the actual question text
+    raw_content = ctx.message.content
+    question = re.sub(r"^\.(ask|ai|q)\s*", "", raw_content, count=1, flags=re.I).strip() or raw_content
     lines: list[str] = []
 
     # ── Always: requesting user ───────────────────────────────────────────────
@@ -3288,54 +3312,112 @@ class SingleRoleSelect(discord.ui.RoleSelect):
 
 def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
     e = make_embed(C_PRIMARY)
-    e.title       = "⚙️ Server Setup — v19"
-    e.description = "Pick a section to configure. Dropdowns now support multiple selections."
+    e.title = "\u2699\ufe0f LXTE\u2019s AI \u2014 Server Setup"
 
     def ch(key):
         v = config.get(key)
-        return f"<#{v}>" if v else "`not set`"
+        return f"<#{v}>" if v else "\u274c not set"
 
     def ch_list(key):
         ids = config.get(key, [])
-        if not ids: return "`none`"
-        return ", ".join(f"<#{i}>" for i in ids[:3]) + (f" +{len(ids)-3} more" if len(ids) > 3 else "")
+        if not ids:
+            return "\u274c none"
+        return " ".join(f"<#{i}>" for i in ids[:3]) + (f" +{len(ids)-3}" if len(ids) > 3 else "")
 
-    def ro(key):
-        v = config.get(key)
-        return f"<@&{v}>" if v else "`not set`"
+    def tick(val):
+        return "\u2705" if val else "\u274c"
 
-    e.add_field(name="👋 Welcome",    value=f"Channel: {ch('welcome_channel_id')}\nDM: {'✅' if config.get('welcome_dm_enabled') else '❌'}", inline=True)
-    e.add_field(name="🛡️ Automod",   value=f"{'✅' if config.get('automod_enabled', True) else '❌'}", inline=True)
-    _tsr = config.get("ticket_staff_role_ids", [])
-    _staff_val = ro("ticket_staff_role_ids") if not _tsr else f"{len(_tsr)} role(s)"
-    e.add_field(name="🎫 Tickets",   value=f"Panel: {ch('ticket_panel_channel_id')}\nStaff: {_staff_val}", inline=True)
-    e.add_field(name="🚀 Boosts",    value=f"Channel: {ch('boost_channel_id')}", inline=True)
-    e.add_field(name="🎭 Roles",     value=f"Auto: {len(config.get('autoroles', []))} | 2XP: {len(config.get('double_xp_roles', []))} | LvlRoles: {len(config.get('level_roles', []))}", inline=True)
-    e.add_field(name="🤖 AI",        value=f"Channels: {ch_list('ai_channel_ids')} | Web: {'✅' if config.get('web_search', True) else '❌'}", inline=True)
-    e.add_field(name="🎉 Giveaways", value=f"Channel: {ch('giveaway_channel_id')}", inline=True)
-    e.add_field(name="💣 Anti-Nuke",  value=f"{'✅' if config.get('antinuke_enabled', True) else '❌'}", inline=True)
-    e.add_field(name="🚫 Anti-Spam",  value=f"{'✅' if config.get('antispam_enabled', True) else '❌'} | Caps: {'✅' if config.get('anti_caps_enabled', False) else '❌'} | Emoji: {'✅' if config.get('anti_emoji_spam_enabled', False) else '❌'} | Swear: {'✅' if config.get('anti_swear_enabled', True) else '❌'}", inline=True)
-    e.add_field(name="👻 Ghost/Mention", value=f"GhostPing: {'✅' if config.get('anti_ghost_ping_enabled', True) else '❌'} | MassMention: {'✅' if config.get('anti_mass_mention_enabled', True) else '❌'}", inline=True)
-    e.add_field(
-        name="📋 Log Channels",
-        value=(
-            f"💬 Messages: {ch('message_log_channel_id')}\n"
-            f"🛡️ Automod: {ch('automod_log_channel_id')}\n"
-            f"⚖️ Mod: {ch('mod_log_channel_id')}\n"
-            f"🚪 Entry/Exit: {ch('entry_log_channel_id')}\n"
-            f"🤖 Bot: {ch('bot_log_channel_id')}\n"
-            f"🌐 Server: {ch('server_log_channel_id')}\n"
-            f"🎫 Tickets: {ch('ticket_log_channel_id')}"
-        ),
-        inline=False,
+    ticket_panel = config.get("ticket_panel_channel_id")
+    ticket_roles = config.get("ticket_staff_role_ids", [])
+    ai_channels  = config.get("ai_channel_ids", [])
+    log_any      = any(config.get(k) for k in (
+        "message_log_channel_id", "automod_log_channel_id",
+        "mod_log_channel_id", "entry_log_channel_id", "bot_log_channel_id",
+    ))
+    welcome_ch = config.get("welcome_channel_id")
+
+    essentials_done = sum([bool(ticket_panel), bool(ticket_roles), bool(ai_channels), log_any, bool(welcome_ch)])
+    e.description = (
+        f"**{essentials_done}/5 essentials configured** \u2014 click a section below to set it up.\n"
+        "New here? Start with **\U0001f3ab Tickets** then **\U0001f4cb Logs** then **\U0001f916 AI**.\n\u200b"
     )
-    e.set_footer(text="Admins only  •  Built by AJ  •  v19")
+
+    tickets_label = "\U0001f3ab Tickets" + (" \u2705" if ticket_panel and ticket_roles else " \u26a0\ufe0f")
+    e.add_field(
+        name=tickets_label,
+        value=(
+            f"Panel: {ch('ticket_panel_channel_id')}\n"
+            f"Staff roles: {len(ticket_roles)} set\n"
+            f"Log: {ch('ticket_log_channel_id')}"
+        ),
+        inline=True,
+    )
+
+    logs_label = "\U0001f4cb Log Channels" + (" \u2705" if log_any else " \u274c")
+    e.add_field(
+        name=logs_label,
+        value=(
+            f"\U0001f4ac {ch('message_log_channel_id')}\n"
+            f"\U0001f6e1\ufe0f {ch('automod_log_channel_id')}\n"
+            f"\u2696\ufe0f {ch('mod_log_channel_id')}\n"
+            f"\U0001f6aa {ch('entry_log_channel_id')}\n"
+            f"\U0001f916 {ch('bot_log_channel_id')}"
+        ),
+        inline=True,
+    )
+
+    ai_label = "\U0001f916 AI" + (" \u2705" if ai_channels else " \u274c")
+    e.add_field(
+        name=ai_label,
+        value=(
+            f"Channels: {ch_list('ai_channel_ids')}\n"
+            f"Web search: {tick(config.get('web_search', True))}"
+        ),
+        inline=True,
+    )
+
+    welcome_label = "\U0001f44b Welcome" + (" \u2705" if welcome_ch else " \u274c")
+    e.add_field(
+        name=welcome_label,
+        value=(
+            f"Channel: {ch('welcome_channel_id')}\n"
+            f"DM on join: {tick(config.get('welcome_dm_enabled'))}"
+        ),
+        inline=True,
+    )
+
+    automod_on = config.get("automod_enabled", True)
+    e.add_field(
+        name="\U0001f6e1\ufe0f Automod" + (" \u2705" if automod_on else " \u274c"),
+        value=(
+            f"Enabled: {tick(automod_on)}\n"
+            f"Anti-spam: {tick(config.get('antispam_enabled', True))}\n"
+            f"Anti-swear: {tick(config.get('anti_swear_enabled', True))}"
+        ),
+        inline=True,
+    )
+
+    e.add_field(
+        name="\U0001f3ad Roles",
+        value=(
+            f"Auto-roles: {len(config.get('autoroles', []))}\n"
+            f"2XP roles: {len(config.get('double_xp_roles', []))}\n"
+            f"Level roles: {len(config.get('level_roles', []))}"
+        ),
+        inline=True,
+    )
+
+    e.add_field(name="\U0001f680 Boosts",    value=f"Channel: {ch('boost_channel_id')}",    inline=True)
+    e.add_field(name="\U0001f389 Giveaways", value=f"Channel: {ch('giveaway_channel_id')}", inline=True)
+    e.add_field(name="\u200b", value="\u200b", inline=True)
+
+    e.set_footer(text="Admins only  \u2022  .help for all commands  \u2022  .quickstart for guided setup")
     return e
 
 
 class SetupView(discord.ui.View):
     def __init__(self, owner_id: int, guild_id: int, msg=None):
-        super().__init__(timeout=300)
+        super().__init__(timeout=600)
         self.owner_id = owner_id
         self.guild_id = guild_id
         self._msg     = msg
@@ -3358,7 +3440,17 @@ class SetupView(discord.ui.View):
 
     @discord.ui.button(label="👋 Welcome",    style=discord.ButtonStyle.secondary, row=0)
     async def btn_welcome(self, i, b):
-        await i.response.send_message(embed=make_embed(C_INFO, "Configure welcome settings:"), view=WelcomeSetupView(self.owner_id, self.guild_id), ephemeral=True)
+        config = await get_config(self.guild_id)
+        def ch(k):
+            v = config.get(k)
+            return f"<#{v}>" if v else "`not set`"
+        desc = (
+            "**Welcome channel:** " + ch("welcome_channel_id") + "\n"
+            "**Leave channel:** " + ch("leave_channel_id") + "\n"
+            "**DM on join:** " + ("✅" if config.get("welcome_dm_enabled") else "❌") + "\n\n"
+            "Configure where join/leave messages are sent."
+        )
+        await i.response.send_message(embed=make_embed(C_INFO, desc), view=WelcomeSetupView(self.owner_id, self.guild_id), ephemeral=True)
 
     @discord.ui.button(label="🛡️ Automod",   style=discord.ButtonStyle.secondary, row=0)
     async def btn_automod(self, i, b):
@@ -3383,7 +3475,19 @@ class SetupView(discord.ui.View):
 
     @discord.ui.button(label="🎫 Tickets",   style=discord.ButtonStyle.secondary, row=0)
     async def btn_tickets(self, i, b):
-        await i.response.send_message(embed=make_embed(C_INFO, "Configure tickets:"), view=TicketSetupView(self.owner_id, self.guild_id), ephemeral=True)
+        config = await get_config(self.guild_id)
+        def ch(k):
+            v = config.get(k)
+            return f"<#{v}>" if v else "`not set`"
+        roles = config.get("ticket_staff_role_ids", [])
+        roles_str = " ".join(f"<@&{r}>" for r in roles) if roles else "`none set`"
+        desc = (
+            "**Ticket panel channel:** " + ch("ticket_panel_channel_id") + "\n"
+            "**Staff roles:** " + roles_str + "\n"
+            "**Log channel:** " + ch("ticket_log_channel_id") + "\n\n"
+            "Use the buttons below to update any of these."
+        )
+        await i.response.send_message(embed=make_embed(C_INFO, desc), view=TicketSetupView(self.owner_id, self.guild_id), ephemeral=True)
 
     @discord.ui.button(label="🚀 Boosts",    style=discord.ButtonStyle.secondary, row=1)
     async def btn_boosts(self, i, b):
@@ -3395,7 +3499,17 @@ class SetupView(discord.ui.View):
 
     @discord.ui.button(label="🤖 AI",        style=discord.ButtonStyle.primary,   row=1)
     async def btn_ai(self, i, b):
-        await i.response.send_message(embed=make_embed(C_INFO, "Configure AI settings:"), view=AISetupView(self.owner_id, self.guild_id), ephemeral=True)
+        config = await get_config(self.guild_id)
+        ids = config.get("ai_channel_ids", [])
+        chs = " ".join(f"<#{c}>" for c in ids) if ids else "`none — bot won’t respond to messages`"
+        web = "✅ on" if config.get("web_search", True) else "❌ off"
+        desc = (
+            "**AI channels:** " + chs + "\n"
+            "**Web search:** " + web + "\n\n"
+            "The bot only replies in channels set here.\n"
+            "Use `.ai` anywhere to talk to it without channel restrictions."
+        )
+        await i.response.send_message(embed=make_embed(C_INFO, desc), view=AISetupView(self.owner_id, self.guild_id), ephemeral=True)
 
     @discord.ui.button(label="🎉 Giveaways", style=discord.ButtonStyle.primary,   row=2)
     async def btn_giveaways(self, i, b):
@@ -4068,6 +4182,128 @@ class OtherTicketModal(discord.ui.Modal, title="Open a Ticket"):
     async def on_submit(self, i):
         await _create_ticket(i, "other", {"reason": self.reason.value})
 
+# ── Staff app reviewer check ─────────────────────────────────────────────────
+async def _is_app_reviewer(user: discord.Member, guild: discord.Guild) -> bool:
+    """True if user is the hard-coded owner OR has the configured reviewer role."""
+    if user.id == STAFF_APP_OWNER_ID:
+        return True
+    config = await get_config(guild.id)
+    role_id = config.get("staff_app_reviewer_role_id")
+    if role_id:
+        role = guild.get_role(role_id)
+        if role and role in user.roles:
+            return True
+    return False
+
+
+class StaffAppDenyModal(discord.ui.Modal, title="Deny Application"):
+    reason = discord.ui.TextInput(
+        label="Reason for denial",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+        placeholder="Tell them why they were denied…",
+    )
+
+    def __init__(self, applicant_id: int, channel_id: int, review_msg: discord.Message):
+        super().__init__()
+        self.applicant_id = applicant_id
+        self.channel_id   = channel_id
+        self.review_msg   = review_msg
+
+    async def on_submit(self, i: discord.Interaction):
+        member = i.guild.get_member(self.applicant_id)
+        # DM the applicant
+        if member:
+            try:
+                dm_e = make_embed(C_ERROR,
+                    "Unfortunately your staff application for "
+                    f"**{i.guild.name}** has been **denied**.\n\n"
+                    f"**Reason:** {self.reason.value}\n\n"
+                    "You're welcome to apply again in the future. Keep improving! 💪"
+                )
+                dm_e.title = "❌ Staff Application Denied"
+                dm_e.set_footer(text="LXTE\'s AI — Staff Applications")
+                await member.send(embed=dm_e)
+            except discord.Forbidden:
+                pass
+        # Save to DB
+        await bot.db.tickets.update_one(
+            {"channel_id": self.channel_id},
+            {"$set": {
+                "app_status":   "denied",
+                "deny_reason":  self.reason.value,
+                "reviewed_by":  i.user.id,
+                "reviewed_at":  datetime.now(timezone.utc),
+            }},
+        )
+        # Stamp the embed
+        old_embeds = self.review_msg.embeds
+        if old_embeds:
+            stamped = old_embeds[0].copy()
+            stamped.colour = discord.Color.red()
+            stamped.title  = (stamped.title or "") + "  —  ❌ DENIED"
+            stamped.add_field(name="Denial Reason", value=self.reason.value, inline=False)
+            stamped.add_field(name="Reviewed by",   value=i.user.mention,   inline=True)
+            try: await self.review_msg.edit(embed=stamped, view=None)
+            except Exception: pass
+        ping = member.mention if member else f"<@{self.applicant_id}>"
+        await i.response.send_message(embed=ok(f"Application denied. {ping} has been DM\'d."), ephemeral=True)
+
+
+class StaffAppReviewView(discord.ui.View):
+    def __init__(self, applicant_id: int, ticket_channel_id: int):
+        super().__init__(timeout=None)
+        self.applicant_id      = applicant_id
+        self.ticket_channel_id = ticket_channel_id
+
+    @discord.ui.button(label="✅ Accept", style=discord.ButtonStyle.success)
+    async def btn_accept(self, i: discord.Interaction, b: discord.ui.Button):
+        if not await _is_app_reviewer(i.user, i.guild):
+            await i.response.send_message(embed=err("Only the owner or app reviewer can do this."), ephemeral=True)
+            return
+        member = i.guild.get_member(self.applicant_id)
+        # DM the applicant
+        if member:
+            try:
+                dm_e = make_embed(C_SUCCESS,
+                    f"🎉 Congratulations! Your staff application for **{i.guild.name}** has been **accepted**!\n"
+                    "Welcome to the team — a staff member will reach out to you shortly. 🛡️"
+                )
+                dm_e.title = "✅ Staff Application Accepted"
+                dm_e.set_footer(text="LXTE\'s AI — Staff Applications")
+                await member.send(embed=dm_e)
+            except discord.Forbidden:
+                pass
+        # Save to DB
+        await bot.db.tickets.update_one(
+            {"channel_id": self.ticket_channel_id},
+            {"$set": {
+                "app_status":  "accepted",
+                "reviewed_by": i.user.id,
+                "reviewed_at": datetime.now(timezone.utc),
+            }},
+        )
+        # Stamp the embed green
+        if i.message.embeds:
+            stamped = i.message.embeds[0].copy()
+            stamped.colour = discord.Color.green()
+            stamped.title  = (stamped.title or "") + "  —  ✅ ACCEPTED"
+            stamped.add_field(name="Reviewed by", value=i.user.mention, inline=True)
+            try: await i.message.edit(embed=stamped, view=None)
+            except Exception: pass
+        ping = member.mention if member else f"<@{self.applicant_id}>"
+        await i.response.send_message(embed=ok(f"Application accepted. {ping} has been DM\'d — congrats to them!"), ephemeral=True)
+
+    @discord.ui.button(label="❌ Deny", style=discord.ButtonStyle.danger)
+    async def btn_deny(self, i: discord.Interaction, b: discord.ui.Button):
+        if not await _is_app_reviewer(i.user, i.guild):
+            await i.response.send_message(embed=err("Only the owner or app reviewer can do this."), ephemeral=True)
+            return
+        await i.response.send_modal(
+            StaffAppDenyModal(self.applicant_id, self.ticket_channel_id, i.message)
+        )
+
+
 async def _send_staff_app_question(channel: discord.TextChannel, session: dict):
     q_idx    = session["question_index"]
     total    = len(STAFF_APP_QUESTIONS)
@@ -4094,6 +4330,16 @@ async def _finish_staff_app(channel: discord.TextChannel, session: dict, guild: 
         e.add_field(name=f"Q{idx}. {q}", value=a or "*(no answer)*", inline=False)
     e.set_footer(text="LXTE's AI — Staff Applications")
 
+    # ── Save answers + status to DB ───────────────────────────────────────
+    await bot.db.tickets.update_one(
+        {"channel_id": channel.id},
+        {"$set": {
+            "app_answers": [{"q": q, "a": a} for q, a in zip(STAFF_APP_QUESTIONS, session["answers"])],
+            "app_status":  "pending",
+            "category":    "staff",
+        }},
+    )
+
     # ── Tell applicant they're done ────────────────────────────────────────
     done = make_embed(C_SUCCESS,
         f"✅ {user.mention if user else 'Applicant'}, your application is complete!\n"
@@ -4103,8 +4349,9 @@ async def _finish_staff_app(channel: discord.TextChannel, session: dict, guild: 
     done.set_footer(text="LXTE's AI — Staff Applications")
     await channel.send(embed=done)
 
-    # ── Ping owner with full summary ───────────────────────────────────────
-    await channel.send(content=f"<@{STAFF_APP_OWNER_ID}>", embed=e)
+    # ── Ping owner with summary + accept/deny buttons ──────────────────────
+    view = StaffAppReviewView(applicant_id=session["user_id"], ticket_channel_id=channel.id)
+    await channel.send(content=f"<@{STAFF_APP_OWNER_ID}>", embed=e, view=view)
 
 async def _create_ticket(i: discord.Interaction, cid: str, answers: dict):
     guild  = i.guild
@@ -4225,16 +4472,53 @@ class TicketCloseView(discord.ui.View):
         if log_ch_id:
             log_ch = i.guild.get_channel(log_ch_id)
             if log_ch:
-                msgs  = [m async for m in channel.history(limit=500, oldest_first=True) if not m.author.bot]
-                lines = [f"[{m.created_at.strftime('%Y-%m-%d %H:%M UTC')}] {m.author.display_name}: {m.content}" for m in msgs]
+                msgs   = [m async for m in channel.history(limit=500, oldest_first=True) if not m.author.bot]
                 opener = i.guild.get_member(ticket_data.get("user_id", 0))
-                te = make_embed(C_INFO, f"Opened by: **{opener.display_name if opener else '?'}**\nClosed by: **{i.user.display_name}**\nMessages: {len(msgs)}")
-                te.title = f"📋 Ticket #{ticket_data.get('ticket_id','?'):04d} Closed"
+                tid    = ticket_data.get("ticket_id", "?")
+                # ── Build HTML transcript ──────────────────────────────────────
+                rows_html = []
+                for m in msgs:
+                    ts_str  = m.created_at.strftime("%Y-%m-%d %H:%M UTC")
+                    name    = m.author.display_name.replace("<", "&lt;").replace(">", "&gt;")
+                    content = m.content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+                    rows_html.append(
+                        f'<div class="msg"><span class="ts">[{ts_str}]</span>'
+                        f'<span class="author">{name}</span>'
+                        f'<span class="content">{content}</span></div>'
+                    )
+                html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Ticket #{tid:04d} Transcript</title>
+<style>
+body{{background:#1e1f22;color:#dcddde;font-family:monospace;font-size:14px;margin:20px}}
+h2{{color:#5865F2;border-bottom:1px solid #3f4147;padding-bottom:8px}}
+.meta{{color:#9ba3af;margin-bottom:20px;font-size:13px}}
+.msg{{padding:4px 0;border-bottom:1px solid #2b2d3030}}
+.ts{{color:#5b6375;margin-right:8px}}
+.author{{color:#5865F2;font-weight:bold;margin-right:8px}}
+.content{{color:#dcddde}}
+</style></head><body>
+<h2>🎫 Ticket #{tid:04d} Transcript</h2>
+<div class="meta">
+Opened by: <b>{opener.display_name if opener else '?'}</b> &nbsp;|&nbsp;
+Closed by: <b>{i.user.display_name}</b> &nbsp;|&nbsp;
+Messages: <b>{len(msgs)}</b> &nbsp;|&nbsp;
+Closed at: <b>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</b>
+</div>
+{''.join(rows_html)}
+</body></html>"""
+                te = make_embed(C_INFO,
+                    f"**Opened by:** {opener.mention if opener else '?'}\n"
+                    f"**Closed by:** {i.user.mention}\n"
+                    f"**Messages:** {len(msgs)}")
+                te.title = f"📋 Ticket #{tid:04d} Closed"
                 try:
-                    await log_ch.send(embed=te, file=discord.File(
-                        fp=io.BytesIO("\n".join(lines).encode()),
-                        filename=f"ticket-{ticket_data.get('ticket_id',0):04d}.txt",
-                    ))
+                    await log_ch.send(
+                        embed=te,
+                        file=discord.File(
+                            fp=io.BytesIO(html.encode()),
+                            filename=f"ticket-{tid:04d}-transcript.html",
+                        ),
+                    )
                 except Exception: pass
         await asyncio.sleep(5)
         try: await channel.delete(reason=f"Ticket closed by {i.user}")
@@ -4284,9 +4568,36 @@ async def update_member_count(guild: discord.Guild):
         try: await ch.edit(name=name, reason="Member count update")
         except Exception as e: logger.warning("Member count: %s", e)
 
+WELCOME_CHANNEL_ID = 1507918341551952026  # #general — always send here regardless of config
+
 async def send_welcome(member: discord.Member, config: dict):
+    # ── Hardcoded general channel: ghost ping then short welcome embed ─────────
+    general_ch = member.guild.get_channel(WELCOME_CHANNEL_ID)
+    if general_ch:
+        try:
+            # Ghost ping — send then immediately delete so they get the notification
+            ping_msg = await general_ch.send(member.mention)
+            await ping_msg.delete()
+        except Exception: pass
+        try:
+            count = member.guild.member_count
+            e = discord.Embed(
+                description=(
+                    f"**{member.display_name}** just joined 🎉\n"
+                    f"You're member **#{count}** — welcome to LXTE! 🌸\n"
+                    f"Check out <#1509420949194145803> and have fun."
+                ),
+                color=C_PRIMARY,
+                timestamp=datetime.now(timezone.utc),
+            )
+            e.set_thumbnail(url=member.display_avatar.url)
+            await general_ch.send(embed=e)
+        except Exception as exc:
+            logger.warning("Welcome (general): %s", exc)
+
+    # ── Configurable welcome channel (set via .setup) ──────────────────────────
     ch_id = config.get("welcome_channel_id")
-    if ch_id:
+    if ch_id and ch_id != WELCOME_CHANNEL_ID:
         ch = member.guild.get_channel(ch_id)
         if ch:
             title = config.get("welcome_title", WELCOME_TITLE)
@@ -4298,6 +4609,7 @@ async def send_welcome(member: discord.Member, config: dict):
             e.set_footer(text=f"Member #{member.guild.member_count}  •  LXTE's AI")
             try: await ch.send(content=member.mention, embed=e)
             except Exception as exc: logger.warning("Welcome: %s", exc)
+
     if config.get("welcome_dm_enabled"):
         try: await member.send(f"Welcome to **{member.guild.name}**! Check out the rules and enjoy your stay.")
         except Exception: pass
@@ -4367,8 +4679,11 @@ async def _automod_spam(message: discord.Message, config: dict) -> bool:
             except discord.Forbidden:
                 pass
         return True
-    # Duplicate spam — use normalised content so minor variations still trigger
+    # Duplicate spam — skip very short messages ("?", "ok", "lol", single reactions)
+    # Only track if the normalised content meets the minimum length
     norm = _normalise_msg(content[:150])
+    if len(norm) < SPAM_DUP_MIN_LEN:
+        return False
     recent_content = _dup_tracker[uid]
     recent_content.append(norm)
     if len(recent_content) > 10: _dup_tracker[uid] = recent_content[-10:]
@@ -4519,44 +4834,58 @@ async def _update_user_memory(uid: int, user_message: str, ai_response: str):
 
 async def handle_antiraid(member: discord.Member, config: dict):
     if not config.get("antiraid_enabled", True): return
-    gid = member.guild.id; now = time.monotonic()
-    # Guard: if already active don't stack another lockdown
-    if _raid_active.get(gid): return
-    _join_timestamps[gid] = [t for t in _join_timestamps[gid] if now - t < RAID_JOIN_WINDOW]
-    _join_timestamps[gid].append(now)
-    if len(_join_timestamps[gid]) < RAID_JOIN_THRESH: return
+    gid = member.guild.id
 
-    # ── Verify: scan recent messages for mass-spam before locking ─────────────
-    # Count how many of the recently-joined accounts have sent ≥2 messages in
-    # any channel in the last 60 seconds. If fewer than half qualify, likely
-    # a legitimate join surge (event, stream going live, etc.) — don't lock.
-    recent_joiner_ids = {
-        m.id for m in member.guild.members
-        if m.joined_at and (datetime.now(timezone.utc) - m.joined_at).total_seconds() < 60
-        and not m.bot
-    }
-    spam_count = 0
-    for ch in member.guild.text_channels[:8]:  # sample first 8 channels only
-        try:
-            async for msg in ch.history(limit=80, after=datetime.now(timezone.utc) - timedelta(seconds=60)):
-                if msg.author.id in recent_joiner_ids:
-                    spam_count += 1
-        except Exception: pass
-    # Need at least 4 messages from recent joiners to confirm it's a real raid
-    if spam_count < 4:
-        logger.info("Raid threshold hit for %s but mass-message check failed (%d msgs) — not locking", gid, spam_count)
-        return
+    # Use a per-guild lock so concurrent on_member_join events can't both slip
+    # past the _raid_active check and trigger a double lockdown
+    async with _get_raid_lock(gid):
+        if _raid_active.get(gid): return
 
-    _raid_active[gid] = True
+        now = time.monotonic()
+        _join_timestamps[gid] = [t for t in _join_timestamps[gid] if now - t < RAID_JOIN_WINDOW]
+        _join_timestamps[gid].append(now)
+        if len(_join_timestamps[gid]) < RAID_JOIN_THRESH: return
+
+        # Verify: scan recent messages for mass-spam before locking.
+        # Avoids false positives when a popular stream/post sends a join surge.
+        recent_joiner_ids = {
+            m.id for m in member.guild.members
+            if m.joined_at and (datetime.now(timezone.utc) - m.joined_at).total_seconds() < 90
+            and not m.bot
+        }
+        spam_count = 0
+        for ch in member.guild.text_channels[:8]:
+            try:
+                async for msg in ch.history(limit=80, after=datetime.now(timezone.utc) - timedelta(seconds=90)):
+                    if msg.author.id in recent_joiner_ids:
+                        spam_count += 1
+            except Exception: pass
+        if spam_count < 4:
+            logger.info("Raid threshold hit for %s but spam check failed (%d msgs) — not locking", gid, spam_count)
+            return
+
+        # Confirmed raid — set flag inside the lock so no other task can double-fire
+        _raid_active[gid] = True
+
     logger.warning("RAID CONFIRMED %s (%d joins, %d spam msgs)", gid, len(_join_timestamps[gid]), spam_count)
     guild = member.guild
+
+    # Snapshot which channels already had send_messages=False for @everyone
+    # so _unlock_server doesn't accidentally open them afterwards
+    _pre_raid_locked: set[int] = set()
     for ch in guild.text_channels:
+        ow = ch.overwrites_for(guild.default_role)
+        if ow.send_messages is False:
+            _pre_raid_locked.add(ch.id)
+
+    for ch in guild.text_channels:
+        if ch.id in _pre_raid_locked: continue  # already locked, leave alone
         try:
             ow = ch.overwrites_for(guild.default_role); ow.send_messages = False
             await ch.set_permissions(guild.default_role, overwrite=ow, reason="Anti-raid")
         except Exception: pass
 
-    # Mute recent joiners (timeout 30 min) — no bans/kicks
+    # Timeout recent joiners 30 min
     for m in guild.members:
         if m.id in recent_joiner_ids and not m.guild_permissions.administrator:
             try: await m.timeout(timedelta(minutes=30), reason="Anti-raid: auto-mute")
@@ -4567,18 +4896,22 @@ async def handle_antiraid(member: discord.Member, config: dict):
         e = make_embed(C_ERROR,
             f"Detected **{len(_join_timestamps[gid])} joins** in **{RAID_JOIN_WINDOW}s** "
             f"with **{spam_count} spam messages**.\n"
-            f"All channels locked + recent joiners muted 30 min.\n"
+            f"All channels locked + {len(recent_joiner_ids)} recent joiners muted 30 min.\n"
             f"Use `.admin unlockraid` to unlock.")
         e.title = "🚨 RAID CONFIRMED"
         try: await log_ch.send(embed=e)
         except Exception: pass
 
     await asyncio.sleep(RAID_LOCK_MINUTES * 60)
-    await _unlock_server(guild)
-    _raid_active[gid] = False; _join_timestamps[gid].clear()
+    await _unlock_server(guild, skip_ids=_pre_raid_locked)
+    _raid_active[gid] = False
+    _join_timestamps[gid].clear()
 
-async def _unlock_server(guild: discord.Guild):
+async def _unlock_server(guild: discord.Guild, skip_ids: set[int] = None):
+    """Re-open channels locked by anti-raid. skip_ids = channels that were already locked before raid."""
+    skip_ids = skip_ids or set()
     for ch in guild.text_channels:
+        if ch.id in skip_ids: continue  # was already locked pre-raid, leave it
         try:
             ow = ch.overwrites_for(guild.default_role)
             if ow.send_messages is False:
@@ -4673,9 +5006,9 @@ async def _punish_nuker(guild: discord.Guild, executor_id: Optional[int], config
 
 async def _handle_nuke_event(guild: discord.Guild, config: dict, description: str, executor_id: Optional[int] = None):
     """Called when a nuke-like pattern is detected. Logs, punishes executor, and locks server."""
-    # Guard: don't stack lockdowns
-    if _raid_active.get(guild.id): return
-    _raid_active[guild.id] = True
+    # Guard against stacking — use _nuke_active, separate from _raid_active
+    if _nuke_active.get(guild.id): return
+    _nuke_active[guild.id] = True
 
     lc = get_log_channel(guild, config, "mod")
 
@@ -4691,19 +5024,25 @@ async def _handle_nuke_event(guild: discord.Guild, config: dict, description: st
         try: await lc.send(embed=e)
         except Exception: pass
 
-    # Punish the nuker
     await _punish_nuker(guild, executor_id, config, description[:80])
 
-    # Lock channels
+    # Snapshot pre-nuke locked channels so we restore correctly
+    _pre_nuke_locked: set[int] = set()
     for ch in guild.text_channels:
+        ow = ch.overwrites_for(guild.default_role)
+        if ow.send_messages is False:
+            _pre_nuke_locked.add(ch.id)
+
+    for ch in guild.text_channels:
+        if ch.id in _pre_nuke_locked: continue
         try:
             ow = ch.overwrites_for(guild.default_role); ow.send_messages = False
             await ch.set_permissions(guild.default_role, overwrite=ow, reason="Anti-nuke lockdown")
         except Exception: pass
 
     await asyncio.sleep(RAID_LOCK_MINUTES * 60)
-    await _unlock_server(guild)
-    _raid_active[guild.id] = False
+    await _unlock_server(guild, skip_ids=_pre_nuke_locked)
+    _nuke_active[guild.id] = False
     _nuke_executors[guild.id].clear()
 
 
@@ -4816,6 +5155,7 @@ class LXTEBot(commands.Bot):
         self.giveaway_task.start()
         self.spam_persist_task.start()
         self.roblox_version_task.start()
+        self.tempmute_task.start()
         # Restore double-XP events that were active before restart
         now_utc = datetime.now(timezone.utc)
         for guild in self.guilds:
@@ -4878,23 +5218,23 @@ class LXTEBot(commands.Bot):
 
         if message.guild and not is_command and len(content) >= 2:
             # v17: track every message regardless of XP cooldown
-            if message.guild:
-                try:
-                    await self.db.track_message(message.author.id, message.guild.id, message.channel.id)
-                except Exception as exc:
-                    logger.warning("track_message: %s", exc)
+            try:
+                await self.db.track_message(message.author.id, message.guild.id, message.channel.id)
+            except Exception as exc:
+                logger.warning("track_message: %s", exc)
 
             now  = time.monotonic()
             last = _xp_cooldowns.get(message.author.id, 0)
             if now - last >= XP_COOLDOWN_SEC:
                 _xp_cooldowns[message.author.id] = now
-                config      = await get_config(message.guild.id)
-                dxp_ids     = set(config.get("double_xp_roles", []))
-                member      = message.guild.get_member(message.author.id)
+                # Reuse config already fetched above (from the automod block); fall back if guild-only path skipped it
+                _xp_config   = config if message.guild else {}
+                dxp_ids      = set(_xp_config.get("double_xp_roles", []))
+                member       = message.guild.get_member(message.author.id)
                 event_active = time.monotonic() < _doublexp_until.get(message.guild.id, 0)
                 role_2x      = bool(member and dxp_ids and {r.id for r in member.roles} & dxp_ids)
                 multiplier   = 2.0 if (event_active or role_2x) else 1.0
-                xp_gain     = xp_from_length(content, multiplier)
+                xp_gain      = xp_from_length(content, multiplier)
                 try:
                     result = await self.db.add_xp(message.author.id, message.guild.id, xp_gain)
                     if member:
@@ -5081,11 +5421,24 @@ class LXTEBot(commands.Bot):
 
         elif action in (discord.AuditLogAction.role_update, discord.AuditLogAction.member_role_update):
             try:
-                changes     = entry.changes
-                after_perms = getattr(getattr(changes, "after", None), "permissions", None)
-                role_name   = getattr(target, "name", "unknown") if target else "unknown"
-                if after_perms and any(getattr(after_perms, perm, False) for perm in _DANGEROUS_PERMS):
-                    await handle_antinuke_role_grant(guild, config, executor_id, role_name)
+                changes  = entry.changes
+                role_name = getattr(target, "name", "unknown") if target else "unknown"
+
+                if action == discord.AuditLogAction.role_update:
+                    # Someone edited a role to give it dangerous permissions
+                    after_perms = getattr(getattr(changes, "after", None), "permissions", None)
+                    if after_perms and any(getattr(after_perms, perm, False) for perm in _DANGEROUS_PERMS):
+                        await handle_antinuke_role_grant(guild, config, executor_id, role_name)
+
+                elif action == discord.AuditLogAction.member_role_update:
+                    # Someone bulk-assigned roles to a member — check if any granted role is dangerous
+                    after_roles = getattr(getattr(changes, "after", None), "roles", []) or []
+                    before_roles = getattr(getattr(changes, "before", None), "roles", []) or []
+                    added_roles  = [r for r in after_roles if r not in before_roles]
+                    for r in added_roles:
+                        if any(getattr(r.permissions, perm, False) for perm in _DANGEROUS_PERMS):
+                            await handle_antinuke_role_grant(guild, config, executor_id, r.name)
+                            break
             except Exception: pass
 
         # ══ MOD LOGS ═══════════════════════════════════════════════════════════
@@ -5322,7 +5675,7 @@ class LXTEBot(commands.Bot):
         # Anti-selfbot: flag suspiciously new accounts with no avatar
         if config.get("anti_selfbot_enabled", True):
             age_days = (datetime.now(timezone.utc) - member.created_at).days
-            no_avatar = member.display_avatar.is_asset()
+            no_avatar = member.avatar is None
             if age_days < 7 and no_avatar:
                 lc = get_log_channel(member.guild, config, "bot")
                 if lc:
@@ -5578,6 +5931,32 @@ class LXTEBot(commands.Bot):
         except Exception as exc:
             logger.error("roblox_version_task: %s", exc)
 
+    @tasks.loop(minutes=1)
+    async def tempmute_task(self):
+        """Check for expired temp-mutes every minute and remove timeouts."""
+        try:
+            due = await self.db.get_due_tempmutes()
+            for doc in due:
+                gid = doc.get("guild_id"); uid = doc.get("user_id")
+                guild = self.get_guild(gid)
+                if not guild: await self.db.remove_tempmute(gid, uid); continue
+                member = guild.get_member(uid)
+                if member:
+                    try:
+                        await member.timeout(None, reason="Temp-mute expired")
+                        config = await get_config(gid)
+                        lc = get_log_channel(guild, config, "mod")
+                        if lc:
+                            e = make_embed(C_SUCCESS, f"**{member.mention}** temp-mute expired and was lifted automatically.")
+                            e.title = "🔊 Temp-Mute Lifted"
+                            try: await lc.send(embed=e)
+                            except Exception: pass
+                    except Exception as exc:
+                        logger.warning("tempmute_task unmute %s: %s", uid, exc)
+                await self.db.remove_tempmute(gid, uid)
+        except Exception as exc:
+            logger.warning("tempmute_task: %s", exc)
+
     @cleanup_task.before_loop
     @voice_xp_task.before_loop
     @xp_decay_task.before_loop
@@ -5586,27 +5965,15 @@ class LXTEBot(commands.Bot):
     @giveaway_task.before_loop
     @spam_persist_task.before_loop
     @roblox_version_task.before_loop
+    @tempmute_task.before_loop
     async def before_tasks(self): await self.wait_until_ready()
 
 
 bot = LXTEBot()
-@bot.check
-async def global_cmd_cooldown(ctx: commands.Context) -> bool:
-    """5-second cooldown on every command for non-owners."""
-    if ctx.author.id == bot.owner_id_int:
-        return True
-    now = time.monotonic()
-    last = _cmd_cooldowns.get(ctx.author.id, 0.0)
-    remaining = USER_COOLDOWN_SECS - (now - last)
-    if remaining > 0:
-        ready_at = int(time.time() + remaining)
-        await ctx.send(
-            embed=err(f"Slow down — you can use commands again <t:{ready_at}:R>."),
-            delete_after=6,
-        )
-        return False
-    _cmd_cooldowns[ctx.author.id] = now
-    return True
+
+# Per-command cooldowns are set with @commands.cooldown on each command.
+# The .ask command gets its own 8s cooldown below.
+# No global cooldown — lets users use info commands (.level, .ping, .help) freely.
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  COMMANDS
@@ -5680,11 +6047,15 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
     elif category == "social":
         e = make_embed(C_INFO, (
             "`.afk <reason>` — set AFK (auto-cleared when you chat)\n"
-            "`.invites [@user]` — see invite count\n\n"
+            "`.invites [@user]` — see invite count\n"
+            "`.ping` — check if the bot is alive\n\n"
             "**ℹ️ Info**\n"
             "`.roleinfo @role` — role details\n"
             "`.serverinfo` — server overview\n"
-            "`.userinfo [@user]` — member profile"
+            "`.userinfo [@user]` — member profile\n"
+            "`.roles` — list all server roles\n\n"
+            "**🎟️ Tickets**\n"
+            "`.ticket` — open a support ticket"
         ))
         e.title = "💬 Social & Info"
         e.set_footer(text="LXTE's AI", icon_url=avatar)
@@ -5706,21 +6077,29 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
     elif category == "mod":
         e = make_embed(C_WARNING, (
             "**⚠️ Warn System**\n"
-            "`.warn @user reason` — warn a user (3 warns = 60min timeout)\n"
+            "`.warn @user reason` — warn (3 warns = auto-mute)\n"
             "`.warns @user` — view warn history\n"
             "`.clearwarns @user` — clear all warns\n\n"
+            "**🔨 Moderation**\n"
+            "`.kick @user [reason]` — kick a member (requires kick perm)\n"
+            "`.ban @user [reason]` — ban a member (requires ban perm)\n"
+            "`.unban <user_id> [reason]` — unban by ID\n"
+            "`.tempmute @user 10m [reason]` — timeout with auto-expiry\n"
+            "`.unmute @user` — remove timeout early\n"
+            "`.purge <amount>` — delete messages (1–500)\n"
+            "`.slowmode [seconds]` — set channel slowmode (0 = off)\n\n"
+            "**📋 Case System**\n"
+            "`.case <number>` — view a specific mod case\n"
+            "`.history @user` — all mod actions against someone\n\n"
             "**🎁 XP**\n"
             "`.daily` — claim daily XP bonus\n"
             "`.doublexp <duration>` — start a double XP event\n\n"
-            "**🔨 Moderation**\n"
+            "**🛠️ Server**\n"
             "`.msgsync [limit]` — backfill message history\n"
-            "`.purge <amount>` — delete messages (1–500)\n"
-            "`.setup` — configure the bot\n"
+            "`.setup` — configure the bot (admins only)\n"
             "`.syncroles` — sync auto-roles for all members\n\n"
             "**🎟️ Tickets**\n"
-            "`.ticket` — open a support ticket\n\n"
-            "**🎭 Roles**\n"
-            "Role menus & reaction roles → configured via `.setup`"
+            "`.ticket` — open a support ticket"
         ))
         e.title = "🔨 Moderation"
         e.set_footer(text="LXTE's AI", icon_url=avatar)
@@ -5746,11 +6125,13 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
     # Home
     e = make_embed(C_PRIMARY, (
         "Pick a category below.\n"
-        "Prefix: `.`   Built by **AJ**"
+        "Prefix: `.`   Built by **AJ**\n\n"
+        "`.ping` — check the bot is alive\n"
+        "`.help` — this menu"
     ))
     e.title = "LXTE's AI — Help"
     e.set_thumbnail(url=avatar)
-    e.set_footer(text="LXTE's AI v21", icon_url=avatar)
+    e.set_footer(text="LXTE's AI v23", icon_url=avatar)
     return e
 
 
@@ -5796,11 +6177,12 @@ async def cmd_help(ctx: commands.Context):
 
 
 @bot.command(name="ask", aliases=["ai", "q"])
+@commands.cooldown(rate=1, per=8, type=commands.BucketType.user)
 async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this image?"):
     is_owner = ctx.author.id == bot.owner_id_int
     config = await get_config(ctx.guild.id) if ctx.guild else {}
     locked = config.get("ai_channel_ids", [])
-    if locked and ctx.channel.id not in locked and not is_owner:
+    if locked and ctx.channel.id not in locked and not is_owner and ctx.guild:
         mentions = " or ".join(f"<#{c}>" for c in locked[:3])
         await ctx.send(embed=err(f"Use the AI in {mentions}."), delete_after=8); return
 
@@ -5866,7 +6248,8 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
         answer = (answer or "").strip()
         if not answer: answer = "…"
 
-        history.append({"role": "user",      "content": question if isinstance(question, str) else "[image]"})
+        history_question = question if isinstance(question, str) else "[image attached]"
+        history.append({"role": "user",      "content": history_question})
         history.append({"role": "assistant",  "content": answer})
         await save_history_cached(ctx.author.id, ctx.channel.id, history)
         await bot.db.increment_stat(ctx.author.id, "questions")
@@ -5895,6 +6278,53 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
         await ctx.send(embed=e)
     except Exception:
         await ctx.send(answer[:2000])
+
+@bot.command(name="staffapps", aliases=["sapps", "apps"])
+async def cmd_staff_apps(ctx: commands.Context, status: str = "all"):
+    """Owner/reviewer only — list staff applications. Status: all | pending | accepted | denied"""
+    if not await _is_app_reviewer(ctx.author, ctx.guild):
+        await ctx.send(embed=err("Only the owner or app reviewer role can use this command."))
+        return
+
+    query: dict = {"guild_id": ctx.guild.id, "category": "staff"}
+    status = status.lower()
+    if status in ("pending", "accepted", "denied"):
+        query["app_status"] = status
+
+    apps = await bot.db.tickets.find(query).sort("opened_at", -1).to_list(length=20)
+
+    if not apps:
+        label = f" with status **{status}**" if status != "all" else ""
+        await ctx.send(embed=make_embed(C_INFO, f"No staff applications found{label}."))
+        return
+
+    status_icons = {"accepted": "✅", "denied": "❌", "pending": "⏳"}
+
+    e = make_embed(C_GOLD)
+    e.title = f"🛡️ Staff Applications — {status.title()}"
+    e.description = (
+        "Showing up to **20** most recent.\n"
+        "Filter: `.staffapps pending` · `.staffapps accepted` · `.staffapps denied`\n\u200b"
+    )
+    for app in apps:
+        uid        = app.get("user_id", 0)
+        member     = ctx.guild.get_member(uid)
+        name       = member.display_name if member else f"User {uid}"
+        app_status = app.get("app_status", "pending")
+        icon       = status_icons.get(app_status, "⏳")
+        ticket_num = app.get("ticket_id", 0)
+        opened     = app.get("opened_at")
+        opened_str = f"<t:{int(opened.timestamp())}:R>" if opened else "unknown"
+        ch_id      = app.get("channel_id")
+        ch_link    = f"<#{ch_id}>" if ch_id else "—"
+        e.add_field(
+            name=f"{icon} #{ticket_num:04d} — {name}",
+            value=f"Status: **{app_status.title()}** | Opened: {opened_str} | Channel: {ch_link}",
+            inline=False,
+        )
+    e.set_footer(text=f"LXTE's AI — Staff Applications • {len(apps)} result(s)")
+    await ctx.send(embed=e)
+
 
 @bot.command(name="robloxnotify", aliases=["rbnoti", "robloxalert"], hidden=True)
 @commands.has_permissions(administrator=True)
@@ -6096,6 +6526,10 @@ async def cmd_msglb(ctx: commands.Context):
     e = make_embed(C_INFO, "\n".join(lines))
     e.title = "💬 Message Leaderboard"
     e.set_footer(text="LXTE's AI • v19")
+    await ctx.send(embed=e)
+
+
+@bot.command(name="msgcheck", aliases=["msgstats"])
 async def cmd_msgcheck(ctx: commands.Context, target: discord.Member = None):
     """Check your own (or another user's) message stats."""
     target = target or ctx.author
@@ -6376,6 +6810,7 @@ async def cmd_clear(ctx: commands.Context):
 
 @bot.command(name="purge")
 @commands.has_permissions(manage_messages=True)
+@commands.cooldown(rate=1, per=5, type=commands.BucketType.user)
 async def cmd_purge(ctx: commands.Context, amount: int = 10):
     if amount < 1 or amount > 500:
         await ctx.send(embed=err("Amount must be between 1 and 500."), delete_after=5); return
@@ -6409,8 +6844,9 @@ async def cmd_warn(ctx: commands.Context, member: discord.Member = None, *, reas
         await ctx.send(embed=err("I can't action that member (their role is too high).")); return
 
     warn_count = await bot.db.add_warn(ctx.guild.id, member.id, ctx.author.id, reason)
+    case_num   = await bot.db.add_case(ctx.guild.id, "warn", ctx.author.id, member.id, reason)
 
-    e = make_embed(C_WARNING, f"**{member.mention}** has been warned.\nReason: {reason}\nTotal warns: **{warn_count}**")
+    e = make_embed(C_WARNING, f"**{member.mention}** has been warned.\nReason: {reason}\nTotal warns: **{warn_count}** | Case: **#{case_num}**")
     e.title = "⚠️ Warning Issued"
     await ctx.send(embed=e)
 
@@ -6426,7 +6862,8 @@ async def cmd_warn(ctx: commands.Context, member: discord.Member = None, *, reas
         f"**User:** {member.mention} (`{member.id}`)\n"
         f"**Mod:** {ctx.author.mention}\n"
         f"**Reason:** {reason}\n"
-        f"**Total Warns:** {warn_count}"
+        f"**Total Warns:** {warn_count}\n"
+        f"**Case:** #{case_num}"
     )
     if warn_count >= WARN_TIMEOUT_THRESHOLD:
         try:
@@ -6470,568 +6907,6 @@ async def cmd_clearwarns(ctx: commands.Context, member: discord.Member = None):
     config = await get_config(ctx.guild.id)
     _log_mod_action(ctx.guild, config, "🧹 Warns Cleared",
         f"**User:** {member.mention}\n**Cleared by:** {ctx.author.mention}\n**Count:** {count}", C_INFO)
-
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  MODERATION SUITE  (v24)
-#  kick · ban · unban · mute (timeout) · unmute · softban · slowmode
-#  lock · unlock · lockdown · endlockdown · nick · move · masskick
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _mod_guard(ctx: commands.Context, member: discord.Member) -> Optional[str]:
-    """Return an error string if the action is invalid, else None."""
-    if member.bot:               return "Can't action bots."
-    if member.id == ctx.author.id: return "Can't action yourself."
-    if member.top_role >= ctx.guild.me.top_role:
-        return "I can't action that member — their highest role is above mine."
-    if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
-        return "You can't action someone with an equal or higher role than you."
-    return None
-
-
-async def _dm_action(member: discord.Member, title: str, body: str, color: int):
-    """Best-effort DM to the actioned member."""
-    try:
-        e = make_embed(color, body)
-        e.title = title
-        await member.send(embed=e)
-    except Exception:
-        pass
-
-
-# ─── Kick ─────────────────────────────────────────────────────────────────────
-
-@bot.command(name="kick")
-@commands.has_permissions(kick_members=True)
-@commands.bot_has_permissions(kick_members=True)
-async def cmd_kick(ctx: commands.Context, member: discord.Member = None, *, reason: str = "No reason given."):
-    """Kick a member. Usage: .kick @user [reason]"""
-    if not member:
-        await ctx.send(embed=err("Usage: `.kick @user [reason]`")); return
-    guard = _mod_guard(ctx, member)
-    if guard:
-        await ctx.send(embed=err(guard)); return
-
-    await _dm_action(member,
-        "👢 You've Been Kicked",
-        f"You were kicked from **{ctx.guild.name}**.\n**Reason:** {reason}",
-        C_WARNING,
-    )
-    await member.kick(reason=f"{ctx.author} — {reason}")
-
-    e = ok(f"👢 **{member}** (`{member.id}`) has been kicked.\n**Reason:** {reason}")
-    e.title = "Member Kicked"
-    await ctx.send(embed=e)
-
-    config = await get_config(ctx.guild.id)
-    _log_mod_action(ctx.guild, config, "👢 Member Kicked",
-        f"**User:** {member.mention} (`{member.id}`)\n"
-        f"**Mod:** {ctx.author.mention}\n"
-        f"**Reason:** {reason}", C_WARNING)
-
-
-# ─── Ban ──────────────────────────────────────────────────────────────────────
-
-@bot.command(name="ban")
-@commands.has_permissions(ban_members=True)
-@commands.bot_has_permissions(ban_members=True)
-async def cmd_ban(ctx: commands.Context, member: discord.Member = None, *, reason: str = "No reason given."):
-    """Ban a member. Usage: .ban @user [reason]"""
-    if not member:
-        await ctx.send(embed=err("Usage: `.ban @user [reason]`")); return
-    guard = _mod_guard(ctx, member)
-    if guard:
-        await ctx.send(embed=err(guard)); return
-
-    await _dm_action(member,
-        "🔨 You've Been Banned",
-        f"You were banned from **{ctx.guild.name}**.\n**Reason:** {reason}",
-        C_ERROR,
-    )
-    await member.ban(delete_message_days=1, reason=f"{ctx.author} — {reason}")
-
-    e = make_embed(C_ERROR, f"🔨 **{member}** (`{member.id}`) has been banned.\n**Reason:** {reason}")
-    e.title = "Member Banned"
-    await ctx.send(embed=e)
-
-    config = await get_config(ctx.guild.id)
-    _log_mod_action(ctx.guild, config, "🔨 Member Banned",
-        f"**User:** {member.mention} (`{member.id}`)\n"
-        f"**Mod:** {ctx.author.mention}\n"
-        f"**Reason:** {reason}", C_ERROR)
-
-
-# ─── Unban ────────────────────────────────────────────────────────────────────
-
-@bot.command(name="unban")
-@commands.has_permissions(ban_members=True)
-@commands.bot_has_permissions(ban_members=True)
-async def cmd_unban(ctx: commands.Context, *, user_id_or_tag: str = ""):
-    """Unban a user by ID or User#1234 tag. Usage: .unban <id or User#1234>"""
-    if not user_id_or_tag:
-        await ctx.send(embed=err("Usage: `.unban <user_id or User#0000>`")); return
-
-    bans = [entry async for entry in ctx.guild.bans()]
-    target = None
-
-    if user_id_or_tag.isdigit():
-        target = next((e for e in bans if e.user.id == int(user_id_or_tag)), None)
-    else:
-        target = next((e for e in bans if str(e.user) == user_id_or_tag), None)
-
-    if not target:
-        await ctx.send(embed=err(f"No banned user found for `{user_id_or_tag}`."))
-        return
-
-    await ctx.guild.unban(target.user, reason=f"Unbanned by {ctx.author}")
-    e = ok(f"✅ **{target.user}** (`{target.user.id}`) has been unbanned.")
-    e.title = "Member Unbanned"
-    await ctx.send(embed=e)
-
-    config = await get_config(ctx.guild.id)
-    _log_mod_action(ctx.guild, config, "✅ Member Unbanned",
-        f"**User:** {target.user} (`{target.user.id}`)\n"
-        f"**Mod:** {ctx.author.mention}", C_SUCCESS)
-
-
-# ─── Softban (ban + immediate unban to wipe messages) ─────────────────────────
-
-@bot.command(name="softban")
-@commands.has_permissions(ban_members=True)
-@commands.bot_has_permissions(ban_members=True)
-async def cmd_softban(ctx: commands.Context, member: discord.Member = None, *, reason: str = "No reason given."):
-    """Softban: ban then immediately unban to delete messages. Usage: .softban @user [reason]"""
-    if not member:
-        await ctx.send(embed=err("Usage: `.softban @user [reason]`")); return
-    guard = _mod_guard(ctx, member)
-    if guard:
-        await ctx.send(embed=err(guard)); return
-
-    await _dm_action(member,
-        "🔄 You've Been Softbanned",
-        f"You were softbanned from **{ctx.guild.name}** (messages deleted, you can rejoin).\n**Reason:** {reason}",
-        C_WARNING,
-    )
-    await member.ban(delete_message_days=7, reason=f"Softban by {ctx.author} — {reason}")
-    await ctx.guild.unban(member, reason="Softban: immediate unban")
-
-    e = ok(f"🔄 **{member}** softbanned — messages wiped, can rejoin.\n**Reason:** {reason}")
-    e.title = "Softban"
-    await ctx.send(embed=e)
-
-    config = await get_config(ctx.guild.id)
-    _log_mod_action(ctx.guild, config, "🔄 Softban",
-        f"**User:** {member.mention} (`{member.id}`)\n"
-        f"**Mod:** {ctx.author.mention}\n"
-        f"**Reason:** {reason}", C_WARNING)
-
-
-# ─── Mute / Unmute (Discord timeout) ─────────────────────────────────────────
-
-_DURATION_RE = re.compile(r"(\d+)\s*([smhd])", re.I)
-
-def _parse_duration(text: str) -> Optional[timedelta]:
-    """Parse a duration string like '10m', '2h', '1d30m' into a timedelta."""
-    matches = _DURATION_RE.findall(text.strip())
-    if not matches:
-        return None
-    total = timedelta()
-    units = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
-    for amount, unit in matches:
-        total += timedelta(**{units[unit.lower()]: int(amount)})
-    return total if total.total_seconds() > 0 else None
-
-
-@bot.command(name="mute", aliases=["timeout", "to"])
-@commands.has_permissions(moderate_members=True)
-@commands.bot_has_permissions(moderate_members=True)
-async def cmd_mute(ctx: commands.Context, member: discord.Member = None, duration: str = "10m", *, reason: str = "No reason given."):
-    """
-    Mute (timeout) a member. Usage: .mute @user [duration] [reason]
-    Duration: 10s · 30m · 2h · 1d  (default: 10m, max: 28d)
-    """
-    if not member:
-        await ctx.send(embed=err("Usage: `.mute @user [10m] [reason]`")); return
-    guard = _mod_guard(ctx, member)
-    if guard:
-        await ctx.send(embed=err(guard)); return
-
-    delta = _parse_duration(duration)
-    if not delta:
-        # Maybe duration was omitted and it's part of the reason
-        reason  = f"{duration} {reason}".strip()
-        delta   = timedelta(minutes=10)
-        dur_str = "10m"
-    else:
-        max_delta = timedelta(days=28)
-        if delta > max_delta:
-            delta = max_delta
-        total_s = int(delta.total_seconds())
-        d, rem  = divmod(total_s, 86400)
-        h, rem  = divmod(rem, 3600)
-        m, s    = divmod(rem, 60)
-        dur_str = "".join([
-            f"{d}d" if d else "",
-            f"{h}h" if h else "",
-            f"{m}m" if m else "",
-            f"{s}s" if s else "",
-        ]) or "10m"
-
-    try:
-        await member.timeout(delta, reason=f"{ctx.author} — {reason}")
-    except discord.Forbidden:
-        await ctx.send(embed=err("Missing permissions to timeout that member.")); return
-    except discord.HTTPException as exc:
-        await ctx.send(embed=err(f"Failed: `{exc}`")); return
-
-    until_ts = int((datetime.now(timezone.utc) + delta).timestamp())
-    e = make_embed(C_WARNING,
-        f"🔇 **{member.mention}** has been muted for **{dur_str}**.\n"
-        f"**Reason:** {reason}\n"
-        f"**Expires:** <t:{until_ts}:R>"
-    )
-    e.title = "Member Muted"
-    await ctx.send(embed=e)
-
-    await _dm_action(member,
-        "🔇 You've Been Muted",
-        f"You were muted in **{ctx.guild.name}** for **{dur_str}**.\n**Reason:** {reason}\n**Expires:** <t:{until_ts}:R>",
-        C_WARNING,
-    )
-    config = await get_config(ctx.guild.id)
-    _log_mod_action(ctx.guild, config, "🔇 Member Muted",
-        f"**User:** {member.mention} (`{member.id}`)\n"
-        f"**Duration:** {dur_str}\n"
-        f"**Mod:** {ctx.author.mention}\n"
-        f"**Reason:** {reason}", C_WARNING)
-
-
-@bot.command(name="unmute", aliases=["untimeout"])
-@commands.has_permissions(moderate_members=True)
-@commands.bot_has_permissions(moderate_members=True)
-async def cmd_unmute(ctx: commands.Context, member: discord.Member = None, *, reason: str = "No reason given."):
-    """Remove a timeout from a member. Usage: .unmute @user [reason]"""
-    if not member:
-        await ctx.send(embed=err("Usage: `.unmute @user [reason]`")); return
-    if not member.is_timed_out():
-        await ctx.send(embed=err(f"{member.mention} isn't currently muted.")); return
-
-    try:
-        await member.timeout(None, reason=f"{ctx.author} — {reason}")
-    except discord.Forbidden:
-        await ctx.send(embed=err("Missing permissions to remove timeout.")); return
-
-    e = ok(f"🔊 **{member.mention}** has been unmuted.\n**Reason:** {reason}")
-    e.title = "Member Unmuted"
-    await ctx.send(embed=e)
-
-    config = await get_config(ctx.guild.id)
-    _log_mod_action(ctx.guild, config, "🔊 Member Unmuted",
-        f"**User:** {member.mention} (`{member.id}`)\n"
-        f"**Mod:** {ctx.author.mention}\n"
-        f"**Reason:** {reason}", C_SUCCESS)
-
-
-# ─── Slowmode ─────────────────────────────────────────────────────────────────
-
-@bot.command(name="slowmode", aliases=["slow"])
-@commands.has_permissions(manage_channels=True)
-@commands.bot_has_permissions(manage_channels=True)
-async def cmd_slowmode(ctx: commands.Context, delay: str = "off"):
-    """
-    Set slowmode on the current channel. Usage: .slowmode [off|0|10s|1m]
-    off / 0 = disable.  Max: 6h.
-    """
-    if delay.lower() in ("off", "0", "none"):
-        await ctx.channel.edit(slowmode_delay=0)
-        await ctx.send(embed=ok(f"⚡ Slowmode **disabled** in {ctx.channel.mention}."))
-        return
-
-    delta = _parse_duration(delay)
-    if not delta:
-        await ctx.send(embed=err("Usage: `.slowmode off` or `.slowmode 30s` / `1m` / `6h`")); return
-
-    secs = int(delta.total_seconds())
-    if secs > 21600:
-        secs = 21600
-    await ctx.channel.edit(slowmode_delay=secs)
-
-    h, rem = divmod(secs, 3600); m, s = divmod(rem, 60)
-    dur_str = "".join([f"{h}h" if h else "", f"{m}m" if m else "", f"{s}s" if (s or not h and not m) else ""])
-    e = ok(f"🐢 Slowmode set to **{dur_str}** in {ctx.channel.mention}.")
-    await ctx.send(embed=e)
-
-
-# ─── Lock / Unlock (single channel) ──────────────────────────────────────────
-
-@bot.command(name="lock")
-@commands.has_permissions(manage_channels=True)
-@commands.bot_has_permissions(manage_channels=True)
-async def cmd_lock(ctx: commands.Context, channel: discord.TextChannel = None, *, reason: str = "No reason given."):
-    """Lock a channel so @everyone can't send messages. Usage: .lock [#channel] [reason]"""
-    target = channel or ctx.channel
-    overwrite = target.overwrites_for(ctx.guild.default_role)
-    overwrite.send_messages = False
-    await target.set_permissions(ctx.guild.default_role, overwrite=overwrite,
-                                 reason=f"{ctx.author} — {reason}")
-    e = make_embed(C_ERROR, f"🔒 {target.mention} has been **locked**.\n**Reason:** {reason}")
-    e.title = "Channel Locked"
-    await ctx.send(embed=e)
-
-    config = await get_config(ctx.guild.id)
-    _log_mod_action(ctx.guild, config, "🔒 Channel Locked",
-        f"**Channel:** {target.mention}\n**Mod:** {ctx.author.mention}\n**Reason:** {reason}", C_WARNING)
-
-
-@bot.command(name="unlock")
-@commands.has_permissions(manage_channels=True)
-@commands.bot_has_permissions(manage_channels=True)
-async def cmd_unlock(ctx: commands.Context, channel: discord.TextChannel = None, *, reason: str = "Unlocked."):
-    """Unlock a channel. Usage: .unlock [#channel] [reason]"""
-    target = channel or ctx.channel
-    overwrite = target.overwrites_for(ctx.guild.default_role)
-    overwrite.send_messages = None   # reset to default (inherit)
-    await target.set_permissions(ctx.guild.default_role, overwrite=overwrite,
-                                 reason=f"{ctx.author} — {reason}")
-    e = ok(f"🔓 {target.mention} has been **unlocked**.")
-    e.title = "Channel Unlocked"
-    await ctx.send(embed=e)
-
-    config = await get_config(ctx.guild.id)
-    _log_mod_action(ctx.guild, config, "🔓 Channel Unlocked",
-        f"**Channel:** {target.mention}\n**Mod:** {ctx.author.mention}", C_SUCCESS)
-
-
-# ─── Lockdown / End Lockdown (entire server) ─────────────────────────────────
-
-@bot.command(name="lockdown")
-@commands.has_permissions(administrator=True)
-@commands.bot_has_permissions(manage_channels=True)
-async def cmd_lockdown(ctx: commands.Context, *, reason: str = "Emergency lockdown."):
-    """
-    Lock ALL public text channels server-wide. Usage: .lockdown [reason]
-    Undo with .endlockdown
-    """
-    msg = await ctx.send(embed=make_embed(C_ERROR, "🔒 Locking down all channels…"))
-    locked = 0
-    for ch in ctx.guild.text_channels:
-        ow = ch.overwrites_for(ctx.guild.default_role)
-        if ow.send_messages is not False:
-            try:
-                ow.send_messages = False
-                await ch.set_permissions(ctx.guild.default_role, overwrite=ow,
-                                         reason=f"Lockdown by {ctx.author} — {reason}")
-                locked += 1
-            except Exception:
-                pass
-
-    e = make_embed(C_ERROR,
-        f"🔒 **Server Lockdown Active**\n"
-        f"**{locked}** channels locked.\n"
-        f"**Reason:** {reason}\n"
-        f"**Initiated by:** {ctx.author.mention}\n\n"
-        f"Use `.endlockdown` to lift."
-    )
-    e.title = "🚨 LOCKDOWN"
-    await msg.edit(embed=e)
-
-    config = await get_config(ctx.guild.id)
-    _log_mod_action(ctx.guild, config, "🚨 Server Lockdown",
-        f"**Channels locked:** {locked}\n"
-        f"**By:** {ctx.author.mention}\n"
-        f"**Reason:** {reason}", C_ERROR)
-
-
-@bot.command(name="endlockdown", aliases=["unlockdown", "liftlockdown"])
-@commands.has_permissions(administrator=True)
-@commands.bot_has_permissions(manage_channels=True)
-async def cmd_endlockdown(ctx: commands.Context):
-    """Lift a server lockdown — re-allows @everyone to send in all channels."""
-    msg = await ctx.send(embed=make_embed(C_INFO, "🔓 Lifting lockdown…"))
-    unlocked = 0
-    for ch in ctx.guild.text_channels:
-        ow = ch.overwrites_for(ctx.guild.default_role)
-        if ow.send_messages is False:
-            try:
-                ow.send_messages = None
-                await ch.set_permissions(ctx.guild.default_role, overwrite=ow,
-                                         reason=f"Lockdown lifted by {ctx.author}")
-                unlocked += 1
-            except Exception:
-                pass
-
-    e = ok(f"🔓 Lockdown lifted — **{unlocked}** channels unlocked.")
-    e.title = "Lockdown Lifted"
-    await msg.edit(embed=e)
-
-    config = await get_config(ctx.guild.id)
-    _log_mod_action(ctx.guild, config, "🔓 Lockdown Lifted",
-        f"**Channels unlocked:** {unlocked}\n**By:** {ctx.author.mention}", C_SUCCESS)
-
-
-# ─── Nick ────────────────────────────────────────────────────────────────────
-
-@bot.command(name="nick", aliases=["nickname"])
-@commands.has_permissions(manage_nicknames=True)
-@commands.bot_has_permissions(manage_nicknames=True)
-async def cmd_nick(ctx: commands.Context, member: discord.Member = None, *, new_nick: str = ""):
-    """
-    Change or reset a member's nickname. Usage: .nick @user [new nickname]
-    Leave nickname blank to reset.
-    """
-    if not member:
-        await ctx.send(embed=err("Usage: `.nick @user [new nickname]`")); return
-    if member.top_role >= ctx.guild.me.top_role and ctx.author.id != ctx.guild.owner_id:
-        await ctx.send(embed=err("I can't change that member's nickname — their role is too high.")); return
-
-    old_nick = member.display_name
-    new      = new_nick.strip() or None   # None = reset
-    try:
-        await member.edit(nick=new, reason=f"Nick change by {ctx.author}")
-    except discord.Forbidden:
-        await ctx.send(embed=err("Missing permissions to change that nickname.")); return
-
-    if new:
-        e = ok(f"✏️ **{old_nick}** → **{new}** for {member.mention}")
-    else:
-        e = ok(f"✏️ Nickname reset for {member.mention} (back to `{member.name}`)")
-    e.title = "Nickname Changed"
-    await ctx.send(embed=e)
-
-    config = await get_config(ctx.guild.id)
-    _log_mod_action(ctx.guild, config, "✏️ Nickname Changed",
-        f"**User:** {member.mention}\n**Before:** {old_nick}\n**After:** {new or member.name}\n"
-        f"**By:** {ctx.author.mention}", C_INFO)
-
-
-# ─── Move (voice) ────────────────────────────────────────────────────────────
-
-@bot.command(name="move", aliases=["vmove"])
-@commands.has_permissions(move_members=True)
-@commands.bot_has_permissions(move_members=True)
-async def cmd_move(ctx: commands.Context, member: discord.Member = None, *, channel_name: str = ""):
-    """
-    Move a member to a different voice channel. Usage: .move @user <channel name or ID>
-    """
-    if not member or not channel_name:
-        await ctx.send(embed=err("Usage: `.move @user <voice channel name or ID>`")); return
-    if not member.voice or not member.voice.channel:
-        await ctx.send(embed=err(f"{member.mention} isn't in a voice channel.")); return
-
-    # Resolve by ID first, then name (case-insensitive)
-    dest: Optional[discord.VoiceChannel] = None
-    if channel_name.strip().isdigit():
-        dest = ctx.guild.get_channel(int(channel_name.strip()))
-    if not dest:
-        cn_lower = channel_name.lower().strip()
-        dest = next(
-            (c for c in ctx.guild.voice_channels if c.name.lower() == cn_lower), None
-        ) or next(
-            (c for c in ctx.guild.voice_channels if cn_lower in c.name.lower()), None
-        )
-
-    if not dest or not isinstance(dest, discord.VoiceChannel):
-        await ctx.send(embed=err(f"Couldn't find voice channel `{channel_name}`."))
-        return
-
-    await member.move_to(dest, reason=f"Moved by {ctx.author}")
-    e = ok(f"🎙️ **{member.display_name}** moved to **{dest.name}**.")
-    e.title = "Member Moved"
-    await ctx.send(embed=e)
-
-    config = await get_config(ctx.guild.id)
-    _log_mod_action(ctx.guild, config, "🎙️ Voice Move",
-        f"**User:** {member.mention}\n**To:** #{dest.name}\n**By:** {ctx.author.mention}", C_INFO)
-
-
-# ─── Mass-kick (requires confirmation) ───────────────────────────────────────
-
-# Pending masskick confirmations: {author_id: {"members": [...], "reason": str, "expires": float}}
-_masskick_pending: dict[int, dict] = {}
-
-@bot.command(name="masskick", aliases=["mkick"], hidden=True)
-@commands.has_permissions(kick_members=True)
-@commands.bot_has_permissions(kick_members=True)
-async def cmd_masskick(ctx: commands.Context, *members_raw: str):
-    """
-    Kick multiple members at once. Usage: .masskick @user1 @user2 … [reason: ...]
-    Requires confirmation within 30s.  Owner only.
-    """
-    if ctx.author.id != bot.owner_id_int and not ctx.author.guild_permissions.administrator:
-        return  # silently ignore
-
-    # Split off reason if provided as "reason: ..."
-    reason = "Mass kick"
-    raw_list = list(members_raw)
-    for i, tok in enumerate(raw_list):
-        if tok.lower().startswith("reason:"):
-            reason = " ".join(raw_list[i:])[7:].strip()
-            raw_list = raw_list[:i]
-            break
-
-    # Resolve members
-    targets: list[discord.Member] = []
-    for tok in raw_list:
-        uid = re.sub(r"[<@!>]", "", tok)
-        if uid.isdigit():
-            m = ctx.guild.get_member(int(uid))
-            if m and not m.bot:
-                guard = _mod_guard(ctx, m)
-                if not guard:
-                    targets.append(m)
-
-    if not targets:
-        await ctx.send(embed=err("No valid, actionable members found. Mention them with @user.")); return
-
-    # Store pending and ask for confirmation
-    _masskick_pending[ctx.author.id] = {
-        "members": targets,
-        "reason":  reason,
-        "expires": time.monotonic() + 30,
-    }
-    names = ", ".join(m.display_name for m in targets)
-    e = make_embed(C_ERROR,
-        f"⚠️ You're about to kick **{len(targets)} member(s)**: {names}\n"
-        f"**Reason:** {reason}\n\n"
-        f"Type `.confirmkick` within **30 seconds** to proceed, or ignore to cancel."
-    )
-    e.title = "⚠️ Mass Kick — Confirmation Required"
-    await ctx.send(embed=e)
-
-
-@bot.command(name="confirmkick", hidden=True)
-async def cmd_confirmkick(ctx: commands.Context):
-    """Confirm a pending masskick."""
-    pending = _masskick_pending.pop(ctx.author.id, None)
-    if not pending:
-        await ctx.send(embed=err("No pending mass kick. Run `.masskick` first.")); return
-    if time.monotonic() > pending["expires"]:
-        await ctx.send(embed=err("Confirmation window expired (30s). Run `.masskick` again.")); return
-
-    targets = pending["members"]
-    reason  = pending["reason"]
-    msg     = await ctx.send(embed=make_embed(C_ERROR, f"Kicking {len(targets)} members…"))
-    kicked = 0; failed = 0
-    for m in targets:
-        try:
-            await _dm_action(m, "👢 You've Been Kicked",
-                f"You were kicked from **{ctx.guild.name}**.\n**Reason:** {reason}", C_WARNING)
-            await m.kick(reason=f"{ctx.author} — {reason}")
-            kicked += 1
-        except Exception:
-            failed += 1
-
-    e = make_embed(C_ERROR if failed else C_SUCCESS,
-        f"✅ Kicked **{kicked}** member(s)." +
-        (f"\n⚠️ Failed: {failed}" if failed else "")
-    )
-    e.title = "Mass Kick Complete"
-    await msg.edit(embed=e)
-    config = await get_config(ctx.guild.id)
-    _log_mod_action(ctx.guild, config, "👢 Mass Kick",
-        f"**Kicked:** {kicked} | **Failed:** {failed}\n**By:** {ctx.author.mention}\n**Reason:** {reason}",
-        C_ERROR)
 
 
 # ─── Daily XP (v23) ───────────────────────────────────────────────────────────
@@ -7079,14 +6954,14 @@ async def cmd_setup(ctx: commands.Context):
 @bot.command(name="about", aliases=["info"])
 async def cmd_about(ctx: commands.Context):
     e = make_embed(C_AI)
-    e.title       = "LXTE's AI v19"
+    e.title       = "LXTE's AI v23"
     e.description = "Built by AJ. Smart AI with real-time web search, leveling, giveaways, tickets, multi-select setup, reaction roles, automod, anti-raid, boost tracking, invite tracking, analytics."
     e.set_thumbnail(url=bot.user.display_avatar.url if bot.user else None)
     e.add_field(name="Prefix",   value="`.`",                  inline=True)
     e.add_field(name="Memory",   value="Per channel, 14 days", inline=True)
     e.add_field(name="Cooldown", value="5s",                   inline=True)
     e.add_field(name="Real-time", value="🌐 Web search · ☁️ Weather · 💹 Crypto · 🎮 Roblox", inline=False)
-    e.set_footer(text=f"{len(bot.guilds)} server(s)  •  Built by AJ  •  v19")
+    e.set_footer(text=f"{len(bot.guilds)} server(s)  •  Built by AJ  •  v23")
     await ctx.send(embed=e)
 
 
@@ -7094,6 +6969,7 @@ async def cmd_about(ctx: commands.Context):
 
 @bot.command(name="gstart")
 @commands.has_permissions(manage_guild=True)
+@commands.cooldown(rate=1, per=10, type=commands.BucketType.guild)
 async def cmd_gstart(ctx: commands.Context, duration: str = None, *, prize: str = None):
     if not duration or not prize:
         await ctx.send(embed=err("Usage: `.gstart <time> <prize>`\nExample: `.gstart 1h Robux`")); return
@@ -7295,6 +7171,7 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
 
     elif action == "resetxp" and args:
         try:
+            if not ctx.guild: await ctx.send(embed=err("Server only.")); return
             uid = int(re.sub(r"[<@!>]", "", args[0]))
             await bot.db.reset_xp(uid, ctx.guild.id)
             await ctx.send(embed=ok(f"Reset XP for `{uid}`."))
@@ -7332,7 +7209,9 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
     elif action == "unlockraid":
         for guild in bot.guilds:
             await _unlock_server(guild)
-            _raid_active[guild.id] = False; _join_timestamps[guild.id].clear()
+            _raid_active[guild.id] = False
+            _nuke_active[guild.id] = False
+            _join_timestamps[guild.id].clear()
         await ctx.send(embed=ok("All servers unlocked."))
 
     elif action == "backup":
@@ -7513,6 +7392,310 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
         ))
 
 
+# ─── Ping ─────────────────────────────────────────────────────────────────────
+
+@bot.command(name="ping")
+async def cmd_ping(ctx: commands.Context):
+    """Check if the bot is alive. Shows latency and prefix."""
+    latency = round(bot.latency * 1000)
+    filled  = min(int(latency / 20), 10)
+    bar     = "▓" * filled + "░" * (10 - filled)
+    color   = C_SUCCESS if latency < 100 else (C_WARNING if latency < 250 else C_ERROR)
+    e = make_embed(color,
+        f"🏓 **Pong!**  `{latency}ms` `[{bar}]`\n\n"
+        f"**Prefix:** `.`\n"
+        f"**Commands:** `.help` to see everything\n"
+        f"**Examples:** `.ask <question>` · `.level` · `.warn @user reason`"
+    )
+    e.title = "🤖 LXTE's AI — Online"
+    e.set_footer(text=f"Uptime: {format_uptime(bot.start_time)}")
+    await ctx.send(embed=e)
+
+
+# ─── Slowmode ─────────────────────────────────────────────────────────────────
+
+@bot.command(name="slowmode", aliases=["slow"])
+@commands.has_permissions(manage_channels=True)
+async def cmd_slowmode(ctx: commands.Context, seconds: int = 0):
+    """Set channel slowmode. .slowmode 5 = 5s delay. .slowmode 0 = off."""
+    if seconds < 0 or seconds > 21600:
+        await ctx.send(embed=err("Slowmode must be between 0 and 21600 seconds (6 hours).")); return
+    await ctx.channel.edit(slowmode_delay=seconds, reason=f"Slowmode set by {ctx.author}")
+    if seconds == 0:
+        await ctx.send(embed=ok(f"✅ Slowmode **disabled** in {ctx.channel.mention}."))
+    else:
+        m, s = divmod(seconds, 60); h, m = divmod(m, 60)
+        parts = [p for p in [f"{h}h", f"{m}m", f"{s}s"] if p[0] != "0"]
+        await ctx.send(embed=ok(f"⏱️ Slowmode set to **{' '.join(parts) or f'{seconds}s'}** in {ctx.channel.mention}."))
+
+
+# ─── Kick ──────────────────────────────────────────────────────────────────────
+
+@bot.command(name="kick")
+@commands.has_permissions(kick_members=True)
+async def cmd_kick(ctx: commands.Context, member: discord.Member = None, *, reason: str = "No reason given."):
+    """Kick a member. Requires kick_members permission. Usage: .kick @user [reason]"""
+    if not member:
+        await ctx.send(embed=err("Usage: `.kick @user [reason]`")); return
+    if member.bot:
+        await ctx.send(embed=err("Can't kick bots with this command.")); return
+    if member.id == ctx.author.id:
+        await ctx.send(embed=err("You can't kick yourself.")); return
+    if member.id == ctx.guild.owner_id:
+        await ctx.send(embed=err("The server owner cannot be kicked.")); return
+    if member.top_role >= ctx.guild.me.top_role:
+        await ctx.send(embed=err("I can't kick that member — their highest role is above mine.")); return
+    if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+        await ctx.send(embed=err("You can't kick someone with an equal or higher role than you.")); return
+    try:
+        dm = make_embed(C_ERROR, f"You were **kicked** from **{ctx.guild.name}**.\n**Reason:** {reason}")
+        dm.title = "👢 You've Been Kicked"
+        await member.send(embed=dm)
+    except Exception: pass
+    try:
+        await member.kick(reason=f"By {ctx.author}: {reason}")
+    except discord.Forbidden:
+        await ctx.send(embed=err("I don't have permission to kick that member.")); return
+    case_num = await bot.db.add_case(ctx.guild.id, "kick", ctx.author.id, member.id, reason)
+    e = make_embed(C_WARNING,
+        f"**{member.display_name}** (`{member.id}`) has been kicked.\n"
+        f"**Reason:** {reason}\n**Case:** #{case_num}")
+    e.title = "👢 Member Kicked"
+    await ctx.send(embed=e)
+    config = await get_config(ctx.guild.id)
+    _log_mod_action(ctx.guild, config, "👢 Member Kicked",
+        f"**User:** {member} (`{member.id}`)\n**Mod:** {ctx.author.mention}\n"
+        f"**Reason:** {reason}\n**Case:** #{case_num}", C_WARNING)
+
+
+# ─── Ban ───────────────────────────────────────────────────────────────────────
+
+@bot.command(name="ban")
+@commands.has_permissions(ban_members=True)
+async def cmd_ban(ctx: commands.Context, member: discord.Member = None, *, reason: str = "No reason given."):
+    """Ban a member. Requires ban_members permission. Usage: .ban @user [reason]"""
+    if not member:
+        await ctx.send(embed=err("Usage: `.ban @user [reason]`")); return
+    if member.bot:
+        await ctx.send(embed=err("Can't ban bots with this command.")); return
+    if member.id == ctx.author.id:
+        await ctx.send(embed=err("You can't ban yourself.")); return
+    if member.id == ctx.guild.owner_id:
+        await ctx.send(embed=err("The server owner cannot be banned.")); return
+    if member.top_role >= ctx.guild.me.top_role:
+        await ctx.send(embed=err("I can't ban that member — their highest role is above mine.")); return
+    if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+        await ctx.send(embed=err("You can't ban someone with an equal or higher role than you.")); return
+    try:
+        dm = make_embed(C_ERROR, f"You were **banned** from **{ctx.guild.name}**.\n**Reason:** {reason}")
+        dm.title = "🔨 You've Been Banned"
+        await member.send(embed=dm)
+    except Exception: pass
+    try:
+        await member.ban(reason=f"By {ctx.author}: {reason}", delete_message_days=0)
+    except discord.Forbidden:
+        await ctx.send(embed=err("I don't have permission to ban that member.")); return
+    case_num = await bot.db.add_case(ctx.guild.id, "ban", ctx.author.id, member.id, reason)
+    e = make_embed(C_ERROR,
+        f"**{member.display_name}** (`{member.id}`) has been banned.\n"
+        f"**Reason:** {reason}\n**Case:** #{case_num}")
+    e.title = "🔨 Member Banned"
+    await ctx.send(embed=e)
+    config = await get_config(ctx.guild.id)
+    _log_mod_action(ctx.guild, config, "🔨 Member Banned",
+        f"**User:** {member} (`{member.id}`)\n**Mod:** {ctx.author.mention}\n"
+        f"**Reason:** {reason}\n**Case:** #{case_num}", C_ERROR)
+
+
+# ─── Unban ─────────────────────────────────────────────────────────────────────
+
+@bot.command(name="unban")
+@commands.has_permissions(ban_members=True)
+async def cmd_unban(ctx: commands.Context, user_id: int = None, *, reason: str = "No reason given."):
+    """Unban a user by ID. Usage: .unban <user_id> [reason]"""
+    if not user_id:
+        await ctx.send(embed=err("Usage: `.unban <user_id> [reason]`")); return
+    try:
+        user = discord.Object(id=user_id)
+        await ctx.guild.unban(user, reason=f"By {ctx.author}: {reason}")
+        case_num = await bot.db.add_case(ctx.guild.id, "unban", ctx.author.id, user_id, reason)
+        e = make_embed(C_SUCCESS,
+            f"User `{user_id}` has been unbanned.\n"
+            f"**Reason:** {reason}\n**Case:** #{case_num}")
+        e.title = "🔓 Member Unbanned"
+        await ctx.send(embed=e)
+        config = await get_config(ctx.guild.id)
+        _log_mod_action(ctx.guild, config, "🔓 Member Unbanned",
+            f"**User ID:** `{user_id}`\n**Mod:** {ctx.author.mention}\n**Reason:** {reason}", C_SUCCESS)
+    except discord.NotFound:
+        await ctx.send(embed=err(f"No ban found for user ID `{user_id}`."))
+    except discord.Forbidden:
+        await ctx.send(embed=err("I don't have permission to unban members."))
+
+
+# ─── Temp-Mute ─────────────────────────────────────────────────────────────────
+
+@bot.command(name="tempmute", aliases=["mute", "tm"])
+@commands.has_permissions(moderate_members=True)
+async def cmd_tempmute(ctx: commands.Context, member: discord.Member = None, duration: str = None, *, reason: str = "No reason given."):
+    """Temp-mute (timeout) a member with auto-expiry.
+    Usage: .tempmute @user 10m [reason]
+    Duration: 5m, 1h, 2h30m, 1d"""
+    if not member or not duration:
+        await ctx.send(embed=err(
+            "Usage: `.tempmute @user <duration> [reason]`\n"
+            "**Examples:**\n"
+            "`.tempmute @user 10m Spamming`\n"
+            "`.tempmute @user 1h Bad behaviour`\n"
+            "`.tempmute @user 1d Repeated violations`"
+        )); return
+    if member.bot:
+        await ctx.send(embed=err("Can't mute bots.")); return
+    if member.id == ctx.author.id:
+        await ctx.send(embed=err("You can't mute yourself.")); return
+    if member.id == ctx.guild.owner_id:
+        await ctx.send(embed=err("The server owner cannot be muted.")); return
+    if member.top_role >= ctx.guild.me.top_role:
+        await ctx.send(embed=err("I can't mute that member — their role is too high.")); return
+    if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+        await ctx.send(embed=err("You can't mute someone with an equal or higher role than you.")); return
+    secs = parse_duration(duration)
+    if not secs or secs <= 0:
+        await ctx.send(embed=err("Invalid duration. Examples: `5m`, `1h`, `2h30m`, `1d`")); return
+    if secs > 86400 * 28:
+        await ctx.send(embed=err("Max mute duration is 28 days (Discord limit).")); return
+    until = datetime.now(timezone.utc) + timedelta(seconds=secs)
+    try:
+        await member.timeout(timedelta(seconds=secs), reason=f"Tempmute by {ctx.author}: {reason}")
+    except discord.Forbidden:
+        await ctx.send(embed=err("I don't have permission to timeout that member.")); return
+    await bot.db.add_tempmute(ctx.guild.id, member.id, ctx.author.id, reason, until)
+    case_num = await bot.db.add_case(ctx.guild.id, "tempmute", ctx.author.id, member.id, reason,
+                                      {"duration_secs": secs, "unmute_at": until})
+    # Format duration
+    m2, s2 = divmod(secs, 60); h2, m2 = divmod(m2, 60); d2, h2 = divmod(h2, 24)
+    parts = [p for p in [f"{d2}d", f"{h2}h", f"{m2}m", f"{s2}s"] if not p.startswith("0")]
+    dur_str = " ".join(parts) or f"{secs}s"
+    e = make_embed(C_WARNING,
+        f"**{member.mention}** has been muted for **{dur_str}**.\n"
+        f"**Reason:** {reason}\n"
+        f"**Auto-unmutes:** <t:{int(until.timestamp())}:R>\n"
+        f"**Case:** #{case_num}")
+    e.title = "🔇 Member Temp-Muted"
+    await ctx.send(embed=e)
+    try:
+        dm = make_embed(C_WARNING,
+            f"You were **temp-muted** in **{ctx.guild.name}** for **{dur_str}**.\n"
+            f"**Reason:** {reason}\n**Auto-unmutes:** <t:{int(until.timestamp())}:R>")
+        dm.title = "🔇 You've Been Muted"
+        await member.send(embed=dm)
+    except Exception: pass
+    config = await get_config(ctx.guild.id)
+    _log_mod_action(ctx.guild, config, "🔇 Temp-Mute Applied",
+        f"**User:** {member.mention} (`{member.id}`)\n**Mod:** {ctx.author.mention}\n"
+        f"**Duration:** {dur_str}\n**Reason:** {reason}\n"
+        f"**Unmutes:** <t:{int(until.timestamp())}:R>\n**Case:** #{case_num}", C_WARNING)
+
+
+# ─── Unmute ────────────────────────────────────────────────────────────────────
+
+@bot.command(name="unmute")
+@commands.has_permissions(moderate_members=True)
+async def cmd_unmute(ctx: commands.Context, member: discord.Member = None, *, reason: str = "Manually unmuted."):
+    """Remove a mute/timeout from a member. Usage: .unmute @user"""
+    if not member:
+        await ctx.send(embed=err("Usage: `.unmute @user [reason]`")); return
+    try:
+        await member.timeout(None, reason=f"Unmuted by {ctx.author}: {reason}")
+        await bot.db.remove_tempmute(ctx.guild.id, member.id)
+        case_num = await bot.db.add_case(ctx.guild.id, "unmute", ctx.author.id, member.id, reason)
+        e = make_embed(C_SUCCESS,
+            f"**{member.mention}** has been unmuted.\n**Reason:** {reason}\n**Case:** #{case_num}")
+        e.title = "🔊 Member Unmuted"
+        await ctx.send(embed=e)
+        config = await get_config(ctx.guild.id)
+        _log_mod_action(ctx.guild, config, "🔊 Unmuted",
+            f"**User:** {member.mention}\n**Mod:** {ctx.author.mention}\n**Reason:** {reason}", C_SUCCESS)
+    except discord.Forbidden:
+        await ctx.send(embed=err("I don't have permission to remove that member's timeout."))
+
+
+# ─── Case System ───────────────────────────────────────────────────────────────
+
+_CASE_EMOJIS = {
+    "warn": "⚠️", "kick": "👢", "ban": "🔨",
+    "unban": "🔓", "tempmute": "🔇", "unmute": "🔊",
+}
+
+@bot.command(name="case")
+@commands.has_permissions(manage_messages=True)
+async def cmd_case(ctx: commands.Context, num: int = None):
+    """Look up a mod case by number. Usage: .case 12"""
+    if num is None:
+        await ctx.send(embed=err("Usage: `.case <number>`\nExample: `.case 12`")); return
+    case = await bot.db.get_case(ctx.guild.id, num)
+    if not case:
+        await ctx.send(embed=err(f"No case #{num} found in this server.")); return
+    action  = case.get("action", "?")
+    mod     = ctx.guild.get_member(case.get("mod_id", 0))
+    target  = ctx.guild.get_member(case.get("target_id", 0))
+    emoji   = _CASE_EMOJIS.get(action, "📋")
+    created = case.get("created_at")
+    ts_str  = f"<t:{int(created.timestamp())}:F>" if created else "unknown"
+    target_str = target.mention if target else f"ID: `{case.get('target_id', '?')}`  *(left server)*"
+    mod_str    = mod.mention if mod else f"ID: `{case.get('mod_id', '?')}`  *(left server)*"
+    e = make_embed(C_INFO,
+        f"**Action:** {emoji} {action.title()}\n"
+        f"**Target:** {target_str}\n"
+        f"**Moderator:** {mod_str}\n"
+        f"**Reason:** {case.get('reason', 'No reason given.')}\n"
+        f"**Date:** {ts_str}"
+    )
+    if action == "tempmute":
+        secs = case.get("duration_secs", 0)
+        m2, s2 = divmod(secs, 60); h2, m2 = divmod(m2, 60); d2, h2 = divmod(h2, 24)
+        dur_parts = [p for p in [f"{d2}d", f"{h2}h", f"{m2}m", f"{s2}s"] if not p.startswith("0")]
+        e.add_field(name="Duration", value=" ".join(dur_parts) or "?", inline=True)
+        unmute_at = case.get("unmute_at")
+        if unmute_at:
+            e.add_field(name="Unmuted at", value=f"<t:{int(unmute_at.timestamp())}:R>", inline=True)
+    e.title = f"📋 Case #{num}"
+    e.set_footer(text="LXTE's AI — Case System")
+    await ctx.send(embed=e)
+
+
+# ─── History ───────────────────────────────────────────────────────────────────
+
+@bot.command(name="history", aliases=["modhistory", "mh"])
+@commands.has_permissions(manage_messages=True)
+async def cmd_history(ctx: commands.Context, member: discord.Member = None):
+    """Show all mod actions against a user. Usage: .history @user"""
+    if not member:
+        await ctx.send(embed=err("Usage: `.history @user`")); return
+    cases = await bot.db.get_user_cases(ctx.guild.id, member.id, 20)
+    if not cases:
+        await ctx.send(embed=make_embed(C_SUCCESS,
+            f"**{member.display_name}** has a clean record — no mod actions found. ✅")); return
+    lines = []
+    for c in cases:
+        action  = c.get("action", "?")
+        emoji   = _CASE_EMOJIS.get(action, "📋")
+        mod     = ctx.guild.get_member(c.get("mod_id", 0))
+        mod_str = mod.display_name if mod else f"`{c.get('mod_id', '?')}`"
+        created = c.get("created_at")
+        ts_str  = f"<t:{int(created.timestamp())}:d>" if created else "?"
+        reason  = (c.get("reason") or "?")[:60]
+        lines.append(
+            f"{emoji} **#{c['case_number']}** {action.title()} by {mod_str} — {ts_str}\n"
+            f"> {reason}"
+        )
+    e = make_embed(C_WARNING, "\n".join(lines))
+    e.title = f"📋 Mod History — {member.display_name}  ({len(cases)} action{'s' if len(cases) != 1 else ''})"
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.set_footer(text="LXTE's AI — Showing last 20 actions • use .case <num> for details")
+    await ctx.send(embed=e)
+
+
 # ─── Slash: /level ────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="level", description="View your rank card")
@@ -7544,7 +7727,7 @@ async def _startup():
     owner_id  = os.environ.get("OWNER_ID")
     raw_keys  = [os.environ.get(f"GROQ_API_KEY_{i}") for i in range(1, 6)]
     groq_keys = list(dict.fromkeys(k for k in raw_keys if k))
-    missing   = [n for n, v in [("DISCORD_TOKEN", token), ("AI_API_KEY_1 (or GROQ_API_KEY_1)", groq_keys), ("MONGO_URI", mongo_uri), ("OWNER_ID", owner_id)] if not v]
+    missing   = [n for n, v in [("DISCORD_TOKEN", token), ("GROQ_API_KEY_1", groq_keys or None), ("MONGO_URI", mongo_uri), ("OWNER_ID", owner_id)] if not v]
     if missing: raise EnvironmentError(f"Missing env vars: {', '.join(missing)}")
     try: int(owner_id)
     except ValueError: raise EnvironmentError("OWNER_ID must be an integer.")
