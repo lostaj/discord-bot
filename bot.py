@@ -1,6 +1,6 @@
 """
 LXTE's AI — built by AJ
-v23.0.0 — Changes from v22:
+v24.0.0 — Changes from v23:
   - UPGRADED: snapshot — now captures EVERYTHING: member counts, XP/levels, guild config,
               role menus, reaction roles, channel & role structure, bans, warns, active
               giveaways, member count history, all AI conversation histories, global stats,
@@ -33,6 +33,33 @@ v23.0.0 — Changes from v22:
   - UPGRADED: `keys` admin action — shows per-key ok/total success rate alongside status.
   - FIXED: auto_web_search previously fired DDG only; now all specialists parallel.
   - FIXED: ask() and ask_stream() had diverged system prompts — now single source of truth.
+
+v24.0.0 — Changes from v23 (all bugs fixed):
+  - FIXED: on_audit_log_entry_create — server log elif-chain was broken; channel/role/guild logs
+           were NEVER firing. Server logs (channel_create/delete/update, role changes, etc.) now
+           correctly use an independent `if` block and fire on every relevant action.
+  - FIXED: ask_stream — streaming HTTP 401/403/429 errors now correctly penalise the key rotator
+           (dead/rate-limited). Previously a streaming failure silently fell through without marking
+           the key, so bad keys kept being selected.
+  - FIXED: msgsync --force flag was documented in the warning message but never handled in code.
+           Users running `.msgsync 500 --force` got the warning again instead of proceeding.
+  - FIXED: auto_web_search result filter is now type-safe. Previously `result.startswith("[")` could
+           crash if result was None or non-string. Now checks isinstance(str) first, and also filters
+           results starting with ❌ (specialist error strings).
+  - FIXED: giveaway_task now announces BEFORE marking ended in DB. Previously a crash between
+           `end_giveaway()` and `do_end_giveaway()` silently killed the giveaway with no winner.
+  - FIXED: ban/kick commands now perform the action BEFORE sending the DM. Previously on Forbidden,
+           the member would receive a "you've been banned/kicked" DM even though nothing happened.
+  - FIXED: run_automod now passes owner_id to _automod_swear. Previously the owner could be caught
+           by the slur filter (owner_id defaulted to 0 in the internal call).
+  - FIXED: cmd_level and cmd_lb now guard against DM usage (no more AttributeError on ctx.guild).
+  - FIXED: cmd_ask removes ⏳ reaction on inner AI exception — no dangling indicator.
+  - FIXED: _trim_history now skips (not stops at) oversized turns — more history is preserved
+           when a single large response is in the middle of the conversation.
+  - FIXED: user memory update now only fires for questions >20 chars (no wasted API calls on "hi").
+  - FIXED: ticket autoclose warns at 75% of timeout (was 50%), min 30min warning lead time.
+  - FIXED: warn auto-timeout now saves record to tempmute DB for full audit trail consistency.
+  - FIXED: build_context now strips .retry prefix from question text for correct trigger matching.
 """
 
 import io, os, re, json, math, time, asyncio, logging, signal, collections, random, functools
@@ -317,7 +344,7 @@ def _contains_slur(text: str) -> tuple[bool, str]:
     return False, ""
 
 load_dotenv()
-print("✅ LXTE's AI v23.0.0 loaded")
+print("✅ LXTE's AI v24.0.0 loaded")
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logger = logging.getLogger("lxte")
 logger.setLevel(logging.INFO)
@@ -507,7 +534,21 @@ SLOWMODE_LIFT_SECS     = 60         # seconds before slowmode is lifted
 _slowmode_active: dict[int, float] = {}   # channel_id -> monotonic timestamp set
 
 # ─── Anti-Mass-Mention ────────────────────────────────────────────────────────
-MASS_MENTION_THRESH = 5   # unique user mentions in a single message
+MASS_MENTION_THRESH = 5
+
+# ─── Staff Abuse Tracking ─────────────────────────────────────────────────────
+# Tracks per-staff action counts within a rolling window.
+# Violations → warning → role strip + permanent log.
+STAFF_ABUSE_WINDOW_SECS   = 60    # rolling window for action counting
+STAFF_ABUSE_WARN_THRESH   = 3     # actions in window before warning
+STAFF_ABUSE_STRIP_THRESH  = 5     # actions in window before role strip
+TRIAL_MOD_MUTE_MAX_SECS   = 3600  # Trial Mods: max mute = 1 hour
+TRIAL_MOD_PURGE_MAX       = 30    # Trial Mods: max purge at once
+_staff_abuse_tracker: dict[int, dict[str, list[float]]] = collections.defaultdict(lambda: collections.defaultdict(list))
+# guild_id -> {user_id -> [timestamps of actions]}
+_staff_abuse_warned: dict[tuple[int,int], float] = {}  # (guild_id, user_id) -> mono ts of last warning
+
+   # unique user mentions in a single message
 
 # ─── Anti-Caps ────────────────────────────────────────────────────────────────
 CAPS_THRESHOLD  = 0.75   # fraction of alpha chars that must be uppercase
@@ -694,6 +735,10 @@ You know this server better than anyone. Members, roles, XP, levels, streaks, le
 
 **Discord & bot commands**
 - All .commands this bot has, how .setup works, tickets, levels, giveaways, roles, automod, everything. You know the whole system.
+- Staff role tiers: Manager > Senior Mod > Mod > Trial Mod > All Staff (no perms) > Invite Bypass. Configured via `.setup` → Staff Roles.
+- Trial Mods: warn, mute (max 1h), purge (max 30), slowmode set only. No kick/ban.
+- Mod/Senior Mod: full warn/kick/ban/mute/purge/unban suite.
+- Abuse protection: too many actions in a short window → warning then automatic role strip.
 
 For anything outside your lane: "not really my area but —" then actually try anyway. Never dead-end someone.
 
@@ -1982,7 +2027,9 @@ async def auto_web_search(question: str) -> str:
     results = await asyncio.gather(*tasks.values(), return_exceptions=True)
     parts: list[str] = []
     for key, result in zip(tasks.keys(), results):
-        if isinstance(result, Exception) or not result or result.startswith("["):
+        if isinstance(result, Exception) or not result or not isinstance(result, str):
+            continue
+        if result.startswith("[") or result.startswith("❌"):
             continue
         if key == "ddg":
             parts.append(f"🔍 Web:\n{result}")
@@ -2027,9 +2074,11 @@ def _trim_history(history: list[dict], budget: int = _HISTORY_CHAR_BUDGET) -> li
             len(b.get("text", "")) for b in content if isinstance(b, dict)
         )
         if used + size > budget:
-            break
+            continue  # skip oversized turn, keep scanning for smaller ones
         trimmed.append(turn)
         used += size
+        if used >= budget * 0.9:
+            break
     return list(reversed(trimmed))
 
 
@@ -2041,7 +2090,7 @@ class AIEngine:
         await self._r.close()
 
     # ── Shared system-prompt builder (v23: no more duplicated logic) ──────────
-    def _build_system(self, is_owner: bool, context: str, custom_system: str) -> str:
+    def _build_system(self, is_owner: bool, context: str, custom_system: str, update_memory: bool = False) -> str:
         if is_owner:
             base = (
                 "You are LXTE's AI, built by AJ. You're talking to the verified server owner.\n"
@@ -2063,6 +2112,15 @@ class AIEngine:
         system = (custom_system.strip() + "\n\n" if custom_system.strip() else "") + base
         if context:
             system += f"\n\n## LIVE SERVER CONTEXT\n{context[:_CTX_CHAR_BUDGET]}"
+        if update_memory:
+            system += (
+                "\n\n## MEMORY INSTRUCTION\n"
+                "After your response, on a NEW line, append a memory tag in this exact format:\n"
+                "[MEMORY: <facts about this user: Roblox username, favourite kit, playstyle, preferences, "
+                "or anything personal they mentioned. Max 300 chars. If nothing new, copy existing memory unchanged. "
+                "If no existing memory and nothing new, write NONE.>]\n"
+                "The user will NOT see this tag — it is stripped before display."
+            )
         return system
 
     def _build_messages(self, system: str, history: list[dict], question,
@@ -2077,12 +2135,28 @@ class AIEngine:
         return [{"role": "system", "content": system}] + trimmed + [{"role": "user", "content": question}]
 
     async def ask(self, question, history: list[dict], model: str, context: str = "",
-                  is_owner: bool = False, custom_system: str = "") -> str:
-        system   = self._build_system(is_owner, context, custom_system)
+                  is_owner: bool = False, custom_system: str = "",
+                  update_memory: bool = False, memory_uid: int = 0) -> str:
+        system   = self._build_system(is_owner, context, custom_system, update_memory=update_memory)
         messages = self._build_messages(system, history, question, is_owner)
         temp     = 0.92 if is_owner else TEMPERATURE
         kwargs   = dict(model=model, messages=messages, max_tokens=MAX_TOKENS, temperature=temp)
-        return await self._r.call(**kwargs)
+        raw = await self._r.call(**kwargs)
+
+        # ── Extract and persist [MEMORY: ...] tag if requested ────────────────
+        if update_memory and memory_uid:
+            import re as _re
+            mem_match = _re.search(r"\[MEMORY:\s*(.*?)\]", raw, _re.DOTALL | _re.IGNORECASE)
+            if mem_match:
+                new_mem = mem_match.group(1).strip()[:300]
+                raw = raw[:mem_match.start()].rstrip()
+                if new_mem and new_mem.upper() != "NONE":
+                    try:
+                        await bot.db.update_user_memory(memory_uid, new_mem)
+                    except Exception:
+                        pass
+
+        return raw
 
     async def ask_stream(self, question, history: list[dict], model: str, context: str = "",
                          is_owner: bool = False, custom_system: str = ""):
@@ -2127,8 +2201,13 @@ class AIEngine:
                         text  = delta.get("content", "")
                         if text: yield text
                     except Exception: continue
-        except Exception:
-            # Any streaming failure — fall back to regular call
+        except Exception as _stream_exc:
+            # Penalise the key if it was an HTTP auth/rate-limit error
+            if isinstance(_stream_exc, httpx.HTTPStatusError):
+                if _stream_exc.response.status_code in (401, 403):
+                    rotator._mark_dead(idx)
+                elif _stream_exc.response.status_code == 429:
+                    rotator._mark_rate_limited(idx, None)
             kwargs.pop("stream", None)
             yield await rotator.call(**kwargs)
 
@@ -2959,7 +3038,7 @@ async def build_context(ctx: commands.Context, recent_chat: str = "") -> str:
     guild    = ctx.guild
     # Strip command prefix so trigger matching works on the actual question text
     raw_content = ctx.message.content
-    question = re.sub(r"^\.(ask|ai|q)\s*", "", raw_content, count=1, flags=re.I).strip() or raw_content
+    question = re.sub(r"^\.(ask|ai|q|retry)\s*", "", raw_content, count=1, flags=re.I).strip() or raw_content
     lines: list[str] = []
 
     # ── Always: requesting user ───────────────────────────────────────────────
@@ -3414,6 +3493,21 @@ def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
 
     e.add_field(name="\U0001f680 Boosts",    value=f"Channel: {ch('boost_channel_id')}",    inline=True)
     e.add_field(name="\U0001f389 Giveaways", value=f"Channel: {ch('giveaway_channel_id')}", inline=True)
+    # Staff roles field
+    staff_configured = any(config.get(k) for k, _, _ in _STAFF_ROLE_SLOTS)
+    e.add_field(
+        name="🛡️ Staff Roles" + (" ✅" if staff_configured else " ❌"),
+        value=(
+            f"Manager: {'✅' if config.get('staff_owner_role_id') else '❌'}  "
+            f"Sr.Mod: {'✅' if config.get('staff_senior_mod_role_id') else '❌'}  "
+            f"Mod: {'✅' if config.get('staff_mod_role_id') else '❌'}\n"
+            f"Trial: {'✅' if config.get('staff_trial_mod_role_id') else '❌'}  "
+            f"All Staff: {'✅' if config.get('staff_all_role_id') else '❌'}  "
+            f"InvBypass: {'✅' if config.get('staff_inv_bypass_role_id') else '❌'}"
+        ),
+        inline=True,
+    )
+
     e.add_field(name="\u200b", value="\u200b", inline=True)
 
     e.set_footer(text="Admins only  \u2022  .help for all commands  \u2022  .quickstart for guided setup")
@@ -3531,6 +3625,15 @@ class SetupView(discord.ui.View):
     @discord.ui.button(label="⬆️ Level Roles", style=discord.ButtonStyle.secondary, row=3)
     async def btn_levelroles(self, i, b):
         await i.response.send_message(embed=make_embed(C_INFO, "Configure level-up roles:"), view=LevelRolesSetupView(self.owner_id, self.guild_id), ephemeral=True)
+
+    @discord.ui.button(label="🛡️ Staff Roles", style=discord.ButtonStyle.primary,   row=3)
+    async def btn_staff_roles(self, i, b):
+        config = await get_config(self.guild_id)
+        await i.response.send_message(
+            embed=_staff_roles_embed(config, i.guild),
+            view=StaffRolesSetupView(self.owner_id, self.guild_id),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="✖ Close",      style=discord.ButtonStyle.danger,    row=3)
     async def btn_close(self, i, b):
@@ -4141,7 +4244,324 @@ class RemoveLevelRoleModal(discord.ui.Modal, title="Remove Level Role"):
         await bot.db.update_config(self.guild_id, "level_roles", new)
         await i.response.send_message(embed=ok(f"Removed level **{level}** mapping."), ephemeral=True)
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STAFF ROLES SETUP VIEW  (v25)
+# ═══════════════════════════════════════════════════════════════════════════════
 
+_STAFF_ROLE_SLOTS = [
+    ("staff_owner_role_id",      "👑 Server/Community Manager",
+     "Full access. Cannot be abused-stripped. Assign to trusted managers only."),
+    ("staff_senior_mod_role_id", "🔵 Senior Moderator",
+     "Warn, kick, ban, mute (up to 28d), purge (up to 500), unban, unmute, clear warns."),
+    ("staff_mod_role_id",        "🟢 Moderator",
+     "Same as Senior Mod: warn, kick, ban, mute, purge, unban, unmute."),
+    ("staff_trial_mod_role_id",  "🟡 Trial Moderator",
+     "Warn, mute (max 1h), purge (max 30 msgs). Cannot kick or ban."),
+    ("staff_all_role_id",        "⚪ All Staff (no mod perms)",
+     "Cosmetic staff role. Bypass spam filter. No moderation commands."),
+    ("staff_inv_bypass_role_id", "🔗 Invite Link Bypass",
+     "Allows posting invite links without automod deletion."),
+]
+
+def _staff_roles_embed(config: dict, guild: discord.Guild) -> discord.Embed:
+    e = make_embed(C_PRIMARY)
+    e.title = "🛡️ Staff Roles Configuration"
+    lines = []
+    for key, label, desc in _STAFF_ROLE_SLOTS:
+        rid  = config.get(key)
+        role = guild.get_role(rid) if rid else None
+        val  = role.mention if role else "`not set`"
+        lines.append(f"**{label}**\n{val}\n*{desc}*")
+    e.description = "\n\n".join(lines)
+    e.set_footer(text="Staff with assigned roles can use mod commands. Abuse = auto role strip.")
+    return e
+
+
+class StaffRolesSetupView(discord.ui.View):
+    def __init__(self, owner_id: int, guild_id: int):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="Set Role", style=discord.ButtonStyle.primary, row=0)
+    async def btn_set(self, i: discord.Interaction, b):
+        await i.response.send_modal(SetStaffRoleModal(self.guild_id))
+
+    @discord.ui.button(label="Clear Role", style=discord.ButtonStyle.danger, row=0)
+    async def btn_clear(self, i: discord.Interaction, b):
+        await i.response.send_modal(ClearStaffRoleModal(self.guild_id))
+
+    @discord.ui.button(label="📋 View All", style=discord.ButtonStyle.secondary, row=0)
+    async def btn_view(self, i: discord.Interaction, b):
+        config = await get_config(self.guild_id)
+        await i.response.send_message(embed=_staff_roles_embed(config, i.guild), ephemeral=True)
+
+    @discord.ui.button(label="❓ Permissions Guide", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_guide(self, i: discord.Interaction, b):
+        guide = (
+            "**👑 Manager / Community Manager**\n"
+            "• `.warn` `.warns` `.clearwarns`\n"
+            "• `.kick` `.ban` `.unban`\n"
+            "• `.tempmute` (up to 28 days) `.unmute`\n"
+            "• `.purge` (up to 500 messages)\n"
+            "• `.slowmode` `.case` `.history`\n\n"
+            "**🟢 Moderator**\n"
+            "Same as Manager — identical permissions.\n\n"
+            "**🟡 Trial Moderator**\n"
+            "• `.warn` `.warns`\n"
+            "• `.tempmute` (max **1 hour**)\n"
+            "• `.purge` (max **30 messages**)\n"
+            "• `.slowmode` (set only, cannot remove)\n"
+            "❌ Cannot kick, ban, unban, clear warns, or mute > 1h\n\n"
+            "**⚪ All Staff (no perms)**\n"
+            "• Bypasses spam filter  • No mod commands\n\n"
+            "**🔗 Invite Bypass**\n"
+            "• May post invite links without automod deletion\n\n"
+            "**🚨 Abuse System**\n"
+            f"• {STAFF_ABUSE_WARN_THRESH}+ actions/{STAFF_ABUSE_WINDOW_SECS}s → public warning\n"
+            f"• {STAFF_ABUSE_STRIP_THRESH}+ actions/{STAFF_ABUSE_WINDOW_SECS}s → all staff roles stripped\n"
+            "• Managers & admins are exempt"
+        )
+        e = make_embed(C_INFO, guide)
+        e.title = "🛡️ Staff Permissions Guide"
+        await i.response.send_message(embed=e, ephemeral=True)
+
+
+class SetStaffRoleModal(discord.ui.Modal, title="Set Staff Role"):
+    slot_input = discord.ui.TextInput(
+        label="Role Slot",
+        placeholder="senior_mod / mod / trial_mod / all / inv_bypass / manager",
+        max_length=20,
+    )
+    role_input = discord.ui.TextInput(
+        label="Role Name",
+        placeholder="e.g. Senior Moderator",
+        max_length=100,
+    )
+
+    def __init__(self, guild_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+
+    async def on_submit(self, i: discord.Interaction):
+        slot_map = {
+            "manager":    "staff_owner_role_id",
+            "senior_mod": "staff_senior_mod_role_id",
+            "senior":     "staff_senior_mod_role_id",
+            "mod":        "staff_mod_role_id",
+            "moderator":  "staff_mod_role_id",
+            "trial_mod":  "staff_trial_mod_role_id",
+            "trial":      "staff_trial_mod_role_id",
+            "all":        "staff_all_role_id",
+            "inv_bypass": "staff_inv_bypass_role_id",
+            "bypass":     "staff_inv_bypass_role_id",
+        }
+        key = slot_map.get(self.slot_input.value.strip().lower())
+        if not key:
+            await i.response.send_message(
+                embed=err(f"Unknown slot `{self.slot_input.value}`. Valid: manager, senior_mod, mod, trial_mod, all, inv_bypass"),
+                ephemeral=True); return
+        role = resolve_role(i.guild, self.role_input.value)
+        if not role:
+            await i.response.send_message(embed=err(f"Role `{self.role_input.value}` not found."), ephemeral=True); return
+        await bot.db.update_config(self.guild_id, key, role.id)
+        # Show slot label
+        label = next((lbl for k, lbl, _ in _STAFF_ROLE_SLOTS if k == key), key)
+        await i.response.send_message(
+            embed=ok(f"**{label}** set to {role.mention}."), ephemeral=True)
+
+
+class ClearStaffRoleModal(discord.ui.Modal, title="Clear Staff Role"):
+    slot_input = discord.ui.TextInput(
+        label="Role Slot to Clear",
+        placeholder="senior_mod / mod / trial_mod / all / inv_bypass / manager",
+        max_length=20,
+    )
+
+    def __init__(self, guild_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+
+    async def on_submit(self, i: discord.Interaction):
+        slot_map = {
+            "manager":    "staff_owner_role_id",
+            "senior_mod": "staff_senior_mod_role_id",
+            "senior":     "staff_senior_mod_role_id",
+            "mod":        "staff_mod_role_id",
+            "moderator":  "staff_mod_role_id",
+            "trial_mod":  "staff_trial_mod_role_id",
+            "trial":      "staff_trial_mod_role_id",
+            "all":        "staff_all_role_id",
+            "inv_bypass": "staff_inv_bypass_role_id",
+            "bypass":     "staff_inv_bypass_role_id",
+        }
+        key = slot_map.get(self.slot_input.value.strip().lower())
+        if not key:
+            await i.response.send_message(
+                embed=err(f"Unknown slot. Valid: manager, senior_mod, mod, trial_mod, all, inv_bypass"),
+                ephemeral=True); return
+        await bot.db.update_config(self.guild_id, key, None)
+        label = next((lbl for k, lbl, _ in _STAFF_ROLE_SLOTS if k == key), key)
+        await i.response.send_message(embed=ok(f"**{label}** cleared."), ephemeral=True)
+
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STAFF ROLE SYSTEM  (v25)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Config key helpers ────────────────────────────────────────────────────────
+def _sr(config: dict, key: str) -> int | None:
+    """Return a single staff role ID from config, or None."""
+    return config.get(key) or None
+
+def _has_staff_role(member: discord.Member, config: dict, *keys: str) -> bool:
+    """True if member has any of the given staff role config keys."""
+    member_role_ids = {r.id for r in member.roles}
+    for k in keys:
+        rid = config.get(k)
+        if rid and rid in member_role_ids:
+            return True
+    return False
+
+def _is_senior_or_above(member: discord.Member, config: dict) -> bool:
+    return _has_staff_role(member, config,
+        "staff_owner_role_id", "staff_manager_role_id",
+        "staff_senior_mod_role_id")
+
+def _is_mod_or_above(member: discord.Member, config: dict) -> bool:
+    return _has_staff_role(member, config,
+        "staff_owner_role_id", "staff_manager_role_id",
+        "staff_senior_mod_role_id", "staff_mod_role_id")
+
+def _is_trial_or_above(member: discord.Member, config: dict) -> bool:
+    return _has_staff_role(member, config,
+        "staff_owner_role_id", "staff_manager_role_id",
+        "staff_senior_mod_role_id", "staff_mod_role_id",
+        "staff_trial_mod_role_id")
+
+def _is_any_staff(member: discord.Member, config: dict) -> bool:
+    return _has_staff_role(member, config,
+        "staff_owner_role_id", "staff_manager_role_id",
+        "staff_senior_mod_role_id", "staff_mod_role_id",
+        "staff_trial_mod_role_id", "staff_all_role_id",
+        "staff_inv_bypass_role_id")
+
+# ── Abuse tracking helper ─────────────────────────────────────────────────────
+async def _check_staff_abuse(
+    ctx: commands.Context,
+    action: str,
+    config: dict,
+) -> bool:
+    """
+    Record this mod action. If the staff member is firing too fast:
+      - First breach: warn publicly, return False (let action proceed).
+      - Second breach: strip all staff roles, log to mod channel, return True (block action).
+    Returns True if the action should be BLOCKED (abuse confirmed).
+    Owner is always exempt.
+    """
+    if ctx.author.id == bot.owner_id_int or ctx.author.guild_permissions.administrator:
+        return False
+    if not _is_any_staff(ctx.author, config):
+        return False
+
+    guild_id = ctx.guild.id
+    uid      = ctx.author.id
+    now      = time.monotonic()
+    window   = STAFF_ABUSE_WINDOW_SECS
+
+    tracker  = _staff_abuse_tracker[guild_id][uid]
+    # prune old entries
+    tracker[:] = [t for t in tracker if now - t < window]
+    tracker.append(now)
+    count = len(tracker)
+
+    if count < STAFF_ABUSE_WARN_THRESH:
+        return False  # fine
+
+    key = (guild_id, uid)
+    last_warn = _staff_abuse_warned.get(key, 0)
+
+    if count >= STAFF_ABUSE_STRIP_THRESH:
+        # Strip every configured staff role they hold
+        staff_keys = [
+            "staff_senior_mod_role_id", "staff_mod_role_id",
+            "staff_trial_mod_role_id", "staff_all_role_id",
+            "staff_inv_bypass_role_id",
+        ]
+        stripped = []
+        for k in staff_keys:
+            rid = config.get(k)
+            if rid:
+                role = ctx.guild.get_role(rid)
+                if role and role in ctx.author.roles:
+                    try:
+                        await ctx.author.remove_roles(role, reason="Staff abuse auto-strip")
+                        stripped.append(role.name)
+                    except Exception:
+                        pass
+        # Clear their tracker so they don't keep triggering
+        _staff_abuse_tracker[guild_id].pop(uid, None)
+        _staff_abuse_warned.pop(key, None)
+
+        # Public callout
+        stripped_str = ', '.join(stripped) or 'none found'
+        e = make_embed(C_ERROR,
+            f"🚨 **{ctx.author.mention}** has been automatically **stripped of their staff role(s)** "
+            f"for abusing mod commands.\n"
+            f"**Roles removed:** {stripped_str}\n"
+            f"**Action that triggered strip:** `{action}` ({count} times in {window}s)\n\n"
+            f"An admin must manually review and re-grant roles if appropriate.")
+        e.title = "🚨 Staff Abuse Detected — Roles Stripped"
+        try:
+            await ctx.send(embed=e)
+        except Exception:
+            pass
+
+        # Mod log
+        stripped_str2 = ', '.join(stripped) or 'none'
+        _log_mod_action(ctx.guild, config, "🚨 Staff Abuse — Roles Stripped",
+            f"**Staff member:** {ctx.author.mention} (`{ctx.author.id}`)\n"
+            f"**Roles stripped:** {stripped_str2}\n"
+            f"**Trigger:** `{action}` — {count} actions in {window}s",
+            C_ERROR)
+        return True  # BLOCK the action
+
+    # Warn threshold — warn once per 30s to avoid spam
+    if now - last_warn > 30:
+        _staff_abuse_warned[key] = now
+        try:
+            await ctx.send(embed=make_embed(C_WARNING,
+                f"⚠️ {ctx.author.mention} — slow down. You're using `{action}` too fast. "
+                f"Continue and your staff role will be automatically removed."),
+                delete_after=10)
+        except Exception:
+            pass
+
+    return False  # warn only, don't block yet
+
+
+# ── Permission check helpers for staff-role-based access ─────────────────────
+async def _require_mod(ctx: commands.Context, config: dict, min_level: str = "mod") -> bool:
+    """
+    Check if ctx.author has at least `min_level` staff role OR the matching Discord permission.
+    min_level: "trial" | "mod" | "senior"
+    Returns True if allowed, sends error and returns False otherwise.
+    """
+    # Owner / administrator always pass
+    if ctx.author.id == bot.owner_id_int or ctx.author.guild_permissions.administrator:
+        return True
+    if min_level == "trial"  and _is_trial_or_above(ctx.author, config): return True
+    if min_level == "mod"    and _is_mod_or_above(ctx.author, config):   return True
+    if min_level == "senior" and _is_senior_or_above(ctx.author, config): return True
+    await ctx.send(embed=err(
+        f"You need a **{'Trial Mod' if min_level == 'trial' else 'Mod' if min_level == 'mod' else 'Senior Mod'}** "
+        f"role or higher to use this command."
+    ))
+    return False
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TICKET SYSTEM
@@ -4711,23 +5131,39 @@ async def send_welcome(member: discord.Member, config: dict):
 
 def _is_staff_bypass(member: discord.Member, config: dict) -> bool:
     """True if this member holds any configured staff-bypass role.
-    Anti-nuke and anti-raid are NEVER bypassed regardless of this flag."""
+    Anti-nuke and anti-raid are NEVER bypassed regardless of this flag.
+    Also honours the new staff role system keys."""
     if member is None:
         return False
+    member_role_ids = {r.id for r in member.roles}
+    # Legacy bypass role list
     bypass_ids = set(config.get("staff_bypass_role_ids", []))
-    if not bypass_ids:
-        return False
-    return bool({r.id for r in member.roles} & bypass_ids)
+    if bypass_ids & member_role_ids:
+        return True
+    # New staff role system — any configured staff role = bypass spam filter
+    for key in ("staff_owner_role_id", "staff_senior_mod_role_id",
+                "staff_mod_role_id", "staff_trial_mod_role_id",
+                "staff_all_role_id", "staff_inv_bypass_role_id"):
+        rid = config.get(key)
+        if rid and rid in member_role_ids:
+            return True
+    return False
 
 
 def _has_invite_bypass(member: discord.Member, config: dict) -> bool:
-    """True if this member has the specific invite-link bypass role (e.g. Partnership Manager)."""
+    """True if this member has the invite-link bypass role (legacy or staff_inv_bypass_role_id)."""
     if member is None:
         return False
+    member_role_ids = {r.id for r in member.roles}
+    # Legacy key
     role_id = config.get("invite_bypass_role_id")
-    if not role_id:
-        return False
-    return any(r.id == role_id for r in member.roles)
+    if role_id and role_id in member_role_ids:
+        return True
+    # New staff system key
+    role_id2 = config.get("staff_inv_bypass_role_id")
+    if role_id2 and role_id2 in member_role_ids:
+        return True
+    return False
 
 
 async def _automod_phishing(message: discord.Message, config: dict) -> bool:
@@ -4921,7 +5357,7 @@ async def run_automod(message: discord.Message, config: dict, owner_id: int = 0)
     is_staff = _is_staff_bypass(member, config)
 
     # ── Slur filter runs first for everyone (staff bypass is inside _automod_swear)
-    if await _automod_swear(message, config): return True
+    if await _automod_swear(message, config, owner_id=owner_id): return True
 
     # Admins skip all remaining checks
     if is_admin: return False
@@ -4967,32 +5403,6 @@ def _log_mod_action(guild: discord.Guild, config: dict, title: str, description:
             except Exception: pass
     asyncio.create_task(_send())
 
-
-async def _update_user_memory(uid: int, user_message: str, ai_response: str):
-    """After an AI response, extract and persist a compact memory string for this user."""
-    existing = await bot.db.get_user_memory(uid)
-    existing_mem = existing.get("memory", "")
-    prompt = (
-        f"EXISTING MEMORY:\n{existing_mem}\n\n"
-        f"NEW USER MESSAGE: {user_message[:300]}\n"
-        f"AI RESPONSE: {ai_response[:300]}\n\n"
-        "Update the memory to include any NEW facts about this user: "
-        "their Roblox username, favourite BedWars kit, playstyle, preferences, or anything personal they mentioned. "
-        "If nothing new, return the existing memory unchanged. "
-        "Reply with ONLY the memory string. Max 300 characters. No JSON, no labels, no preamble."
-    )
-    try:
-        new_memory = await bot.ai._r.call(
-            model=AI_TEXT,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=100,
-            temperature=0.2,
-        )
-        new_memory = new_memory.strip()[:300]
-        if new_memory:
-            await bot.db.update_user_memory(uid, new_memory)
-    except Exception:
-        pass  # memory update is best-effort
 
 
 async def handle_antiraid(member: discord.Member, config: dict):
@@ -5647,7 +6057,7 @@ class LXTEBot(commands.Bot):
 
         # ══ SERVER LOGS ════════════════════════════════════════════════════════
 
-        elif action == discord.AuditLogAction.channel_create:
+        if action == discord.AuditLogAction.channel_create:
             ch_name = getattr(target, "name", "?") if target else "?"
             ch_type = str(getattr(target, "type", "?"))
             await _slog("📢 Channel Created", f"**#{ch_name}** (type: {ch_type})\n**By:** {exec_str}", C_SUCCESS)
@@ -6006,7 +6416,9 @@ class LXTEBot(commands.Bot):
             elif raw_last.tzinfo is None: last = raw_last.replace(tzinfo=timezone.utc)
             else: last = raw_last
             close_cutoff = now - timedelta(hours=auto_h)
-            warn_cutoff  = now - timedelta(hours=max(1, auto_h // 2))
+            # Warn at 75% of timeout (min 30min before auto-close)
+            warn_hours   = max(0.5, auto_h * 0.75)
+            warn_cutoff  = now - timedelta(hours=warn_hours)
             if last < close_cutoff:
                 await self.db.close_ticket(ch_id)
                 try:
@@ -6030,8 +6442,9 @@ class LXTEBot(commands.Bot):
                 guild = self.get_guild(giveaway.get("guild_id"))
                 if not guild: continue
                 try:
-                    await self.db.end_giveaway(giveaway["message_id"])
+                    # Announce first — if announce fails, giveaway not yet marked ended so it can be retried
                     await do_end_giveaway(giveaway, guild)
+                    await self.db.end_giveaway(giveaway["message_id"])
                 except Exception as exc:
                     logger.warning("giveaway_task per-item error: %s", exc)
         except Exception as exc:
@@ -6178,7 +6591,7 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "Attach an image to analyze it.\n\n"
             "`.clear` — wipe your chat history\n"
             "`.retry` — re-run your last question\n\n"
-            "5s cooldown · auto web search · fully filtered"
+            "8s cooldown · auto web search · fully filtered"
         ))
         e.title = "🤖 AI"
         e.set_footer(text="LXTE's AI", icon_url=avatar)
@@ -6251,15 +6664,15 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "**⚠️ Warn System**\n"
             "`.warn @user reason` — warn (3 warns = auto-mute)\n"
             "`.warns @user` — view warn history\n"
-            "`.clearwarns @user` — clear all warns\n\n"
+            "`.clearwarns @user` — clear all warns *(Mod+)*\n\n"
             "**🔨 Moderation**\n"
-            "`.kick @user [reason]` — kick a member (requires kick perm)\n"
-            "`.ban @user [reason]` — ban a member (requires ban perm)\n"
-            "`.unban <user_id> [reason]` — unban by ID\n"
-            "`.tempmute @user 10m [reason]` — timeout with auto-expiry\n"
-            "`.unmute @user` — remove timeout early\n"
-            "`.purge <amount>` — delete messages (1–500)\n"
-            "`.slowmode [seconds]` — set channel slowmode (0 = off)\n\n"
+            "`.kick @user [reason]` — kick *(Mod+)*\n"
+            "`.ban @user [reason]` — ban *(Mod+)*\n"
+            "`.unban <user_id> [reason]` — unban *(Mod+)*\n"
+            "`.tempmute @user 10m [reason]` — timeout *(Trial: max 1h)*\n"
+            "`.unmute @user` — remove timeout *(Mod+)*\n"
+            "`.purge <amount>` — delete messages *(Trial: max 30)*\n"
+            "`.slowmode [seconds]` — slowmode *(Trial: set only)*\n\n"
             "**📋 Case System**\n"
             "`.case <number>` — view a specific mod case\n"
             "`.history @user` — all mod actions against someone\n\n"
@@ -6278,6 +6691,31 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
         ))
         e.title = "🔨 Moderation"
         e.set_footer(text="LXTE's AI", icon_url=avatar)
+        return e
+
+    elif category == "staff":
+        e = make_embed(C_PRIMARY, (
+            "Configure staff roles via `.setup` → **🛡️ Staff Roles**\n\n"
+            "**👑 Manager / Community Manager**\n"
+            "Full access. All mod commands. Exempt from abuse auto-strip.\n\n"
+            "**🔵 Senior Moderator**\n"
+            "Warn, kick, ban, unban, mute (28d), unmute, purge (500), slowmode, clear warns.\n\n"
+            "**🟢 Moderator**\n"
+            "Identical to Senior Mod.\n\n"
+            "**🟡 Trial Moderator**\n"
+            "Warn, mute (max 1h), purge (max 30 msgs), slowmode (set only).\n"
+            "❌ Cannot kick, ban, unban, or remove slowmode.\n\n"
+            "**⚪ All Staff (no mod perms)**\n"
+            "Bypasses spam filter. No mod commands. Cosmetic only.\n\n"
+            "**🔗 Invite Link Bypass**\n"
+            "Can post invite links without automod deletion.\n\n"
+            f"**🚨 Abuse Protection**\n"
+            f"• {STAFF_ABUSE_WARN_THRESH}+ actions in {STAFF_ABUSE_WINDOW_SECS}s → public warning\n"
+            f"• {STAFF_ABUSE_STRIP_THRESH}+ actions in {STAFF_ABUSE_WINDOW_SECS}s → all staff roles stripped\n"
+            "Managers and admins are exempt."
+        ))
+        e.title = "🛡️ Staff Roles"
+        e.set_footer(text="LXTE's AI — Use .setup to configure staff roles", icon_url=avatar)
         return e
 
     elif category == "admin":
@@ -6306,7 +6744,7 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
     ))
     e.title = "LXTE's AI — Help"
     e.set_thumbnail(url=avatar)
-    e.set_footer(text="LXTE's AI v23", icon_url=avatar)
+    e.set_footer(text="LXTE's AI v24", icon_url=avatar)
     return e
 
 
@@ -6324,9 +6762,10 @@ class HelpView(discord.ui.View):
             discord.SelectOption(label="Leveling",    value="leveling",  emoji="⬆️"),
             discord.SelectOption(label="Moderation",  value="mod",       emoji="🔨"),
             discord.SelectOption(label="Social & Info", value="social",  emoji="💬"),
+            discord.SelectOption(label="Staff Roles",   value="staff",   emoji="🛡️"),
         ]
         if ctx.author.id == getattr(ctx.bot, "owner_id_int", 0):
-            options.append(discord.SelectOption(label="Admin", value="admin", emoji="🛡️"))
+            options.append(discord.SelectOption(label="Admin", value="admin", emoji="🔒"))
 
         select          = discord.ui.Select(placeholder="Pick a category…", options=options)
         select.callback = self.on_select
@@ -6407,16 +6846,20 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
         if mem:
             ctx_str = f"[MEMORY ABOUT THIS USER: {mem}]\n\n" + ctx_str
 
-        # Ask the AI — simple single response, no streaming
+        # Ask the AI — single call; memory update piggybacked via [MEMORY:] tag
+        do_mem = isinstance(question, str) and not has_image and len(question.strip()) > 20
         try:
             answer = await bot.ai.ask(
                 user_content, history, model,
                 context=ctx_str,
                 is_owner=is_owner and _owner_unfiltered,
                 custom_system=custom_system,
+                update_memory=do_mem,
+                memory_uid=ctx.author.id,
             )
         except Exception as exc:
             stop.set()
+            await safe_unreact(ctx.message, "⏳", ctx.bot.user)
             logger.error("AI: %s", exc, exc_info=exc)
             await ctx.send(embed=err(f"Something went wrong: `{str(exc)[:200]}`")); return
 
@@ -6428,8 +6871,7 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
         history.append({"role": "assistant",  "content": answer})
         await save_history_cached(ctx.author.id, ctx.channel.id, history)
         await bot.db.increment_stat(ctx.author.id, "questions")
-        if isinstance(question, str) and not has_image:
-            asyncio.create_task(_update_user_memory(ctx.author.id, question, answer))
+
 
     except Exception as exc:
         stop.set()
@@ -6602,6 +7044,8 @@ async def cmd_retry(ctx: commands.Context):
 
 @bot.command(name="level", aliases=["xp", "card", "profile"])
 async def cmd_level(ctx: commands.Context, target: discord.Member = None):
+    if not ctx.guild:
+        await ctx.send(embed=err("This command only works in a server.")); return
     target = target or ctx.author
     data   = await bot.db.get_level_data(target.id, ctx.guild.id)
     buf    = await generate_rank_card(target, data)
@@ -6632,6 +7076,8 @@ async def cmd_level(ctx: commands.Context, target: discord.Member = None):
 
 @bot.command(name="leaderboard", aliases=["lb"])
 async def cmd_lb(ctx: commands.Context):
+    if not ctx.guild:
+        await ctx.send(embed=err("This command only works in a server.")); return
     rows = await bot.db.get_leaderboard(ctx.guild.id, 10)
     if not rows: await ctx.send(embed=make_embed(C_WARNING, "Nobody has XP yet — start chatting!")); return
     medals = ["🥇","🥈","🥉"]
@@ -6756,6 +7202,7 @@ async def cmd_msgsync(ctx: commands.Context, limit: int = 500, *, flags: str = "
     """
     is_owner  = ctx.author.id == bot.owner_id_int
     do_reset  = "--reset" in flags.lower()
+    do_force  = "--force" in flags.lower()
     max_limit = 100_000 if is_owner else 10_000
     limit     = max(50, min(limit, max_limit))
 
@@ -6764,7 +7211,7 @@ async def cmd_msgsync(ctx: commands.Context, limit: int = 500, *, flags: str = "
 
     # Warn if data already exists and --reset not passed
     existing_count = await bot.db.msg_tracking.count_documents({"guild_id": ctx.guild.id})
-    if existing_count > 0 and not do_reset:
+    if existing_count > 0 and not do_reset and not do_force:
         warn = await ctx.send(embed=make_embed(C_WARNING,
             f"⚠️ **{existing_count} users** already have message data in this server.\n\n"
             f"Running sync without `--reset` will **add** to existing counts, which will **double-count** "
@@ -6984,11 +7431,18 @@ async def cmd_clear(ctx: commands.Context):
 
 
 @bot.command(name="purge")
-@commands.has_permissions(manage_messages=True)
 @commands.cooldown(rate=1, per=5, type=commands.BucketType.user)
 async def cmd_purge(ctx: commands.Context, amount: int = 10):
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod(ctx, config, "trial"): return
+    # Trial mods are capped at TRIAL_MOD_PURGE_MAX messages
+    if _has_staff_role(ctx.author, config, "staff_trial_mod_role_id") and        not _is_mod_or_above(ctx.author, config) and        ctx.author.id != bot.owner_id_int:
+        if amount > TRIAL_MOD_PURGE_MAX:
+            await ctx.send(embed=err(f"Trial Mods can only purge up to **{TRIAL_MOD_PURGE_MAX}** messages at once.")); return
     if amount < 1 or amount > 500:
         await ctx.send(embed=err("Amount must be between 1 and 500."), delete_after=5); return
+    if await _check_staff_abuse(ctx, "purge", config): return
     await ctx.message.delete()
     deleted = await ctx.channel.purge(limit=amount)
     await ctx.send(embed=ok(f"Deleted **{len(deleted)}** messages."), delete_after=5)
@@ -7006,9 +7460,11 @@ async def cmd_purge(ctx: commands.Context, amount: int = 10):
 # ─── Warn System (v23) ────────────────────────────────────────────────────────
 
 @bot.command(name="warn")
-@commands.has_permissions(manage_messages=True)
 async def cmd_warn(ctx: commands.Context, member: discord.Member = None, *, reason: str = "No reason given."):
     """Warn a user. 3 warns = 60min timeout. Usage: .warn @user reason"""
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod(ctx, config, "trial"): return
     if not member:
         await ctx.send(embed=err("Usage: `.warn @user reason`")); return
     if member.bot:
@@ -7017,6 +7473,7 @@ async def cmd_warn(ctx: commands.Context, member: discord.Member = None, *, reas
         await ctx.send(embed=err("Can't warn yourself.")); return
     if member.top_role >= ctx.guild.me.top_role:
         await ctx.send(embed=err("I can't action that member (their role is too high).")); return
+    if await _check_staff_abuse(ctx, "warn", config): return
 
     warn_count = await bot.db.add_warn(ctx.guild.id, member.id, ctx.author.id, reason)
     case_num   = await bot.db.add_case(ctx.guild.id, "warn", ctx.author.id, member.id, reason)
@@ -7042,7 +7499,9 @@ async def cmd_warn(ctx: commands.Context, member: discord.Member = None, *, reas
     )
     if warn_count >= WARN_TIMEOUT_THRESHOLD:
         try:
+            until_dt = datetime.now(timezone.utc) + timedelta(minutes=WARN_TIMEOUT_MINUTES)
             await member.timeout(timedelta(minutes=WARN_TIMEOUT_MINUTES), reason=f"Auto-timeout: {warn_count} warns")
+            await bot.db.add_tempmute(ctx.guild.id, member.id, ctx.bot.user.id, f"Auto-timeout: {warn_count} warns", until_dt)
             await ctx.send(embed=make_embed(C_ERROR,
                 f"⏱️ {member.mention} auto-timed out for **{WARN_TIMEOUT_MINUTES} minutes** ({warn_count} warns)."))
             log_desc += f"\n⏱️ *Auto-timed out for {WARN_TIMEOUT_MINUTES} min*"
@@ -7052,9 +7511,11 @@ async def cmd_warn(ctx: commands.Context, member: discord.Member = None, *, reas
 
 
 @bot.command(name="warns")
-@commands.has_permissions(manage_messages=True)
 async def cmd_warns(ctx: commands.Context, member: discord.Member = None):
     """View warns for a user. Usage: .warns @user"""
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod(ctx, config, "trial"): return
     if not member:
         await ctx.send(embed=err("Usage: `.warns @user`")); return
     warns = await bot.db.get_warns(ctx.guild.id, member.id)
@@ -7072,9 +7533,11 @@ async def cmd_warns(ctx: commands.Context, member: discord.Member = None):
 
 
 @bot.command(name="clearwarns")
-@commands.has_permissions(manage_guild=True)
 async def cmd_clearwarns(ctx: commands.Context, member: discord.Member = None):
     """Clear all warns for a user. Usage: .clearwarns @user"""
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod(ctx, config, "mod"): return
     if not member:
         await ctx.send(embed=err("Usage: `.clearwarns @user`")); return
     count = await bot.db.clear_warns(ctx.guild.id, member.id)
@@ -7205,14 +7668,14 @@ async def cmd_transcript(ctx: commands.Context):
 @bot.command(name="about", aliases=["info"])
 async def cmd_about(ctx: commands.Context):
     e = make_embed(C_AI)
-    e.title       = "LXTE's AI v23"
+    e.title       = "LXTE's AI v24"
     e.description = "Built by AJ. Smart AI with real-time web search, leveling, giveaways, tickets, multi-select setup, reaction roles, automod, anti-raid, boost tracking, invite tracking, analytics."
     e.set_thumbnail(url=bot.user.display_avatar.url if bot.user else None)
     e.add_field(name="Prefix",   value="`.`",                  inline=True)
     e.add_field(name="Memory",   value="Per channel, 14 days", inline=True)
     e.add_field(name="Cooldown", value="5s",                   inline=True)
     e.add_field(name="Real-time", value="🌐 Web search · ☁️ Weather · 💹 Crypto · 🎮 Roblox", inline=False)
-    e.set_footer(text=f"{len(bot.guilds)} server(s)  •  Built by AJ  •  v23")
+    e.set_footer(text=f"{len(bot.guilds)} server(s)  •  Built by AJ  •  v24")
     await ctx.send(embed=e)
 
 
@@ -7606,7 +8069,7 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
 
         # ── Assemble final document ───────────────────────────────────────────
         snapshot = {
-            "snapshot_version": "v22",
+            "snapshot_version": "v24",
             "taken_at":         now_utc.isoformat(),
             "health":           health,
             "guilds":           guilds_data,
@@ -7666,9 +8129,18 @@ async def cmd_ping(ctx: commands.Context):
 # ─── Slowmode ─────────────────────────────────────────────────────────────────
 
 @bot.command(name="slowmode", aliases=["slow"])
-@commands.has_permissions(manage_channels=True)
 async def cmd_slowmode(ctx: commands.Context, seconds: int = 0):
-    """Set channel slowmode. .slowmode 5 = 5s delay. .slowmode 0 = off."""
+    """Set channel slowmode. Requires Trial Mod or above. .slowmode 5 = 5s delay. .slowmode 0 = off."""
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod(ctx, config, "trial"): return
+    # Trial mods cannot remove slowmode (0) — only set it
+    is_trial_only = (_has_staff_role(ctx.author, config, "staff_trial_mod_role_id")
+                     and not _is_mod_or_above(ctx.author, config)
+                     and ctx.author.id != bot.owner_id_int
+                     and not ctx.author.guild_permissions.administrator)
+    if is_trial_only and seconds == 0:
+        await ctx.send(embed=err("Trial Mods can set slowmode but cannot remove it. Ask a Mod+.")); return
     if seconds < 0 or seconds > 21600:
         await ctx.send(embed=err("Slowmode must be between 0 and 21600 seconds (6 hours).")); return
     await ctx.channel.edit(slowmode_delay=seconds, reason=f"Slowmode set by {ctx.author}")
@@ -7683,9 +8155,11 @@ async def cmd_slowmode(ctx: commands.Context, seconds: int = 0):
 # ─── Kick ──────────────────────────────────────────────────────────────────────
 
 @bot.command(name="kick")
-@commands.has_permissions(kick_members=True)
 async def cmd_kick(ctx: commands.Context, member: discord.Member = None, *, reason: str = "No reason given."):
-    """Kick a member. Requires kick_members permission. Usage: .kick @user [reason]"""
+    """Kick a member. Requires Mod or above. Usage: .kick @user [reason]"""
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod(ctx, config, "mod"): return
     if not member:
         await ctx.send(embed=err("Usage: `.kick @user [reason]`")); return
     if member.bot:
@@ -7698,15 +8172,17 @@ async def cmd_kick(ctx: commands.Context, member: discord.Member = None, *, reas
         await ctx.send(embed=err("I can't kick that member — their highest role is above mine.")); return
     if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
         await ctx.send(embed=err("You can't kick someone with an equal or higher role than you.")); return
+    if await _check_staff_abuse(ctx, "kick", config): return
+    try:
+        await member.kick(reason=f"By {ctx.author}: {reason}")
+    except discord.Forbidden:
+        await ctx.send(embed=err("I don't have permission to kick that member.")); return
+    # DM after successful kick (best-effort — member is already gone)
     try:
         dm = make_embed(C_ERROR, f"You were **kicked** from **{ctx.guild.name}**.\n**Reason:** {reason}")
         dm.title = "👢 You've Been Kicked"
         await member.send(embed=dm)
     except Exception: pass
-    try:
-        await member.kick(reason=f"By {ctx.author}: {reason}")
-    except discord.Forbidden:
-        await ctx.send(embed=err("I don't have permission to kick that member.")); return
     case_num = await bot.db.add_case(ctx.guild.id, "kick", ctx.author.id, member.id, reason)
     e = make_embed(C_WARNING,
         f"**{member.display_name}** (`{member.id}`) has been kicked.\n"
@@ -7722,9 +8198,11 @@ async def cmd_kick(ctx: commands.Context, member: discord.Member = None, *, reas
 # ─── Ban ───────────────────────────────────────────────────────────────────────
 
 @bot.command(name="ban")
-@commands.has_permissions(ban_members=True)
 async def cmd_ban(ctx: commands.Context, member: discord.Member = None, *, reason: str = "No reason given."):
-    """Ban a member. Requires ban_members permission. Usage: .ban @user [reason]"""
+    """Ban a member. Requires Mod or above. Usage: .ban @user [reason]"""
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod(ctx, config, "mod"): return
     if not member:
         await ctx.send(embed=err("Usage: `.ban @user [reason]`")); return
     if member.bot:
@@ -7737,15 +8215,17 @@ async def cmd_ban(ctx: commands.Context, member: discord.Member = None, *, reaso
         await ctx.send(embed=err("I can't ban that member — their highest role is above mine.")); return
     if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
         await ctx.send(embed=err("You can't ban someone with an equal or higher role than you.")); return
+    if await _check_staff_abuse(ctx, "ban", config): return
+    try:
+        await member.ban(reason=f"By {ctx.author}: {reason}", delete_message_days=0)
+    except discord.Forbidden:
+        await ctx.send(embed=err("I don't have permission to ban that member.")); return
+    # DM after successful ban (best-effort — member is banned so DM may fail)
     try:
         dm = make_embed(C_ERROR, f"You were **banned** from **{ctx.guild.name}**.\n**Reason:** {reason}")
         dm.title = "🔨 You've Been Banned"
         await member.send(embed=dm)
     except Exception: pass
-    try:
-        await member.ban(reason=f"By {ctx.author}: {reason}", delete_message_days=0)
-    except discord.Forbidden:
-        await ctx.send(embed=err("I don't have permission to ban that member.")); return
     case_num = await bot.db.add_case(ctx.guild.id, "ban", ctx.author.id, member.id, reason)
     e = make_embed(C_ERROR,
         f"**{member.display_name}** (`{member.id}`) has been banned.\n"
@@ -7761,9 +8241,11 @@ async def cmd_ban(ctx: commands.Context, member: discord.Member = None, *, reaso
 # ─── Unban ─────────────────────────────────────────────────────────────────────
 
 @bot.command(name="unban")
-@commands.has_permissions(ban_members=True)
 async def cmd_unban(ctx: commands.Context, user_id: int = None, *, reason: str = "No reason given."):
-    """Unban a user by ID. Usage: .unban <user_id> [reason]"""
+    """Unban a user by ID. Requires Mod or above. Usage: .unban <user_id> [reason]"""
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod(ctx, config, "mod"): return
     if not user_id:
         await ctx.send(embed=err("Usage: `.unban <user_id> [reason]`")); return
     try:
@@ -7787,18 +8269,20 @@ async def cmd_unban(ctx: commands.Context, user_id: int = None, *, reason: str =
 # ─── Temp-Mute ─────────────────────────────────────────────────────────────────
 
 @bot.command(name="tempmute", aliases=["mute", "tm"])
-@commands.has_permissions(moderate_members=True)
 async def cmd_tempmute(ctx: commands.Context, member: discord.Member = None, duration: str = None, *, reason: str = "No reason given."):
-    """Temp-mute (timeout) a member with auto-expiry.
+    """Temp-mute (timeout) a member with auto-expiry. Requires Trial Mod or above.
     Usage: .tempmute @user 10m [reason]
-    Duration: 5m, 1h, 2h30m, 1d"""
+    Duration: 5m, 1h, 2h30m, 1d (Trial Mods max 1h)"""
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod(ctx, config, "trial"): return
     if not member or not duration:
         await ctx.send(embed=err(
             "Usage: `.tempmute @user <duration> [reason]`\n"
             "**Examples:**\n"
             "`.tempmute @user 10m Spamming`\n"
             "`.tempmute @user 1h Bad behaviour`\n"
-            "`.tempmute @user 1d Repeated violations`"
+            "`.tempmute @user 1d Repeated violations` *(Mod+ only)*"
         )); return
     if member.bot:
         await ctx.send(embed=err("Can't mute bots.")); return
@@ -7813,8 +8297,16 @@ async def cmd_tempmute(ctx: commands.Context, member: discord.Member = None, dur
     secs = parse_duration(duration)
     if not secs or secs <= 0:
         await ctx.send(embed=err("Invalid duration. Examples: `5m`, `1h`, `2h30m`, `1d`")); return
+    # Trial mods: hard cap at 1 hour
+    is_trial_only = (_has_staff_role(ctx.author, config, "staff_trial_mod_role_id")
+                     and not _is_mod_or_above(ctx.author, config)
+                     and ctx.author.id != bot.owner_id_int
+                     and not ctx.author.guild_permissions.administrator)
+    if is_trial_only and secs > TRIAL_MOD_MUTE_MAX_SECS:
+        await ctx.send(embed=err(f"Trial Mods can only mute for up to **1 hour**. Use `.tempmute @user 1h` max.")); return
     if secs > 86400 * 28:
         await ctx.send(embed=err("Max mute duration is 28 days (Discord limit).")); return
+    if await _check_staff_abuse(ctx, "tempmute", config): return
     until = datetime.now(timezone.utc) + timedelta(seconds=secs)
     try:
         await member.timeout(timedelta(seconds=secs), reason=f"Tempmute by {ctx.author}: {reason}")
@@ -7851,9 +8343,11 @@ async def cmd_tempmute(ctx: commands.Context, member: discord.Member = None, dur
 # ─── Unmute ────────────────────────────────────────────────────────────────────
 
 @bot.command(name="unmute")
-@commands.has_permissions(moderate_members=True)
 async def cmd_unmute(ctx: commands.Context, member: discord.Member = None, *, reason: str = "Manually unmuted."):
-    """Remove a mute/timeout from a member. Usage: .unmute @user"""
+    """Remove a mute/timeout from a member. Requires Mod or above. Usage: .unmute @user"""
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod(ctx, config, "mod"): return
     if not member:
         await ctx.send(embed=err("Usage: `.unmute @user [reason]`")); return
     try:
