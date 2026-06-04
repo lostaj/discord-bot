@@ -4277,26 +4277,90 @@ def _staff_roles_embed(config: dict, guild: discord.Guild) -> discord.Embed:
     return e
 
 
+# ── Shared slot map used by both Set and Clear flows ─────────────────────────
+_SLOT_MAP = {
+    "manager":    "staff_owner_role_id",
+    "senior_mod": "staff_senior_mod_role_id",
+    "senior":     "staff_senior_mod_role_id",
+    "mod":        "staff_mod_role_id",
+    "moderator":  "staff_mod_role_id",
+    "trial_mod":  "staff_trial_mod_role_id",
+    "trial":      "staff_trial_mod_role_id",
+    "all":        "staff_all_role_id",
+    "inv_bypass": "staff_inv_bypass_role_id",
+    "bypass":     "staff_inv_bypass_role_id",
+}
+
+# Select options for all 6 role slots
+_SLOT_SELECT_OPTIONS = [
+    discord.SelectOption(label="👑 Manager / Community Manager", value="staff_owner_role_id",
+                         description="Full access. Exempt from abuse-strip."),
+    discord.SelectOption(label="🔵 Senior Moderator",            value="staff_senior_mod_role_id",
+                         description="Warn, kick, ban, mute (28d), purge (500), unban."),
+    discord.SelectOption(label="🟢 Moderator",                   value="staff_mod_role_id",
+                         description="Same as Senior Mod."),
+    discord.SelectOption(label="🟡 Trial Moderator",             value="staff_trial_mod_role_id",
+                         description="Warn, mute (max 1h), purge (max 30). No kick/ban."),
+    discord.SelectOption(label="⚪ All Staff (no mod perms)",     value="staff_all_role_id",
+                         description="Spam filter bypass only. Cosmetic."),
+    discord.SelectOption(label="🔗 Invite Link Bypass",          value="staff_inv_bypass_role_id",
+                         description="Can post invite links without automod deletion."),
+]
+
+
 class StaffRolesSetupView(discord.ui.View):
+    """Main staff-roles panel — shown when admin clicks 🛡️ Staff Roles in setup."""
     def __init__(self, owner_id: int, guild_id: int):
         super().__init__(timeout=300)
         self.owner_id = owner_id
         self.guild_id = guild_id
 
-    @discord.ui.button(label="Set Role", style=discord.ButtonStyle.primary, row=0)
-    async def btn_set(self, i: discord.Interaction, b):
-        await i.response.send_modal(SetStaffRoleModal(self.guild_id))
+        # ── Set Role dropdown ─────────────────────────────────────────────────
+        set_select = discord.ui.Select(
+            placeholder="Set a role → pick a slot…",
+            options=_SLOT_SELECT_OPTIONS,
+            row=0,
+        )
+        set_select.callback = self._on_set_select
+        self.add_item(set_select)
 
-    @discord.ui.button(label="Clear Role", style=discord.ButtonStyle.danger, row=0)
-    async def btn_clear(self, i: discord.Interaction, b):
-        await i.response.send_modal(ClearStaffRoleModal(self.guild_id))
+        # ── Clear Role dropdown ───────────────────────────────────────────────
+        clear_options = [
+            discord.SelectOption(
+                label=o.label, value=o.value, description="Clear this slot",
+            )
+            for o in _SLOT_SELECT_OPTIONS
+        ]
+        clear_select = discord.ui.Select(
+            placeholder="Clear a role → pick a slot…",
+            options=clear_options,
+            row=1,
+        )
+        clear_select.callback = self._on_clear_select
+        self.add_item(clear_select)
 
-    @discord.ui.button(label="📋 View All", style=discord.ButtonStyle.secondary, row=0)
+    async def _on_set_select(self, i: discord.Interaction):
+        """User picked a slot to SET — open a modal asking for the role name."""
+        config_key = i.data["values"][0]
+        label      = next((o.label for o in _SLOT_SELECT_OPTIONS if o.value == config_key), config_key)
+        await i.response.send_modal(SetStaffRoleModal(self.guild_id, config_key, label))
+
+    async def _on_clear_select(self, i: discord.Interaction):
+        """User picked a slot to CLEAR — do it immediately and confirm."""
+        config_key = i.data["values"][0]
+        label      = next((o.label for o in _SLOT_SELECT_OPTIONS if o.value == config_key), config_key)
+        await bot.db.update_config(self.guild_id, config_key, None)
+        await i.response.send_message(
+            embed=ok(f"**{label}** has been cleared."),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="📋 View All", style=discord.ButtonStyle.secondary, row=2)
     async def btn_view(self, i: discord.Interaction, b):
         config = await get_config(self.guild_id)
         await i.response.send_message(embed=_staff_roles_embed(config, i.guild), ephemeral=True)
 
-    @discord.ui.button(label="❓ Permissions Guide", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="❓ Permissions Guide", style=discord.ButtonStyle.secondary, row=2)
     async def btn_guide(self, i: discord.Interaction, b):
         guide = (
             "**👑 Manager / Community Manager**\n"
@@ -4328,81 +4392,31 @@ class StaffRolesSetupView(discord.ui.View):
 
 
 class SetStaffRoleModal(discord.ui.Modal, title="Set Staff Role"):
-    slot_input = discord.ui.TextInput(
-        label="Role Slot",
-        placeholder="senior_mod / mod / trial_mod / all / inv_bypass / manager",
-        max_length=20,
-    )
+    """Modal shown after picking a slot — user types the role name."""
     role_input = discord.ui.TextInput(
         label="Role Name",
-        placeholder="e.g. Senior Moderator",
+        placeholder="Type the exact role name, e.g. Senior Moderator",
         max_length=100,
     )
 
-    def __init__(self, guild_id: int):
-        super().__init__()
-        self.guild_id = guild_id
+    def __init__(self, guild_id: int, config_key: str, slot_label: str):
+        super().__init__(title=f"Set: {slot_label[:40]}")
+        self.guild_id   = guild_id
+        self.config_key = config_key
+        self.slot_label = slot_label
 
     async def on_submit(self, i: discord.Interaction):
-        slot_map = {
-            "manager":    "staff_owner_role_id",
-            "senior_mod": "staff_senior_mod_role_id",
-            "senior":     "staff_senior_mod_role_id",
-            "mod":        "staff_mod_role_id",
-            "moderator":  "staff_mod_role_id",
-            "trial_mod":  "staff_trial_mod_role_id",
-            "trial":      "staff_trial_mod_role_id",
-            "all":        "staff_all_role_id",
-            "inv_bypass": "staff_inv_bypass_role_id",
-            "bypass":     "staff_inv_bypass_role_id",
-        }
-        key = slot_map.get(self.slot_input.value.strip().lower())
-        if not key:
-            await i.response.send_message(
-                embed=err(f"Unknown slot `{self.slot_input.value}`. Valid: manager, senior_mod, mod, trial_mod, all, inv_bypass"),
-                ephemeral=True); return
-        role = resolve_role(i.guild, self.role_input.value)
+        role = resolve_role(i.guild, self.role_input.value.strip())
         if not role:
-            await i.response.send_message(embed=err(f"Role `{self.role_input.value}` not found."), ephemeral=True); return
-        await bot.db.update_config(self.guild_id, key, role.id)
-        # Show slot label
-        label = next((lbl for k, lbl, _ in _STAFF_ROLE_SLOTS if k == key), key)
-        await i.response.send_message(
-            embed=ok(f"**{label}** set to {role.mention}."), ephemeral=True)
-
-
-class ClearStaffRoleModal(discord.ui.Modal, title="Clear Staff Role"):
-    slot_input = discord.ui.TextInput(
-        label="Role Slot to Clear",
-        placeholder="senior_mod / mod / trial_mod / all / inv_bypass / manager",
-        max_length=20,
-    )
-
-    def __init__(self, guild_id: int):
-        super().__init__()
-        self.guild_id = guild_id
-
-    async def on_submit(self, i: discord.Interaction):
-        slot_map = {
-            "manager":    "staff_owner_role_id",
-            "senior_mod": "staff_senior_mod_role_id",
-            "senior":     "staff_senior_mod_role_id",
-            "mod":        "staff_mod_role_id",
-            "moderator":  "staff_mod_role_id",
-            "trial_mod":  "staff_trial_mod_role_id",
-            "trial":      "staff_trial_mod_role_id",
-            "all":        "staff_all_role_id",
-            "inv_bypass": "staff_inv_bypass_role_id",
-            "bypass":     "staff_inv_bypass_role_id",
-        }
-        key = slot_map.get(self.slot_input.value.strip().lower())
-        if not key:
             await i.response.send_message(
-                embed=err(f"Unknown slot. Valid: manager, senior_mod, mod, trial_mod, all, inv_bypass"),
-                ephemeral=True); return
-        await bot.db.update_config(self.guild_id, key, None)
-        label = next((lbl for k, lbl, _ in _STAFF_ROLE_SLOTS if k == key), key)
-        await i.response.send_message(embed=ok(f"**{label}** cleared."), ephemeral=True)
+                embed=err(f"No role named `{self.role_input.value}` found. Check spelling and try again."),
+                ephemeral=True,
+            ); return
+        await bot.db.update_config(self.guild_id, self.config_key, role.id)
+        await i.response.send_message(
+            embed=ok(f"**{self.slot_label}** → {role.mention} ✅"),
+            ephemeral=True,
+        )
 
 
 
