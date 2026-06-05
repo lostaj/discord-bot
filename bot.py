@@ -59,271 +59,16 @@ except ImportError:
     _BsonObjectId = None
     _BSON_AVAILABLE = False
 
-# ─── Slur / Swear Filter — bypass-resistant, zero dependencies ────────────────
-# Handles ALL known bypass techniques:
-#   • Repeated letters:        niiiggger, faaaggot
-#   • Separator insertion:     n.i.g.g.e.r  n-i-g  n_i_g  n i g g e r
-#   • Leetspeak:               n1gg3r  f4gg0t  k1k3  @ss
-#   • Unicode lookalikes:      Cyrillic/Greek/fullwidth chars that look like ASCII
-#   • Zero-width chars:        ni​gg​er (invisible chars between letters)
-#   • Combining diacritics:    n̈ïg̈g̈ër stripped via NFKD + combining removal
-#   • Mixed case + all above simultaneously
-
-import unicodedata as _ud
-
-# ── Invisible / zero-width character stripper ─────────────────────────────────
-_INVIS_RE = re.compile(
-    r"[\u200b-\u200f\u00ad\ufeff\u180e\u2060-\u2064"
-    r"\ufe0f\u034f\u115f\u1160\u17b4\u17b5\u3164\uffa0"
-    r"\U000E0000-\U000E007F]",  # tags block
-    re.UNICODE,
-)
-
-# ── Normalise: strip invisibles, NFKD decompose, drop combining marks, lowercase
-@functools.lru_cache(maxsize=512)
-def _clean(text: str) -> str:
-    # 1. strip zero-width / invisible (uses the compiled _INVIS_RE above)
-    text = _INVIS_RE.sub("", text)
-    # 2. NFKD — decomposes fullwidth, ligatures, precomposed chars
-    text = _ud.normalize("NFKD", text)
-    # 3. Drop combining diacritics (accent marks etc.)
-    text = "".join(c for c in text if _ud.category(c) != "Mn")
-    # 4. Lowercase
-    return text.lower()
-
-# ── Separator between letter slots (catches spaces, dots, dashes, underscores…)
-_SEP = r"[\s\W_]*"   # zero or more separator chars between every letter slot
-
-# ── Letter-slot character classes
-# Each string = all chars that can represent that letter (ASCII + lookalikes + leet)
-_A = r"[a@4áàâãäåæаą]"
-_B = r"[b68вбƀ]"
-_C = r"[cç¢(сċćčĉ]"
-_D = r"[dďđ]"
-_E = r"[e3éèêëęėеë€ę]"
-_F = r"[fƒ]"
-_H = r"[hнħĥ]"
-_I = r"[i1!|íìîïіїįĩ]"
-_J = r"[jĵ]"
-_K = r"[kкķ]"
-_L = r"[l1|£ļłĺľ]"
-_M = r"[mмɱ]"
-_N = r"[nņñńňŋ]"
-_O = r"[o0óòôõöøðоőœ]"
-_P = r"[pрþ]"
-_Q = r"[q]"
-_R = r"[rгŗřŕ]"
-_S = r"[s5\$§šśŝşș]"
-_T = r"[t7\+ţťțŧ]"
-_U = r"[uüúùûůűųµ]"
-_V = r"[vνѵ]"
-_W = r"[wωŵ]"
-_X = r"[x×хχ]"
-_Y = r"[yýÿŷ]"
-_Z = r"[z2žżźƶ]"
-
-def _w(*slots: str) -> str:
-    """Join letter slots with optional separator between each."""
-    return _SEP.join(slots)
-
-# ── Pattern registry ──────────────────────────────────────────────────────────
-_SLUR_PATTERNS: list[tuple[re.Pattern, str]] = []
-
-def _add(pat: str, label: str):
-    try:
-        _SLUR_PATTERNS.append((re.compile(pat, re.IGNORECASE | re.UNICODE), label))
-    except re.error as exc:
-        print(f"[slur filter] Bad pattern '{label}': {exc}")
-
-# ── Boundary helper: word must not be embedded inside a longer alpha word ─────
-# Uses negative lookbehind/lookahead for ASCII letters only (post-clean text)
-_LB = r"(?<![a-z])"   # left boundary
-_RB = r"(?![a-z])"    # right boundary
-
-# ════════════════════════════════════════════════════════════════════════════════
-#  SLUR PATTERNS
-# ════════════════════════════════════════════════════════════════════════════════
-
-# ── N-word suite (v3 — comprehensive bypass-resistant) ────────────────────────
-#
-# Bypass vectors covered:
-#   Standard:   nigga nigger niggah nigguh niggaz niggr
-#   Leet-i:     n1gga n!gga n|gga
-#   Leet-g/q:   ni99a ni9ga niqqa niqqer n1qqa
-#   Separators: n.i.g.g.a  n-i-g-g-e-r  n i g g a
-#   Censored:   n*gga n*gger n**ga n**ger n****r n*gg*r n#gga n#gger
-#   Short:      nig nigu niguh niglet
-#   Repeated:   niiigga niggggga niiiigger
-#   Unicode:    nïgga ñigga ńigga (all normalised before matching)
-#   Leet nums:  n1663r n16g3r
-#   Phrase:     "n word" "n-word" "the n word"
-#   Compound:   nignog nig nog
-#   Still safe: snigger niggardly trigger bigger digger niggle rigging
-
-# _G already includes 'q' for niqqa/niqqer substitution
-_G = r"[g9ģğġĝq]"   # includes q for niqqa/niqqer substitution
-
-# Censor-char class: * # ^ ~ used for self-censoring like n*gga
-_CX = r"[\*#\^~]{1,3}"
-
-# Shared tail: optional vowel, optional trailing consonant
-_N_TAIL = r"(?:[eaаu@uo0])?(?:[rhzs])?"
-
-# P1 — Full double-g core (nigga/nigger/niqqa etc.) with repeated-letter support
-_add(
-    _LB + _N + _SEP + _I + r"+" + _SEP + _G + r"+" + _SEP + _G + r"+" + _N_TAIL + _RB,
-    "n-word-core",
-)
-
-# P2 — Short form: nig / nigu / niguh / niglet (single g, optional suffix)
-_add(
-    _LB + _N + _SEP + _I + r"+" + _SEP + _G + r"+"
-    + r"(?:" + _SEP + r"(?:let|[uhlest]))?"
-    + _RB,
-    "n-word-short",
-)
-
-# P3 — Censored slots: n*gga  n**ger  n#gga  n*gg*r  n*gg*
-_I_OR_CX = r"(?:" + _I + r"+|" + _CX + r")"
-_G_OR_CX = r"(?:" + _G + r"+|" + _CX + r")"
-_add(
-    _LB + _N + _I_OR_CX + _G_OR_CX + _G_OR_CX + r"?" + _N_TAIL + _RB,
-    "n-word-censored-slot",
-)
-
-# P4 — Fully censored body: n + 1-6 non-word chars + terminal a/e/r
-#      Catches: n****r  n***a  n**a  n*r
-_add(
-    _LB + _N + r"[\W_]{1,6}" + r"(?:" + _A + r"|" + _E + r"|" + _R + r")" + _RB,
-    "n-word-full-censor",
-)
-
-# P5 — "n word" / "n-word" phrase
-_add(
-    r"(?<![a-z])" + _N + r"[\s\-_\*\.]{1,3}" + r"w[o0]r[dl](?![a-z])",
-    "n-word-phrase",
-)
-
-# P6 — Leet-number encoding: 1663 = i g g e
-_add(_LB + _N + r"1[6g][6g][3e][rh]?" + _RB, "n-word-1663")
-
-# P7 — Nig nog / nignog
-_add(_LB + r"nig" + _SEP + r"nog" + _RB, "nignog")
-
-# ── F-slur (faggot / fag / fgt / fagz) ───────────────────────────────────────
-_add(_LB + _w(_F,_A,_G) + r"(?:" + _SEP + _w(_G,_O,_T) + r")?" + _RB, "f-slur")
-_add(_LB + _F + _SEP + _G + _SEP + _T + _RB, "fgt")
-
-# ── K-slur (kike) ─────────────────────────────────────────────────────────────
-_add(_LB + _w(_K,_I,_K,_E) + _RB, "k-slur")
-
-# ── C-slur (ch*nk) ────────────────────────────────────────────────────────────
-_add(_LB + _w(_C,_H,_I,_N,_K) + r"s?" + _RB, "chink")
-
-# ── Sp*c / sp*ck ──────────────────────────────────────────────────────────────
-_add(_LB + _w(_S,_P) + r"[iae]" + _SEP + _w(_C,_K) + r"s?" + _RB, "spick")
-
-# ── W*tback ───────────────────────────────────────────────────────────────────
-_add(_LB + _w(_W,_E,_T,_B,_A,_C,_K) + _RB, "wetback")
-
-# ── Beaner ────────────────────────────────────────────────────────────────────
-_add(_LB + _w(_B,_E,_A,_N,_E,_R) + r"s?" + _RB, "beaner")
-
-# ── G**k ──────────────────────────────────────────────────────────────────────
-_add(_LB + _G + _SEP + r"[ou0]" + _SEP + _O + _SEP + _K + r"s?" + _RB, "gook")
-
-# ── J*p ───────────────────────────────────────────────────────────────────────
-_add(_LB + _J + _SEP + r"[a@]" + _SEP + _P + r"s?" + _RB, "jap")
-
-# ── R-slur (ret*rd) ───────────────────────────────────────────────────────────
-_add(_LB + _w(_R,_E,_T,_A,_R,_D) + r"(?:e[ds]?)?" + _RB, "r-slur")
-
-# ── Tr*nny ────────────────────────────────────────────────────────────────────
-_add(_LB + _w(_T,_R,_A,_N,_N) + r"(?:ie|y|ies)?" + _RB, "t-slur-tranny")
-
-# ── Sh*male ───────────────────────────────────────────────────────────────────
-_add(_LB + _w(_S,_H,_E,_M,_A,_L,_E) + _RB, "t-slur-shemale")
-
-# ── D*ke ──────────────────────────────────────────────────────────────────────
-_add(_LB + _D + _SEP + r"[yi1!]" + _SEP + _K + _SEP + _E + r"s?" + _RB, "d-slur")
-
-# ── C**t ──────────────────────────────────────────────────────────────────────
-_add(_LB + _w(_C,_U,_N,_T) + r"s?" + _RB, "c-word")
-
-# ── Cr*cker (racial) ──────────────────────────────────────────────────────────
-_add(_LB + _w(_C,_R,_A,_C,_K,_E,_R) + r"s?" + _RB, "cracker")
-
-# ── H*aji ─────────────────────────────────────────────────────────────────────
-_add(_LB + _w(_H,_A,_J,_I) + r"s?" + _RB, "haji")
-
-# ── Towelhead ─────────────────────────────────────────────────────────────────
-_add(_LB + _w(_T,_O,_W,_E,_L) + _SEP + _w(_H,_E,_A,_D) + _RB, "towelhead")
-
-# ── Sandnigger ────────────────────────────────────────────────────────────────
-_add(_LB + _w(_S,_A,_N,_D) + _SEP + _N + _SEP + r"[i1!|íì]" + _SEP + _G, "sand-n-word")
-
-# ── P*ki ──────────────────────────────────────────────────────────────────────
-_add(_LB + _w(_P,_A,_K,_I) + r"s?" + _RB, "paki")
-
-# ── G*psy (slur usage) ────────────────────────────────────────────────────────
-_add(_LB + _w(_G,_Y+r"|[ie]",_P,_S) + r"(?:y|ie|ies)?" + _RB, "gypo")
-
-# ── Zipperhead ────────────────────────────────────────────────────────────────
-_add(_LB + _w(_Z,_I,_P,_P,_E,_R) + _SEP + _w(_H,_E,_A,_D) + _RB, "zipperhead")
-
-# ── Slope (anti-Asian) ────────────────────────────────────────────────────────
-_add(_LB + _w(_S,_L,_O,_P,_E) + r"s?" + _RB, "slope")
-
-# ── Coon ──────────────────────────────────────────────────────────────────────
-_add(_LB + _w(_C,_O,_O,_N) + r"s?" + _RB, "coon")
-
-# ── Sambo ─────────────────────────────────────────────────────────────────────
-_add(_LB + _w(_S,_A,_M,_B,_O) + r"s?" + _RB, "sambo")
-
-# ── Darkie / Darky ────────────────────────────────────────────────────────────
-_add(_LB + _w(_D,_A,_R,_K) + r"(?:ie|y|ies)?" + _RB, "darkie")
-
-# ── Jungle bunny ──────────────────────────────────────────────────────────────
-_add(_LB + _w(_J,_U,_N,_G,_L,_E) + _SEP + _w(_B,_U,_N,_N) + r"(?:y|ies)?" + _RB, "jungle-bunny")
-
-# ── Porch monkey ──────────────────────────────────────────────────────────────
-_add(_LB + r"porch" + _SEP + _w(_M,_O,_N,_K) + r"(?:ey|ies)?" + _RB, "porch-monkey")
-
-# ── Mud duck (anti-Black) ─────────────────────────────────────────────────────
-_add(_LB + r"mud" + _SEP + r"duck" + _RB, "mud-duck")
-
-# ── Rice ball / rice eye (anti-Asian) ────────────────────────────────────────
-_add(_LB + r"rice" + _SEP + r"(?:ball|eye)" + _RB, "rice-slur")
-
-# ── Rag ?head ─────────────────────────────────────────────────────────────────
-_add(_LB + r"rag" + _SEP + r"head" + _RB, "raghead")
-
-# ── Camel jockey ──────────────────────────────────────────────────────────────
-_add(_LB + r"camel" + _SEP + r"jockey" + _RB, "camel-jockey")
-
-# ── White power / 1488 / 14 words ────────────────────────────────────────────
-_add(r"\b14\s*88\b", "1488")
-_add(r"\bwhite\s+power\b", "white-power")
-_add(r"\b88\b.*\b88\b", "hh-double")   # heil hitler coded
-_add(r"\bsieg\s+heil\b", "sieg-heil")
-_add(r"[hн][hн]\s*[hн][hн]", "hh")   # HH / heil hitler shorthand
-
-# ── General swear words (fuck, shit, bitch, ass, etc.) intentionally excluded ─
-# This filter targets SLURS ONLY. Basic profanity is not caught here.
-
-print(f"✅ Slur filter v3 loaded — {len(_SLUR_PATTERNS)} patterns active")
-
-# ── Detection function ────────────────────────────────────────────────────────
-def _contains_slur(text: str) -> tuple[bool, str]:
-    """Returns (matched, label). Cleans text before matching."""
-    cleaned = _clean(text)
-    for pattern, label in _SLUR_PATTERNS:
-        if pattern.search(cleaned):
-            return True, label
-    return False, ""
 
 load_dotenv()
-print("✅ LXTE's AI v24.0.0 loaded")
+print("✅ LXTE's AI v26.0.0 loaded")
+
+# ─── Owner immunity helper ────────────────────────────────────────────────────
+def _is_owner(user_or_id) -> bool:
+    """True if the given user/id is the bot owner (OWNER_ID from .env). Invisible to everything."""
+    uid = user_or_id if isinstance(user_or_id, int) else getattr(user_or_id, "id", 0)
+    owner = getattr(bot, "owner_id_int", None) or int(os.environ.get("OWNER_ID", "0") or "0")
+    return bool(owner and uid == owner)
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logger = logging.getLogger("lxte")
 logger.setLevel(logging.INFO)
@@ -559,10 +304,6 @@ _afk_users: dict[int, tuple[str, float]] = {}
 # When True, the owner's AI interactions bypass all safety filters.
 # Toggled with .unfiltered / .filtered — resets to False on bot restart.
 _owner_unfiltered: bool = False
-
-# ─── Ghost-ping warn tracker (v18) ───────────────────────────────────────────
-# uid -> count of ghost-ping offences (soft-warn on 1st, longer timeout on repeat)
-_ghost_ping_strikes: dict[int, int] = collections.defaultdict(int)
 
 # ─── Config cache — see get_config() above ───────────────────────────────────
 
@@ -1291,6 +1032,9 @@ class Database:
         self.cases          = db["cases"]
         self.tempmutes      = db["tempmutes"]
         self.roblox_history = db["roblox_version_history"]
+        self.tempbans       = db["tempbans"]
+        self.reports        = db["reports"]
+        self.ticket_ratings = db["ticket_ratings"]
 
     async def _retry(self, coro_fn, *args, retries: int = 3, **kwargs):
         """
@@ -1346,6 +1090,10 @@ class Database:
             await self.cases.create_index([("guild_id",1),("target_id",1)], background=True)
             await self.tempmutes.create_index("unmute_at", background=True)
             await self.roblox_history.create_index("_id", background=True)
+            await self.tempbans.create_index("unban_at", background=True)
+            await self.tempbans.create_index([("guild_id",1),("user_id",1)], background=True)
+            await self.reports.create_index([("guild_id",1),("created_at",-1)], background=True)
+            await self.ticket_ratings.create_index([("guild_id",1),("ticket_id",1)], background=True)
             logger.info("Indexes ready")
         except Exception as exc:
             logger.error("Index error: %s", exc)
@@ -1715,6 +1463,85 @@ class Database:
             },
             upsert=True,
         )
+
+    # ── Temp-Bans ─────────────────────────────────────────────────────────────
+    async def add_tempban(self, gid: int, uid: int, mod_id: int, reason: str,
+                           unban_at: datetime):
+        await self.tempbans.update_one(
+            {"guild_id": gid, "user_id": uid},
+            {"$set": {
+                "guild_id": gid, "user_id": uid, "mod_id": mod_id,
+                "reason": reason, "unban_at": unban_at,
+                "created_at": datetime.now(timezone.utc),
+            }},
+            upsert=True,
+        )
+
+    async def get_due_tempbans(self) -> list[dict]:
+        now = datetime.now(timezone.utc)
+        return await self.tempbans.find({"unban_at": {"$lte": now}}).to_list(length=100)
+
+    async def remove_tempban(self, gid: int, uid: int):
+        await self.tempbans.delete_one({"guild_id": gid, "user_id": uid})
+
+    # ── Reports ───────────────────────────────────────────────────────────────
+    async def add_report(self, gid: int, reporter_id: int, target_id: int,
+                          reason: str) -> str:
+        now = datetime.now(timezone.utc)
+        last = await self.reports.find_one(
+            {"guild_id": gid}, sort=[("report_number", -1)])
+        num = (last.get("report_number", 0) if last else 0) + 1
+        await self.reports.insert_one({
+            "guild_id": gid, "report_number": num,
+            "reporter_id": reporter_id, "target_id": target_id,
+            "reason": reason, "created_at": now, "actioned": False,
+        })
+        return str(num)
+
+    # ── Ticket Ratings ────────────────────────────────────────────────────────
+    async def rate_ticket(self, gid: int, ticket_id: int, rater_id: int,
+                           closer_id: int, stars: int):
+        await self.ticket_ratings.update_one(
+            {"guild_id": gid, "ticket_id": ticket_id},
+            {"$set": {
+                "guild_id": gid, "ticket_id": ticket_id,
+                "rater_id": rater_id, "closer_id": closer_id,
+                "stars": stars, "rated_at": datetime.now(timezone.utc),
+            }},
+            upsert=True,
+        )
+
+    async def get_ticket_stats(self, gid: int) -> dict:
+        total    = await self.tickets.count_documents({"guild_id": gid})
+        open_c   = await self.tickets.count_documents({"guild_id": gid, "closed": False})
+        closed_c = await self.tickets.count_documents({"guild_id": gid, "closed": True})
+        pipeline = [
+            {"$match": {"guild_id": gid}},
+            {"$group": {"_id": None,
+                         "avg": {"$avg": "$stars"},
+                         "count": {"$sum": 1}}},
+        ]
+        rating_doc = None
+        async for doc in self.ticket_ratings.aggregate(pipeline):
+            rating_doc = doc; break
+        closer_pipeline = [
+            {"$match": {"guild_id": gid, "closed": True}},
+            {"$group": {"_id": "$claimed_by", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": 5},
+        ]
+        top_closers = []
+        async for doc in self.tickets.aggregate(closer_pipeline):
+            if doc["_id"]:
+                top_closers.append({"closer_id": doc["_id"], "count": doc["count"]})
+        return {
+            "total_tickets":  total,
+            "open_tickets":   open_c,
+            "closed_tickets": closed_c,
+            "total_ratings":  rating_doc.get("count", 0) if rating_doc else 0,
+            "avg_rating":     round(rating_doc.get("avg", 0.0) or 0.0, 2) if rating_doc else 0.0,
+            "top_closers":    top_closers,
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2589,8 +2416,7 @@ async def _build_server_sections(
                 f"  Automod: {'✅' if config.get('automod_enabled', True) else '❌'} | "
                 f"Anti-spam: {'✅' if config.get('antispam_enabled', True) else '❌'} | "
                 f"Anti-nuke: {'✅' if config.get('antinuke_enabled', True) else '❌'} | "
-                f"Anti-swear: {'✅' if config.get('anti_swear_enabled', True) else '❌'}\n"
-                f"  Voice XP: {'✅' if config.get('voice_xp_enabled', True) else '❌'} | "
+                    f"  Voice XP: {'✅' if config.get('voice_xp_enabled', True) else '❌'} | "
                 f"Web search: {'✅' if config.get('web_search', True) else '❌'}"
             )
             _add_section("╔══ SERVER CONFIG ══╗", cfg_str)
@@ -3066,7 +2892,6 @@ def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
         value=(
             f"Enabled: {tick(automod_on)}\n"
             f"Anti-spam: {tick(config.get('antispam_enabled', True))}\n"
-            f"Anti-swear: {tick(config.get('anti_swear_enabled', True))}"
         ),
         inline=True,
     )
@@ -3089,11 +2914,11 @@ def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
         name="🛡️ Staff Roles" + (" ✅" if staff_configured else " ❌"),
         value=(
             f"Manager: {'✅' if config.get('staff_owner_role_id') else '❌'}  "
+            f"ComMgr: {'✅' if config.get('staff_community_manager_role_id') else '❌'}  "
+            f"Partner: {'✅' if config.get('staff_partnership_manager_role_id') else '❌'}\n"
             f"Sr.Mod: {'✅' if config.get('staff_senior_mod_role_id') else '❌'}  "
-            f"Mod: {'✅' if config.get('staff_mod_role_id') else '❌'}\n"
-            f"Trial: {'✅' if config.get('staff_trial_mod_role_id') else '❌'}  "
-            f"All Staff: {'✅' if config.get('staff_all_role_id') else '❌'}  "
-            f"InvBypass: {'✅' if config.get('staff_inv_bypass_role_id') else '❌'}"
+            f"Mod: {'✅' if config.get('staff_mod_role_id') else '❌'}  "
+            f"Trial: {'✅' if config.get('staff_trial_mod_role_id') else '❌'}"
         ),
         inline=True,
     )
@@ -3225,7 +3050,15 @@ class SetupView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="✖ Close",      style=discord.ButtonStyle.danger,    row=3)
+    @discord.ui.button(label="🔒 Fake Perms", style=discord.ButtonStyle.primary,   row=4)
+    async def btn_fake_perms(self, i, b):
+        await i.response.send_message(
+            embed=_fake_perms_embed(i.guild),
+            view=FakePermsSetupView(self.owner_id, self.guild_id),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="✖ Close",      style=discord.ButtonStyle.danger,    row=4)
     async def btn_close(self, i, b):
         await i.message.delete()
 
@@ -3280,7 +3113,6 @@ class AutomodSetupView(discord.ui.View):
             f"No Invites: {'✅' if config.get('automod_no_invites', True) else '❌'}\n"
             f"No Links: {'✅' if config.get('automod_no_links', True) else '❌'}\n"
             f"Anti-Raid: {'✅' if config.get('antiraid_enabled', True) else '❌'}\n"
-            f"Swear Filter: {'✅' if config.get('anti_swear_enabled', True) else '❌'}\n"
             f"Anti-Spam: {'✅' if config.get('antispam_enabled', True) else '❌'}\n"
             f"Anti-Caps: {'✅' if config.get('anti_caps_enabled', False) else '❌'}\n"
             f"Anti-Emoji: {'✅' if config.get('anti_emoji_spam_enabled', False) else '❌'}\n"
@@ -3301,8 +3133,6 @@ class AutomodSetupView(discord.ui.View):
     @discord.ui.button(label="Toggle Anti-Raid",    style=discord.ButtonStyle.secondary, row=1)
     async def t4(self, i, b): await self._toggle(i, "antiraid_enabled")
 
-    @discord.ui.button(label="Toggle Swear Filter", style=discord.ButtonStyle.secondary, row=1)
-    async def t5(self, i, b): await self._toggle(i, "anti_swear_enabled", default=True)
 
     @discord.ui.button(label="Toggle Anti-Spam",    style=discord.ButtonStyle.secondary, row=1)
     async def t6(self, i, b): await self._toggle(i, "antispam_enabled")
@@ -3839,17 +3669,21 @@ class RemoveLevelRoleModal(discord.ui.Modal, title="Remove Level Role"):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _STAFF_ROLE_SLOTS = [
-    ("staff_owner_role_id",      "👑 Server/Community Manager",
-     "Full access. Cannot be abused-stripped. Assign to trusted managers only."),
-    ("staff_senior_mod_role_id", "🔵 Senior Moderator",
+    ("staff_owner_role_id",             "👑 Manager",
+     "Full access to all bot commands. Cannot be abuse-stripped."),
+    ("staff_community_manager_role_id", "👑 Community Manager",
+     "Full access — same as Manager. Assign to trusted community leads."),
+    ("staff_partnership_manager_role_id","🤝 Partnership Manager",
+     "Above Senior Mod. Can post invite links. No moderation commands by default."),
+    ("staff_senior_mod_role_id",        "🔵 Senior Moderator",
      "Warn, kick, ban, mute (up to 28d), purge (up to 500), unban, unmute, clear warns."),
-    ("staff_mod_role_id",        "🟢 Moderator",
+    ("staff_mod_role_id",               "🟢 Moderator",
      "Same as Senior Mod: warn, kick, ban, mute, purge, unban, unmute."),
-    ("staff_trial_mod_role_id",  "🟡 Trial Moderator",
+    ("staff_trial_mod_role_id",         "🟡 Trial Moderator",
      "Warn, mute (max 1h), purge (max 30 msgs). Cannot kick or ban."),
-    ("staff_all_role_id",        "⚪ All Staff (no mod perms)",
-     "Cosmetic staff role. Bypass spam filter. No moderation commands."),
-    ("staff_inv_bypass_role_id", "🔗 Invite Link Bypass",
+    ("staff_all_role_id",               "⚪ All Staff (no mod perms)",
+     "Cosmetic staff role. Bypasses spam filter. No moderation commands."),
+    ("staff_inv_bypass_role_id",        "🔗 Invite Link Bypass",
      "Allows posting invite links without automod deletion."),
 ]
 
@@ -3869,22 +3703,31 @@ def _staff_roles_embed(config: dict, guild: discord.Guild) -> discord.Embed:
 
 # ── Shared slot map used by both Set and Clear flows ─────────────────────────
 _SLOT_MAP = {
-    "manager":    "staff_owner_role_id",
-    "senior_mod": "staff_senior_mod_role_id",
-    "senior":     "staff_senior_mod_role_id",
-    "mod":        "staff_mod_role_id",
-    "moderator":  "staff_mod_role_id",
-    "trial_mod":  "staff_trial_mod_role_id",
-    "trial":      "staff_trial_mod_role_id",
-    "all":        "staff_all_role_id",
-    "inv_bypass": "staff_inv_bypass_role_id",
-    "bypass":     "staff_inv_bypass_role_id",
+    "manager":             "staff_owner_role_id",
+    "community_manager":   "staff_community_manager_role_id",
+    "community":           "staff_community_manager_role_id",
+    "partnership_manager": "staff_partnership_manager_role_id",
+    "partnership":         "staff_partnership_manager_role_id",
+    "partner":             "staff_partnership_manager_role_id",
+    "senior_mod":          "staff_senior_mod_role_id",
+    "senior":              "staff_senior_mod_role_id",
+    "mod":                 "staff_mod_role_id",
+    "moderator":           "staff_mod_role_id",
+    "trial_mod":           "staff_trial_mod_role_id",
+    "trial":               "staff_trial_mod_role_id",
+    "all":                 "staff_all_role_id",
+    "inv_bypass":          "staff_inv_bypass_role_id",
+    "bypass":              "staff_inv_bypass_role_id",
 }
 
-# Select options for all 6 role slots
+# Select options for all 8 role slots
 _SLOT_SELECT_OPTIONS = [
-    discord.SelectOption(label="👑 Manager / Community Manager", value="staff_owner_role_id",
+    discord.SelectOption(label="👑 Manager",                     value="staff_owner_role_id",
                          description="Full access. Exempt from abuse-strip."),
+    discord.SelectOption(label="👑 Community Manager",           value="staff_community_manager_role_id",
+                         description="Full access — same as Manager."),
+    discord.SelectOption(label="🤝 Partnership Manager",         value="staff_partnership_manager_role_id",
+                         description="Above Senior Mod. Invite bypass."),
     discord.SelectOption(label="🔵 Senior Moderator",            value="staff_senior_mod_role_id",
                          description="Warn, kick, ban, mute (28d), purge (500), unban."),
     discord.SelectOption(label="🟢 Moderator",                   value="staff_mod_role_id",
@@ -4013,6 +3856,166 @@ class SetStaffRoleModal(discord.ui.Modal, title="Set Staff Role"):
 
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FAKE PERMISSIONS SYSTEM  (v26)
+#  DB-backed per-role bot permissions. Roles hold no real Discord perms.
+#  Configure via .setup → 🔒 Fake Perms
+# ═══════════════════════════════════════════════════════════════════════════════
+
+FAKE_PERM_LABELS = {
+    "administrator":     "All bot commands (full access)",
+    "ban_members":       ".ban  .unban  .softban  .massban",
+    "kick_members":      ".kick",
+    "moderate_members":  ".tempmute (.mute)  .unmute",
+    "manage_messages":   ".purge  .warn  .warnings  .clearwarns",
+    "manage_nicknames":  ".nick",
+    "manage_roles":      ".role add/remove  .rolepersist",
+    "invite_bypass":     "Post invite links without automod deletion",
+}
+
+async def _get_fake_perms(guild_id: int, member: discord.Member) -> set:
+    """Return union of all fake perms across this member's roles."""
+    role_ids = [r.id for r in member.roles]
+    if not role_ids: return set()
+    docs = await bot.db.db["fake_perms"].find(
+        {"guild_id": guild_id, "role_id": {"$in": role_ids}}
+    ).to_list(50)
+    perms: set = set()
+    for doc in docs:
+        perms.update(doc.get("perms", []))
+    return perms
+
+async def _has_fake_perm(guild_id: int, member: discord.Member, perm: str) -> bool:
+    fp = await _get_fake_perms(guild_id, member)
+    return "administrator" in fp or perm in fp
+
+async def _require_mod_or_fake(ctx: commands.Context, config: dict,
+                                min_level: str = "mod", fake_perm: str = None) -> bool:
+    """Like _require_mod but also checks DB fake perms."""
+    if ctx.author.id == bot.owner_id_int or ctx.author.guild_permissions.administrator:
+        return True
+    if min_level == "trial"  and _is_trial_or_above(ctx.author, config):  return True
+    if min_level == "mod"    and _is_mod_or_above(ctx.author, config):    return True
+    if min_level == "senior" and _is_senior_or_above(ctx.author, config): return True
+    if fake_perm and ctx.guild:
+        if await _has_fake_perm(ctx.guild.id, ctx.author, fake_perm):
+            return True
+    await ctx.send(embed=err(
+        f"You need a **{'Trial Mod' if min_level=='trial' else 'Mod' if min_level=='mod' else 'Senior Mod'}** "
+        f"role or the corresponding bot permission to use this command."
+    ))
+    return False
+
+
+def _fake_perms_embed(guild: discord.Guild) -> discord.Embed:
+    e = make_embed(C_PRIMARY)
+    e.title = "🔒 Fake Permissions"
+    e.description = (
+        "Grant bot-level permissions to roles **without** giving them real Discord permissions.\n"
+        "Staff can only moderate through the bot — no raw Discord access.\n\n"
+        "**Valid permissions:**\n" +
+        "\n".join(f"`{k}` — {v}" for k, v in FAKE_PERM_LABELS.items())
+    )
+    e.set_footer(text="Use the buttons to grant or revoke perms per role.")
+    return e
+
+async def _fake_perms_list_embed(guild: discord.Guild) -> discord.Embed:
+    docs = await bot.db.db["fake_perms"].find({"guild_id": guild.id}).to_list(50)
+    e = make_embed(C_PRIMARY)
+    e.title = "🔒 Fake Perms — Current Config"
+    if not docs:
+        e.description = "No fake perms configured yet."
+        return e
+    lines = []
+    for doc in docs:
+        role = guild.get_role(doc["role_id"])
+        rname = role.mention if role else f"`{doc['role_id']}`"
+        perms_str = ", ".join(f"`{p}`" for p in doc.get("perms", []))
+        lines.append(f"{rname} → {perms_str or '*none*'}")
+    e.description = "\n".join(lines)
+    return e
+
+
+class FakePermsGrantModal(discord.ui.Modal, title="Grant Fake Perms"):
+    role_name  = discord.ui.TextInput(label="Role Name", placeholder="e.g. Moderator", max_length=100)
+    perms_list = discord.ui.TextInput(
+        label="Permissions (comma-separated)",
+        placeholder="ban_members, kick_members, manage_messages",
+        style=discord.TextStyle.paragraph, max_length=300,
+    )
+    def __init__(self, guild_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+    async def on_submit(self, i: discord.Interaction):
+        role = resolve_role(i.guild, self.role_name.value.strip())
+        if not role:
+            await i.response.send_message(embed=err(f"Role `{self.role_name.value}` not found."), ephemeral=True); return
+        raw   = [p.strip().lower().replace(" ", "_") for p in self.perms_list.value.split(",") if p.strip()]
+        valid = [p for p in raw if p in FAKE_PERM_LABELS]
+        bad   = [p for p in raw if p not in FAKE_PERM_LABELS]
+        if not valid:
+            await i.response.send_message(
+                embed=err(f"No valid perms. Valid: {', '.join(f'`{k}`' for k in FAKE_PERM_LABELS)}"),
+                ephemeral=True); return
+        await bot.db.db["fake_perms"].update_one(
+            {"guild_id": self.guild_id, "role_id": role.id},
+            {"$addToSet": {"perms": {"$each": valid}}}, upsert=True)
+        msg = f"✅ Granted `{', '.join(valid)}` to {role.mention}."
+        if bad: msg += f"\n⚠️ Unknown perms skipped: `{', '.join(bad)}`"
+        await i.response.send_message(embed=ok(msg), ephemeral=True)
+
+
+class FakePermsRevokeModal(discord.ui.Modal, title="Revoke Fake Perms"):
+    role_name  = discord.ui.TextInput(label="Role Name", placeholder="e.g. Moderator", max_length=100)
+    perms_list = discord.ui.TextInput(
+        label="Permissions to revoke (comma-sep, or 'all')",
+        placeholder="ban_members, kick_members  OR  all",
+        style=discord.TextStyle.paragraph, max_length=300,
+    )
+    def __init__(self, guild_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+    async def on_submit(self, i: discord.Interaction):
+        role = resolve_role(i.guild, self.role_name.value.strip())
+        if not role:
+            await i.response.send_message(embed=err(f"Role `{self.role_name.value}` not found."), ephemeral=True); return
+        raw = self.perms_list.value.strip().lower()
+        if raw == "all":
+            await bot.db.db["fake_perms"].delete_one({"guild_id": self.guild_id, "role_id": role.id})
+            await i.response.send_message(embed=ok(f"✅ All fake perms cleared for {role.mention}."), ephemeral=True)
+        else:
+            perms = [p.strip().replace(" ", "_") for p in raw.split(",") if p.strip()]
+            await bot.db.db["fake_perms"].update_one(
+                {"guild_id": self.guild_id, "role_id": role.id},
+                {"$pullAll": {"perms": perms}})
+            await i.response.send_message(embed=ok(f"✅ Revoked `{', '.join(perms)}` from {role.mention}."), ephemeral=True)
+
+
+class FakePermsSetupView(discord.ui.View):
+    def __init__(self, owner_id: int, guild_id: int):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+    async def interaction_check(self, i: discord.Interaction) -> bool:
+        if not i.user.guild_permissions.administrator:
+            await i.response.send_message(embed=err("Admins only."), ephemeral=True); return False
+        return True
+    @discord.ui.button(label="➕ Grant Perms",  style=discord.ButtonStyle.success,   row=0)
+    async def btn_grant(self, i: discord.Interaction, b):
+        await i.response.send_modal(FakePermsGrantModal(self.guild_id))
+    @discord.ui.button(label="➖ Revoke Perms", style=discord.ButtonStyle.danger,    row=0)
+    async def btn_revoke(self, i: discord.Interaction, b):
+        await i.response.send_modal(FakePermsRevokeModal(self.guild_id))
+    @discord.ui.button(label="📋 View All",     style=discord.ButtonStyle.secondary, row=0)
+    async def btn_view(self, i: discord.Interaction, b):
+        e = await _fake_perms_list_embed(i.guild)
+        await i.response.send_message(embed=e, ephemeral=True)
+    @discord.ui.button(label="🗑️ Reset All",    style=discord.ButtonStyle.danger,    row=1)
+    async def btn_reset(self, i: discord.Interaction, b):
+        await bot.db.db["fake_perms"].delete_many({"guild_id": self.guild_id})
+        await i.response.send_message(embed=ok("✅ All fake perms cleared for this server."), ephemeral=True)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  STAFF ROLE SYSTEM  (v25)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4033,8 +4036,8 @@ def _has_staff_role(member: discord.Member, config: dict, *keys: str) -> bool:
 
 def _is_senior_or_above(member: discord.Member, config: dict) -> bool:
     return _has_staff_role(member, config,
-        "staff_owner_role_id",
-        "staff_senior_mod_role_id")
+        "staff_owner_role_id", "staff_community_manager_role_id",
+        "staff_partnership_manager_role_id", "staff_senior_mod_role_id")
 
 def _is_mod_or_above(member: discord.Member, config: dict) -> bool:
     return _has_staff_role(member, config,
@@ -4736,7 +4739,8 @@ def _is_staff_bypass(member: discord.Member, config: dict) -> bool:
     if bypass_ids & member_role_ids:
         return True
     # New staff role system — any configured staff role = bypass spam filter
-    for key in ("staff_owner_role_id", "staff_senior_mod_role_id",
+    for key in ("staff_owner_role_id", "staff_community_manager_role_id",
+                "staff_partnership_manager_role_id", "staff_senior_mod_role_id",
                 "staff_mod_role_id", "staff_trial_mod_role_id",
                 "staff_all_role_id", "staff_inv_bypass_role_id"):
         rid = config.get(key)
@@ -4917,42 +4921,13 @@ async def _automod_emoji(message: discord.Message, config: dict) -> bool:
 
 
 
-async def _automod_swear(message: discord.Message, config: dict, owner_id: int = 0) -> bool:
-    """Bypass-resistant slur/swear filter. Returns True if message was actioned."""
-    if owner_id and message.author.id == owner_id: return False   # owner exempt
-    if not config.get("anti_swear_enabled", True): return False
-    # Staff bypass — fully exempt, zero logging, message stays untouched
-    member = message.guild.get_member(message.author.id) if message.guild else None
-    if member and _is_staff_bypass(member, config): return False
-    matched, label = _contains_slur(message.content)
-    if not matched: return False
-    try: await message.delete()
-    except Exception: pass
-    try:
-        await message.channel.send(
-            embed=err(f"{message.author.mention} that language isn't allowed here."),
-            delete_after=6,
-        )
-    except Exception: pass
-    _log_automod(
-        message.guild, config,
-        f"🤬 **Slur/swear filter** — {message.author.mention} triggered `{label}` filter",
-        C_WARNING,
-    )
-    return True
-
-
 async def run_automod(message: discord.Message, config: dict, owner_id: int = 0) -> bool:
     """Run all automod sub-checks. Returns True if message was hard-actioned (deleted/muted)."""
     if not message.guild or not config.get("automod_enabled", True): return False
-    # Bot owner bypasses everything
-    if owner_id and message.author.id == owner_id: return False
+    if _is_owner(message.author): return False  # owner invisible to ALL automod
     member   = message.guild.get_member(message.author.id)
     is_admin = bool(member and member.guild_permissions.administrator)
     is_staff = _is_staff_bypass(member, config)
-
-    # ── Slur filter runs first for everyone (staff bypass is inside _automod_swear)
-    if await _automod_swear(message, config, owner_id=owner_id): return True
 
     # Admins skip all remaining checks
     if is_admin: return False
@@ -5002,6 +4977,7 @@ def _log_mod_action(guild: discord.Guild, config: dict, title: str, description:
 
 async def handle_antiraid(member: discord.Member, config: dict):
     if not config.get("antiraid_enabled", True): return
+    if _is_owner(member): return  # owner invisible to anti-raid
     gid = member.guild.id
 
     # Use a per-guild lock so concurrent on_member_join events can't both slip
@@ -5122,8 +5098,8 @@ async def _punish_nuker(guild: discord.Guild, executor_id: Optional[int], config
     NEVER bans or kicks real members.
     """
     if not executor_id: return
+    if _is_owner(executor_id): return  # bot owner untouchable
     executor = guild.get_member(executor_id)
-    # Don't punish the server owner or the bot itself
     if not executor or executor.id == guild.owner_id or executor.id == guild.me.id: return
 
     # Only strip roles that actually carry elevated/dangerous permissions
@@ -5333,6 +5309,7 @@ class LXTEBot(commands.Bot):
         self.giveaway_task.start()
         self.roblox_version_task.start()
         self.tempmute_task.start()
+        self.tempban_task.start()
         # Restore double-XP events that were active before restart
         now_utc = datetime.now(timezone.utc)
         for guild in self.guilds:
@@ -5390,8 +5367,6 @@ class LXTEBot(commands.Bot):
             # Always run swear filter, even on command-like messages; owner bypasses all
             if not is_command:
                 if await run_automod(message, config, owner_id=owner_id): return
-            else:
-                if await _automod_swear(message, config, owner_id=owner_id): return
 
         if message.guild and not is_command and len(content) >= 2:
             # v17: track every message regardless of XP cooldown
@@ -5465,6 +5440,23 @@ class LXTEBot(commands.Bot):
 
         await self.process_commands(message)
 
+    async def on_guild_join(self, guild: discord.Guild):
+        """Check blacklist on join; notify owner."""
+        bl = await bot.db.db["blacklisted_guilds"].find_one({"guild_id": guild.id})
+        if bl:
+            try:
+                ch = guild.system_channel or next(
+                    (c for c in guild.text_channels if c.permissions_for(guild.me).send_messages), None)
+                if ch: await ch.send(embed=make_embed(C_ERROR,
+                    f"This server is blacklisted. Reason: {bl.get('reason','None.')}\nLeaving now."))
+            except Exception: pass
+            await guild.leave(); return
+        try:
+            owner = await bot.fetch_user(bot.owner_id_int)
+            await owner.send(embed=make_embed(C_SUCCESS,
+                f"✅ Joined **{guild.name}** (`{guild.id}`)\nMembers: {guild.member_count:,} | Owner: {guild.owner}"))
+        except Exception: pass
+
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         if before.premium_since is None and after.premium_since is not None:
             guild  = after.guild
@@ -5516,35 +5508,20 @@ class LXTEBot(commands.Bot):
             e.set_footer(text=f"ID: {message.id}")
             try: await lc.send(embed=e)
             except Exception: pass
-        # Ghost-ping check
-        if config.get("anti_ghost_ping_enabled", True) and message.mentions:
+        # Ghost-ping check — log only, no punishment
+        if config.get("anti_ghost_ping_enabled", True) and message.mentions and not _is_owner(message.author):
             real_mentions = [u for u in message.mentions if not u.bot and u.id != message.author.id]
             if real_mentions:
                 names = ", ".join(u.mention for u in real_mentions[:5])
-                # Increment strike counter and apply escalating timeout
-                strikes = _ghost_ping_strikes[message.author.id] + 1
-                _ghost_ping_strikes[message.author.id] = strikes
-                timeout_mins = 2 if strikes == 1 else min(60, strikes * 10)
-                member = message.guild.get_member(message.author.id)
-                if member and not member.guild_permissions.administrator:
-                    try: await member.timeout(timedelta(minutes=timeout_mins), reason=f"Ghost ping (strike {strikes})")
-                    except Exception: pass
                 alc = get_log_channel(message.guild, config, "automod")
                 if alc:
-                    eg = make_embed(C_ERROR,
+                    eg = make_embed(C_WARNING,
                         f"👻 **{message.author.mention}** ghost-pinged {names} and deleted the message.\n"
-                        f"**Content:** {message.content[:300] or '*empty*'}\n"
-                        f"**Action:** Muted {timeout_mins} min (strike {strikes})"
+                        f"**Content:** {message.content[:300] or '*empty*'}"
                     )
-                    eg.title = "👻 Ghost Ping — Auto-Muted"
+                    eg.title = "👻 Ghost Ping Detected"
                     try: await alc.send(embed=eg)
                     except Exception: pass
-                try:
-                    await message.channel.send(
-                        embed=make_embed(C_WARNING, f"👻 {message.author.mention} ghost ping detected. Muted {timeout_mins} min."),
-                        delete_after=8,
-                    )
-                except Exception: pass
 
     # ── Unified audit log handler: anti-nuke + mod logs + server logs ───────────
     async def on_audit_log_entry_create(self, entry: discord.AuditLogEntry):
@@ -5559,6 +5536,7 @@ class LXTEBot(commands.Bot):
         action      = entry.action
         reason_str  = f"\n**Reason:** {entry.reason}" if entry.reason else ""
 
+        if executor_id and _is_owner(executor_id): return  # owner invisible to all audit logging
         mod_lc    = get_log_channel(guild, config, "mod")
         server_lc = get_log_channel(guild, config, "server")
 
@@ -5825,6 +5803,18 @@ class LXTEBot(commands.Bot):
         if member.bot: return
         config = await get_config(member.guild.id)
         asyncio.create_task(handle_antiraid(member, config))
+
+        # ── Re-apply persisted roles on rejoin ──────────────────────────────
+        try:
+            persists = await bot.db.db["role_persist"].find(
+                {"guild_id": member.guild.id, "user_id": member.id}
+            ).to_list(20)
+            for entry in persists:
+                role = member.guild.get_role(entry["role_id"])
+                if role and role < member.guild.me.top_role:
+                    try: await member.add_roles(role, reason="Rolepersist — rejoined")
+                    except Exception: pass
+        except Exception: pass
         used = await find_used_invite(member.guild)
         if used and used.inviter:
             await self.db.increment_invite_count(member.guild.id, used.inviter.id)
@@ -5923,7 +5913,6 @@ class LXTEBot(commands.Bot):
             for uid in [k for k in list(_dup_tracker) if not _dup_tracker[k]]:
                 del _dup_tracker[uid]
             # Reset ghost-ping strike counters (soft reset — strikes decay after 1h quiet)
-            _ghost_ping_strikes.clear()
         except Exception as exc:
             logger.warning("cleanup_task: %s", exc)
 
@@ -6133,6 +6122,35 @@ class LXTEBot(commands.Bot):
         except Exception as exc:
             logger.warning("tempmute_task: %s", exc)
 
+    @tasks.loop(minutes=2)
+    async def tempban_task(self):
+        """Check for expired temp-bans every 2 minutes and unban automatically."""
+        try:
+            due = await self.db.get_due_tempbans()
+            for doc in due:
+                gid = doc.get("guild_id"); uid = doc.get("user_id")
+                guild = self.get_guild(gid)
+                if not guild:
+                    await self.db.remove_tempban(gid, uid); continue
+                try:
+                    user = discord.Object(id=uid)
+                    await guild.unban(user, reason="Temp-ban expired")
+                    config = await get_config(gid)
+                    lc = get_log_channel(guild, config, "mod")
+                    if lc:
+                        e = make_embed(C_SUCCESS,
+                            f"Temp-ban for <@{uid}> (`{uid}`) has expired and been lifted.")
+                        e.title = "🔓 Temp-Ban Expired"
+                        try: await lc.send(embed=e)
+                        except Exception: pass
+                except discord.NotFound:
+                    pass  # Already unbanned manually
+                except Exception as exc:
+                    logger.warning("tempban_task unban %s: %s", uid, exc)
+                await self.db.remove_tempban(gid, uid)
+        except Exception as exc:
+            logger.warning("tempban_task: %s", exc)
+
     @cleanup_task.before_loop
     @voice_xp_task.before_loop
     @xp_decay_task.before_loop
@@ -6141,6 +6159,7 @@ class LXTEBot(commands.Bot):
     @giveaway_task.before_loop
     @roblox_version_task.before_loop
     @tempmute_task.before_loop
+    @tempban_task.before_loop
     async def before_tasks(self): await self.wait_until_ready()
 
 
@@ -7035,7 +7054,7 @@ async def cmd_warn(ctx: commands.Context, member: discord.Member = None, *, reas
     """Warn a user. 3 warns = 60min timeout. Usage: .warn @user reason"""
     if not ctx.guild: return
     config = await get_config(ctx.guild.id)
-    if not await _require_mod(ctx, config, "trial"): return
+    if not await _require_mod_or_fake(ctx, config, "trial", "manage_messages"): return
     if not member:
         await ctx.send(embed=err("Usage: `.warn @user reason`")); return
     if member.bot:
@@ -7108,7 +7127,7 @@ async def cmd_clearwarns(ctx: commands.Context, member: discord.Member = None):
     """Clear all warns for a user. Usage: .clearwarns @user"""
     if not ctx.guild: return
     config = await get_config(ctx.guild.id)
-    if not await _require_mod(ctx, config, "mod"): return
+    if not await _require_mod_or_fake(ctx, config, "mod", "manage_messages"): return
     if not member:
         await ctx.send(embed=err("Usage: `.clearwarns @user`")); return
     count = await bot.db.clear_warns(ctx.guild.id, member.id)
@@ -7208,6 +7227,14 @@ async def cmd_close(ctx: commands.Context):
     await bot.db.close_ticket(ctx.channel.id)
     _staff_app_sessions.pop(ctx.channel.id, None)
     await _send_transcript_to_log(ctx.channel, ticket_data, ctx.author)
+    opener_id = ticket_data.get("user_id")
+    ticket_id = ticket_data.get("ticket_id")
+    if opener_id and ticket_id and opener_id != ctx.author.id:
+        opener = bot.get_user(opener_id) or await bot.fetch_user(opener_id)
+        if opener:
+            asyncio.create_task(
+                send_ticket_rating_dm(opener, ctx.guild.id, ticket_id, ctx.author.id)
+            )
     await asyncio.sleep(5)
     try: await ctx.channel.delete(reason=f"Ticket closed by {ctx.author}")
     except Exception: pass
@@ -7246,7 +7273,7 @@ async def cmd_about(ctx: commands.Context):
     e.add_field(name="Memory",   value="Per channel, 14 days", inline=True)
     e.add_field(name="Cooldown", value="5s",                   inline=True)
     e.add_field(name="Real-time", value="🌐 Web search · ☁️ Weather · 💹 Crypto · 🎮 Roblox", inline=False)
-    e.set_footer(text=f"{len(bot.guilds)} server(s)  •  Built by AJ  •  v24")
+    e.set_footer(text=f"{len(bot.guilds)} server(s)  •  Built by AJ  •  v26")
     await ctx.send(embed=e)
 
 
@@ -7730,7 +7757,7 @@ async def cmd_kick(ctx: commands.Context, member: discord.Member = None, *, reas
     """Kick a member. Requires Mod or above. Usage: .kick @user [reason]"""
     if not ctx.guild: return
     config = await get_config(ctx.guild.id)
-    if not await _require_mod(ctx, config, "mod"): return
+    if not await _require_mod_or_fake(ctx, config, "mod", "kick_members"): return
     if not member:
         await ctx.send(embed=err("Usage: `.kick @user [reason]`")); return
     if member.bot:
@@ -7773,7 +7800,7 @@ async def cmd_ban(ctx: commands.Context, member: discord.Member = None, *, reaso
     """Ban a member. Requires Mod or above. Usage: .ban @user [reason]"""
     if not ctx.guild: return
     config = await get_config(ctx.guild.id)
-    if not await _require_mod(ctx, config, "mod"): return
+    if not await _require_mod_or_fake(ctx, config, "mod", "ban_members"): return
     if not member:
         await ctx.send(embed=err("Usage: `.ban @user [reason]`")); return
     if member.bot:
@@ -7846,7 +7873,7 @@ async def cmd_tempmute(ctx: commands.Context, member: discord.Member = None, dur
     Duration: 5m, 1h, 2h30m, 1d (Trial Mods max 1h)"""
     if not ctx.guild: return
     config = await get_config(ctx.guild.id)
-    if not await _require_mod(ctx, config, "trial"): return
+    if not await _require_mod_or_fake(ctx, config, "trial", "moderate_members"): return
     if not member or not duration:
         await ctx.send(embed=err(
             "Usage: `.tempmute @user <duration> [reason]`\n"
@@ -8012,6 +8039,505 @@ async def cmd_history(ctx: commands.Context, member: discord.Member = None):
     await ctx.send(embed=e)
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  NEW COMMANDS — v26
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Bot Customization (owner only) ──────────────────────────────────────────
+
+@bot.command(name="setavatar", hidden=True)
+async def cmd_setavatar(ctx: commands.Context, url: str = None):
+    if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
+    if not url: await ctx.send(embed=err("Usage: `.setavatar <image_url>`"), delete_after=8); return
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(url); r.raise_for_status()
+        await bot.user.edit(avatar=r.content)
+        await ctx.send(embed=ok("✅ Avatar updated."))
+    except Exception as exc: await ctx.send(embed=err(f"Failed: `{exc}`"))
+
+@bot.command(name="setbanner", hidden=True)
+async def cmd_setbanner(ctx: commands.Context, url: str = None):
+    if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
+    if not url: await ctx.send(embed=err("Usage: `.setbanner <image_url>`"), delete_after=8); return
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(url); r.raise_for_status()
+        await bot.user.edit(banner=r.content)
+        await ctx.send(embed=ok("✅ Banner updated."))
+    except Exception as exc: await ctx.send(embed=err(f"Failed: `{exc}`"))
+
+@bot.command(name="setnick", hidden=True)
+async def cmd_setnick(ctx: commands.Context, *, nick: str = None):
+    if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
+    if not ctx.guild: return
+    try:
+        new = None if nick in (None, "clear", "reset") else nick[:32]
+        await ctx.guild.me.edit(nick=new)
+        await ctx.send(embed=ok(f"✅ Nickname {'cleared' if not new else f'set to `{new}`'}."))
+    except Exception as exc: await ctx.send(embed=err(f"Failed: `{exc}`"))
+
+@bot.command(name="setname", hidden=True)
+async def cmd_setname(ctx: commands.Context, *, name: str = None):
+    if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
+    if not name: await ctx.send(embed=err("Usage: `.setname <username>`"), delete_after=8); return
+    try:
+        await bot.user.edit(username=name[:32])
+        await ctx.send(embed=ok(f"✅ Username set to `{name}`."))
+    except Exception as exc: await ctx.send(embed=err(f"Failed: `{exc}`"))
+
+
+# ─── Channel Management ───────────────────────────────────────────────────────
+
+@bot.command(name="lock")
+async def cmd_lock(ctx: commands.Context, channel: discord.TextChannel = None, *, reason: str = "Locked by staff."):
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod_or_fake(ctx, config, "mod", "manage_messages"): return
+    ch = channel or ctx.channel
+    ow = ch.overwrites_for(ctx.guild.default_role)
+    ow.send_messages = False
+    try:
+        await ch.edit(overwrites={ctx.guild.default_role: ow}, reason=reason)
+        await ctx.send(embed=ok(f"🔒 {ch.mention} locked. Reason: {reason}"))
+        _log_mod_action(ctx.guild, config, "🔒 Channel Locked",
+            f"**Channel:** {ch.mention}\n**By:** {ctx.author.mention}\n**Reason:** {reason}")
+    except discord.Forbidden:
+        await ctx.send(embed=err("Missing permissions."))
+
+@bot.command(name="unlock")
+async def cmd_unlock(ctx: commands.Context, channel: discord.TextChannel = None, *, reason: str = "Unlocked by staff."):
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod_or_fake(ctx, config, "mod", "manage_messages"): return
+    ch = channel or ctx.channel
+    ow = ch.overwrites_for(ctx.guild.default_role)
+    ow.send_messages = None
+    try:
+        await ch.edit(overwrites={ctx.guild.default_role: ow}, reason=reason)
+        await ctx.send(embed=ok(f"🔓 {ch.mention} unlocked."))
+        _log_mod_action(ctx.guild, config, "🔓 Channel Unlocked",
+            f"**Channel:** {ch.mention}\n**By:** {ctx.author.mention}\n**Reason:** {reason}")
+    except discord.Forbidden:
+        await ctx.send(embed=err("Missing permissions."))
+
+@bot.command(name="nuke")
+async def cmd_nuke(ctx: commands.Context, channel: discord.TextChannel = None):
+    if not ctx.guild: return
+    if ctx.author.id != bot.owner_id_int and not ctx.author.guild_permissions.administrator:
+        await ctx.send(embed=err("Administrator only.")); return
+    ch = channel or ctx.channel
+    conf = await ctx.send(embed=make_embed(C_ERROR,
+        f"⚠️ This will **delete and recreate** {ch.mention}, wiping ALL messages.\nReact ✅ to confirm, ❌ to cancel."))
+    for emoji in ("✅", "❌"): await conf.add_reaction(emoji)
+    def check(r, u): return u == ctx.author and str(r.emoji) in ("✅", "❌") and r.message.id == conf.id
+    try: reaction, _ = await bot.wait_for("reaction_add", timeout=30, check=check)
+    except asyncio.TimeoutError: await conf.edit(embed=make_embed(C_WARNING, "Nuke cancelled — timed out.")); return
+    if str(reaction.emoji) == "❌": await conf.edit(embed=make_embed(C_WARNING, "Nuke cancelled.")); return
+    pos = ch.position
+    new_ch = await ch.clone(reason=f"Nuke by {ctx.author}")
+    await new_ch.edit(position=pos)
+    await ch.delete(reason=f"Nuke by {ctx.author}")
+    e = make_embed(C_SUCCESS, f"💥 Nuked by {ctx.author.mention}.")
+    e.title = "💥 Channel Nuked"
+    await new_ch.send(embed=e)
+
+
+# ─── Nick ────────────────────────────────────────────────────────────────────
+
+@bot.command(name="nick")
+async def cmd_nick(ctx: commands.Context, member: discord.Member = None, *, nick: str = None):
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod_or_fake(ctx, config, "mod", "manage_nicknames"): return
+    if not member: await ctx.send(embed=err("Usage: `.nick @user [nickname | clear]`")); return
+    try:
+        new = None if not nick or nick.lower() in ("clear", "reset", "none") else nick[:32]
+        await member.edit(nick=new, reason=f"Nick changed by {ctx.author}")
+        await ctx.send(embed=ok(f"✅ Nickname {'cleared' if not new else f'set to **{new}**'} for {member.mention}."))
+        _log_mod_action(ctx.guild, config, "✏️ Nickname Changed",
+            f"**User:** {member.mention}\n**Nick:** `{new or 'cleared'}`\n**By:** {ctx.author.mention}")
+    except discord.Forbidden:
+        await ctx.send(embed=err("Missing permissions or target is higher in hierarchy."))
+
+
+# ─── Softban / Massban ────────────────────────────────────────────────────────
+
+@bot.command(name="softban")
+async def cmd_softban(ctx: commands.Context, member: discord.Member = None, *, reason: str = "No reason given."):
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod_or_fake(ctx, config, "mod", "ban_members"): return
+    if not member: await ctx.send(embed=err("Usage: `.softban @user [reason]`")); return
+    if member.top_role >= ctx.author.top_role and ctx.author.id != bot.owner_id_int:
+        await ctx.send(embed=err("Can't softban someone at or above your role.")); return
+    try:
+        try:
+            dm_e = make_embed(C_ERROR,
+                f"You have been **softbanned** from **{ctx.guild.name}**.\n**Reason:** {reason}\n\n*Your recent messages were cleared. You may rejoin with an invite.*")
+            dm_e.title = "⚡ Softbanned"
+            await member.send(embed=dm_e)
+        except Exception: pass
+        await ctx.guild.ban(member, reason=f"Softban by {ctx.author}: {reason}", delete_message_days=7)
+        await ctx.guild.unban(member, reason="Softban — immediate unban")
+        await ctx.send(embed=ok(f"⚡ **{member}** softbanned. Reason: {reason}"))
+        _log_mod_action(ctx.guild, config, "⚡ Softban",
+            f"**User:** {member.mention} (`{member.id}`)\n**By:** {ctx.author.mention}\n**Reason:** {reason}", C_WARNING)
+    except discord.Forbidden:
+        await ctx.send(embed=err("Missing permissions."))
+
+@bot.command(name="massban")
+async def cmd_massban(ctx: commands.Context, *, ids: str = None):
+    if not ctx.guild: return
+    if ctx.author.id != bot.owner_id_int and not ctx.author.guild_permissions.administrator:
+        await ctx.send(embed=err("Administrator only.")); return
+    if not ids: await ctx.send(embed=err("Usage: `.massban 123 456 789 | reason`")); return
+    parts  = ids.split("|", 1)
+    reason = parts[1].strip() if len(parts) > 1 else "Mass ban."
+    raw_ids = [s.strip() for s in parts[0].split() if s.strip().isdigit()]
+    if not raw_ids: await ctx.send(embed=err("No valid user IDs found.")); return
+    msg = await ctx.send(embed=make_embed(C_WARNING, f"Banning {len(raw_ids)} users…"))
+    banned, failed = 0, 0
+    for uid in raw_ids:
+        try:
+            await ctx.guild.ban(discord.Object(int(uid)), reason=f"Massban by {ctx.author}: {reason}", delete_message_days=1)
+            banned += 1
+        except Exception: failed += 1
+    e = make_embed(C_SUCCESS, f"✅ Banned **{banned}** | Failed: **{failed}**\n**Reason:** {reason}")
+    e.title = "🔨 Mass Ban Complete"
+    await msg.edit(embed=e)
+    config = await get_config(ctx.guild.id)
+    _log_mod_action(ctx.guild, config, "🔨 Mass Ban",
+        f"**Banned:** {banned} | **Failed:** {failed}\n**By:** {ctx.author.mention}\n**Reason:** {reason}", C_ERROR)
+
+
+# ─── Role Management ─────────────────────────────────────────────────────────
+
+@bot.command(name="role")
+async def cmd_role(ctx: commands.Context, action: str = None, member: discord.Member = None, *, role_name: str = None):
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod_or_fake(ctx, config, "senior", "manage_roles"): return
+    if action not in ("add", "remove", "give", "take") or not member or not role_name:
+        await ctx.send(embed=err("Usage: `.role add @user RoleName` | `.role remove @user RoleName`")); return
+    role = discord.utils.find(lambda r: r.name.lower() == role_name.lower(), ctx.guild.roles)
+    if not role: await ctx.send(embed=err(f"Role `{role_name}` not found.")); return
+    if role >= ctx.guild.me.top_role: await ctx.send(embed=err("That role is above my highest role.")); return
+    try:
+        if action in ("add", "give"):
+            await member.add_roles(role, reason=f"Role given by {ctx.author}")
+            await ctx.send(embed=ok(f"✅ Added **{role.name}** to {member.mention}."))
+        else:
+            await member.remove_roles(role, reason=f"Role removed by {ctx.author}")
+            await ctx.send(embed=ok(f"✅ Removed **{role.name}** from {member.mention}."))
+        _log_mod_action(ctx.guild, config, "🎭 Role Updated",
+            f"**User:** {member.mention}\n**Role:** {role.mention} ({'added' if action in ('add','give') else 'removed'})\n**By:** {ctx.author.mention}")
+    except discord.Forbidden:
+        await ctx.send(embed=err("Missing permissions to manage that role."))
+
+@bot.command(name="rolepersist")
+async def cmd_rolepersist(ctx: commands.Context, action: str = None, member: discord.Member = None, *, role_name: str = None):
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod_or_fake(ctx, config, "senior", "manage_roles"): return
+    if action not in ("add", "remove", "list"):
+        await ctx.send(embed=err("Usage: `.rolepersist add @user Role` | `.rolepersist remove @user Role` | `.rolepersist list`")); return
+    if action == "list":
+        docs = await bot.db.db["role_persist"].find({"guild_id": ctx.guild.id}).to_list(50)
+        if not docs: await ctx.send(embed=make_embed(C_INFO, "No role persists configured.")); return
+        lines = []
+        for doc in docs:
+            m = ctx.guild.get_member(doc["user_id"]); r = ctx.guild.get_role(doc["role_id"])
+            lines.append(f"{m.mention if m else f'`{doc["user_id"]}`'} → {r.mention if r else f'`{doc["role_id"]}`'}")
+        e = make_embed(C_INFO, "\n".join(lines)); e.title = "🔒 Role Persists"
+        await ctx.send(embed=e); return
+    if not member or not role_name:
+        await ctx.send(embed=err("Usage: `.rolepersist add @user RoleName`")); return
+    role = discord.utils.find(lambda r: r.name.lower() == role_name.lower(), ctx.guild.roles)
+    if not role: await ctx.send(embed=err(f"Role `{role_name}` not found.")); return
+    if action == "add":
+        await bot.db.db["role_persist"].update_one(
+            {"guild_id": ctx.guild.id, "user_id": member.id, "role_id": role.id},
+            {"$set": {"guild_id": ctx.guild.id, "user_id": member.id, "role_id": role.id}}, upsert=True)
+        await ctx.send(embed=ok(f"✅ **{role.name}** will persist for {member.mention} on rejoin."))
+    else:
+        await bot.db.db["role_persist"].delete_one({"guild_id": ctx.guild.id, "user_id": member.id, "role_id": role.id})
+        await ctx.send(embed=ok(f"✅ Persist removed for {member.mention} / **{role.name}**."))
+
+
+# ─── Mod Stats / Warnings alias ──────────────────────────────────────────────
+
+@bot.command(name="modstats")
+async def cmd_modstats(ctx: commands.Context, target: discord.Member = None):
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod(ctx, config, "mod"): return
+    if target:
+        cases = await bot.db.db["mod_cases"].find({"guild_id": ctx.guild.id, "mod_id": target.id}).to_list(500)
+        counts: dict = {}
+        for c in cases: counts[c.get("action","?")] = counts.get(c.get("action","?"),0)+1
+        lines = [f"**{k.title()}:** {v}" for k, v in sorted(counts.items(), key=lambda x:-x[1])]
+        e = make_embed(C_PRIMARY, "\n".join(lines) or "No actions yet.")
+        e.title = f"📊 Mod Stats — {target.display_name}"
+        e.set_thumbnail(url=target.display_avatar.url)
+    else:
+        pipeline = [{"$match":{"guild_id":ctx.guild.id}},{"$group":{"_id":"$mod_id","count":{"$sum":1}}},{"$sort":{"count":-1}},{"$limit":15}]
+        results = await bot.db.db["mod_cases"].aggregate(pipeline).to_list(15)
+        lines = []
+        for r in results:
+            m = ctx.guild.get_member(r["_id"]); name = m.display_name if m else f"`{r['_id']}`"
+            lines.append(f"**{name}:** {r['count']} action{'s' if r['count']!=1 else ''}")
+        e = make_embed(C_PRIMARY, "\n".join(lines) or "No mod actions logged yet.")
+        e.title = "📊 Mod Stats — All Staff"
+    await ctx.send(embed=e)
+
+@bot.command(name="warnings", aliases=["warnlist"])
+async def cmd_warnings(ctx: commands.Context, member: discord.Member = None):
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod(ctx, config, "trial"): return
+    if not member: await ctx.send(embed=err("Usage: `.warnings @user`")); return
+    warns = await bot.db.get_user_cases(ctx.guild.id, member.id, 50)
+    warn_cases = [c for c in warns if c.get("action") in ("warn","warning")]
+    if not warn_cases: await ctx.send(embed=make_embed(C_SUCCESS, f"**{member.display_name}** has no warnings. ✅")); return
+    lines = []
+    for i, c in enumerate(warn_cases, 1):
+        created = c.get("created_at"); ts = f"<t:{int(created.timestamp())}:d>" if created else "?"
+        lines.append(f"**#{i}** {ts} — {(c.get('reason') or '?')[:80]}")
+    e = make_embed(C_WARNING, "\n".join(lines))
+    e.title = f"⚠️ Warnings — {member.display_name} ({len(warn_cases)} total)"
+    e.set_thumbnail(url=member.display_avatar.url)
+    await ctx.send(embed=e)
+
+
+# ─── Ticket Extras ────────────────────────────────────────────────────────────
+
+@bot.command(name="adduser")
+async def cmd_adduser(ctx: commands.Context, member: discord.Member = None):
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod(ctx, config, "trial"): return
+    if not member: await ctx.send(embed=err("Usage: `.adduser @user`")); return
+    ticket = await bot.db.tickets.find_one({"channel_id": ctx.channel.id})
+    if not ticket: await ctx.send(embed=err("This is not a ticket channel.")); return
+    try:
+        await ctx.channel.set_permissions(member, read_messages=True, send_messages=True, reason=f"Added by {ctx.author}")
+        await ctx.send(embed=ok(f"✅ {member.mention} added to this ticket."))
+    except discord.Forbidden: await ctx.send(embed=err("Missing permissions."))
+
+@bot.command(name="removeuser")
+async def cmd_removeuser(ctx: commands.Context, member: discord.Member = None):
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod(ctx, config, "trial"): return
+    if not member: await ctx.send(embed=err("Usage: `.removeuser @user`")); return
+    ticket = await bot.db.tickets.find_one({"channel_id": ctx.channel.id})
+    if not ticket: await ctx.send(embed=err("This is not a ticket channel.")); return
+    try:
+        await ctx.channel.set_permissions(member, overwrite=None, reason=f"Removed by {ctx.author}")
+        await ctx.send(embed=ok(f"✅ {member.mention} removed from this ticket."))
+    except discord.Forbidden: await ctx.send(embed=err("Missing permissions."))
+
+@bot.command(name="renameticket", aliases=["ticketrename"])
+async def cmd_renameticket(ctx: commands.Context, *, name: str = None):
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod(ctx, config, "trial"): return
+    if not name: await ctx.send(embed=err("Usage: `.renameticket <new name>`")); return
+    ticket = await bot.db.tickets.find_one({"channel_id": ctx.channel.id})
+    if not ticket: await ctx.send(embed=err("This is not a ticket channel.")); return
+    safe = name[:50].replace(" ", "-").lower()
+    try:
+        await ctx.channel.edit(name=f"ticket-{safe}", reason=f"Renamed by {ctx.author}")
+        await ctx.send(embed=ok(f"✅ Renamed to `ticket-{safe}`."))
+    except discord.Forbidden: await ctx.send(embed=err("Missing permissions."))
+
+@bot.command(name="priority")
+async def cmd_priority(ctx: commands.Context):
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod(ctx, config, "trial"): return
+    ticket = await bot.db.tickets.find_one({"channel_id": ctx.channel.id})
+    if not ticket: await ctx.send(embed=err("This is not a ticket channel.")); return
+    await bot.db.tickets.update_one({"channel_id": ctx.channel.id}, {"$set": {"priority": True}})
+    try:
+        if not ctx.channel.name.startswith("🔴"):
+            await ctx.channel.edit(name=f"🔴-{ctx.channel.name}")
+    except Exception: pass
+    await ctx.send(embed=ok("🔴 Ticket marked as **high priority**."))
+
+
+# ─── Utility ─────────────────────────────────────────────────────────────────
+
+@bot.command(name="shorten")
+async def cmd_shorten(ctx: commands.Context, url: str = None):
+    if not url: await ctx.send(embed=err("Usage: `.shorten <url>`")); return
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get("https://is.gd/create.php", params={"format": "simple", "url": url})
+            r.raise_for_status(); short = r.text.strip()
+        e = make_embed(C_SUCCESS, f"**Original:** {url[:80]}{'…' if len(url)>80 else ''}\n**Short:** {short}")
+        e.title = "🔗 URL Shortened"
+        await ctx.send(embed=e)
+    except Exception as exc: await ctx.send(embed=err(f"Failed: `{exc}`"))
+
+
+class EmbedBuilderModal(discord.ui.Modal, title="Create Embed"):
+    embed_title   = discord.ui.TextInput(label="Title", max_length=100, required=False)
+    embed_desc    = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph, max_length=2000)
+    embed_color   = discord.ui.TextInput(label="Color hex (e.g. 5865F2)", max_length=8, required=False, default="5865F2")
+    embed_footer  = discord.ui.TextInput(label="Footer (optional)", max_length=100, required=False)
+    embed_channel = discord.ui.TextInput(label="Channel ID (blank = here)", max_length=20, required=False)
+    async def on_submit(self, i: discord.Interaction):
+        try: color = int(self.embed_color.value.lstrip("#") or "5865F2", 16)
+        except ValueError: color = C_PRIMARY
+        e = discord.Embed(description=self.embed_desc.value, color=color)
+        if self.embed_title.value:  e.title = self.embed_title.value
+        if self.embed_footer.value: e.set_footer(text=self.embed_footer.value)
+        try:
+            ch_id = int(self.embed_channel.value.strip()) if self.embed_channel.value.strip() else 0
+            ch = i.guild.get_channel(ch_id) or i.channel
+            await ch.send(embed=e)
+            await i.response.send_message(embed=ok("✅ Embed sent."), ephemeral=True)
+        except Exception as exc:
+            await i.response.send_message(embed=err(f"Failed: `{exc}`"), ephemeral=True)
+
+@bot.command(name="embed")
+async def cmd_embed(ctx: commands.Context):
+    if not ctx.guild: return
+    if ctx.author.id != bot.owner_id_int and not ctx.author.guild_permissions.administrator:
+        await ctx.send(embed=err("Administrator only.")); return
+    class EmbedTrigger(discord.ui.View):
+        def __init__(self): super().__init__(timeout=60)
+        @discord.ui.button(label="📝 Open Builder", style=discord.ButtonStyle.primary)
+        async def open_modal(self, i: discord.Interaction, b): await i.response.send_modal(EmbedBuilderModal())
+    await ctx.send("Click to open the embed builder:", view=EmbedTrigger(), delete_after=60)
+
+@bot.command(name="say")
+async def cmd_say(ctx: commands.Context, channel: discord.TextChannel = None, *, text: str = None):
+    if not ctx.guild: return
+    if ctx.author.id != bot.owner_id_int and not ctx.author.guild_permissions.administrator:
+        await ctx.send(embed=err("Administrator only.")); return
+    if not text: await ctx.send(embed=err("Usage: `.say [#channel] <message>`")); return
+    ch = channel or ctx.channel
+    try: await ctx.message.delete()
+    except Exception: pass
+    await ch.send(text)
+    config = await get_config(ctx.guild.id)
+    _log_mod_action(ctx.guild, config, "💬 Bot Say",
+        f"**By:** {ctx.author.mention}\n**Channel:** {ch.mention}\n**Content:** {text[:500]}", C_INFO)
+
+@bot.command(name="botdm", aliases=["senddm"], hidden=True)
+async def cmd_botdm(ctx: commands.Context, user: discord.User = None, *, message: str = None):
+    if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
+    if not user or not message: await ctx.send(embed=err("Usage: `.botdm @user <message>`"), delete_after=8); return
+    try:
+        e = make_embed(C_PRIMARY, message); e.title = "📩 Message from LXTE's AI"
+        await user.send(embed=e)
+        await ctx.send(embed=ok(f"✅ DM sent to **{user}**."))
+    except discord.Forbidden:
+        await ctx.send(embed=err(f"Can't DM **{user}** — DMs closed or they blocked the bot."))
+
+
+# ─── Invite Management ────────────────────────────────────────────────────────
+
+@bot.command(name="inviteinfo", aliases=["ii"])
+async def cmd_inviteinfo(ctx: commands.Context, code: str = None):
+    if not code: await ctx.send(embed=err("Usage: `.inviteinfo <code>`")); return
+    code = code.replace("https://discord.gg/", "").replace("discord.gg/", "").strip()
+    try:
+        invite = await bot.fetch_invite(code, with_counts=True)
+        e = make_embed(C_INFO); e.title = f"🔗 Invite — {code}"
+        e.add_field(name="Server",   value=invite.guild.name if invite.guild else "?",               inline=True)
+        e.add_field(name="Channel",  value=f"#{invite.channel.name}" if invite.channel else "?",     inline=True)
+        e.add_field(name="Members",  value=f"{invite.approximate_member_count:,}" if invite.approximate_member_count else "?", inline=True)
+        e.add_field(name="Online",   value=f"{invite.approximate_presence_count:,}" if invite.approximate_presence_count else "?", inline=True)
+        e.add_field(name="Inviter",  value=str(invite.inviter) if invite.inviter else "?",            inline=True)
+        e.add_field(name="Expires",  value=f"<t:{int(invite.expires_at.timestamp())}:R>" if invite.expires_at else "Never", inline=True)
+        if invite.guild and invite.guild.icon: e.set_thumbnail(url=invite.guild.icon.url)
+        await ctx.send(embed=e)
+    except discord.NotFound: await ctx.send(embed=err(f"Invite `{code}` not found or expired."))
+    except Exception as exc: await ctx.send(embed=err(f"Failed: `{exc}`"))
+
+@bot.command(name="resetinvites")
+async def cmd_resetinvites(ctx: commands.Context, member: discord.Member = None):
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod(ctx, config, "senior"): return
+    if not member: await ctx.send(embed=err("Usage: `.resetinvites @user`")); return
+    await bot.db.db["invites"].update_one(
+        {"guild_id": ctx.guild.id, "user_id": member.id},
+        {"$set": {"invites": 0, "left": 0, "bonus": 0}}, upsert=True)
+    await ctx.send(embed=ok(f"✅ Invite count reset for {member.mention}."))
+
+@bot.command(name="resetallinvites")
+async def cmd_resetallinvites(ctx: commands.Context):
+    if not ctx.guild: return
+    if ctx.author.id != bot.owner_id_int and not ctx.author.guild_permissions.administrator:
+        await ctx.send(embed=err("Administrator only.")); return
+    conf = await ctx.send(embed=make_embed(C_WARNING, "⚠️ Reset ALL invite counts for every member. React ✅ to confirm."))
+    await conf.add_reaction("✅"); await conf.add_reaction("❌")
+    def check(r, u): return u == ctx.author and str(r.emoji) in ("✅","❌") and r.message.id == conf.id
+    try: reaction, _ = await bot.wait_for("reaction_add", timeout=30, check=check)
+    except asyncio.TimeoutError: await conf.edit(embed=make_embed(C_WARNING, "Cancelled.")); return
+    if str(reaction.emoji) == "❌": await conf.edit(embed=make_embed(C_WARNING, "Cancelled.")); return
+    result = await bot.db.db["invites"].delete_many({"guild_id": ctx.guild.id})
+    await conf.edit(embed=ok(f"✅ Reset invite data for **{result.deleted_count}** users."))
+
+
+# ─── Owner / Multi-guild Tools ────────────────────────────────────────────────
+
+@bot.command(name="restart", hidden=True)
+async def cmd_restart(ctx: commands.Context):
+    if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
+    await ctx.send(embed=make_embed(C_WARNING, "🔄 Restarting…"))
+    import sys, os as _os
+    await bot.close()
+    _os.execv(sys.executable, [sys.executable] + sys.argv)
+
+@bot.command(name="guilds", hidden=True)
+async def cmd_guilds(ctx: commands.Context):
+    if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
+    lines = [f"**{g.name}** — {g.member_count:,} members (`{g.id}`)"
+             for g in sorted(bot.guilds, key=lambda g: -(g.member_count or 0))]
+    e = make_embed(C_INFO, "\n".join(lines[:30])); e.title = f"🌐 Guilds ({len(bot.guilds)})"
+    await ctx.send(embed=e)
+
+@bot.command(name="blacklistserver", hidden=True)
+async def cmd_blacklistserver(ctx: commands.Context, guild_id: int = None, *, reason: str = "No reason."):
+    if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
+    if not guild_id: await ctx.send(embed=err("Usage: `.blacklistserver <guild_id> [reason]`"), delete_after=8); return
+    await bot.db.db["blacklisted_guilds"].update_one(
+        {"guild_id": guild_id},
+        {"$set": {"guild_id": guild_id, "reason": reason, "at": datetime.now(timezone.utc)}}, upsert=True)
+    g = bot.get_guild(guild_id)
+    if g:
+        try:
+            sys_ch = g.system_channel or next((c for c in g.text_channels if c.permissions_for(g.me).send_messages), None)
+            if sys_ch: await sys_ch.send(embed=make_embed(C_ERROR, f"This server has been blacklisted. Reason: {reason}"))
+        except Exception: pass
+        await g.leave()
+    await ctx.send(embed=ok(f"✅ Guild `{guild_id}` blacklisted and left."))
+
+@bot.command(name="broadcast", hidden=True)
+async def cmd_broadcast(ctx: commands.Context, *, message: str = None):
+    if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
+    if not message: await ctx.send(embed=err("Usage: `.broadcast <message>`"), delete_after=8); return
+    sent, failed = 0, 0
+    for g in bot.guilds:
+        try:
+            cfg = await get_config(g.id)
+            lc_id = cfg.get("bot_log_channel_id") or cfg.get("log_channel_id")
+            ch = g.get_channel(lc_id) if lc_id else g.system_channel
+            if not ch: ch = next((c for c in g.text_channels if c.permissions_for(g.me).send_messages), None)
+            if ch:
+                e = make_embed(C_PRIMARY, message); e.title = "📢 Broadcast"
+                await ch.send(embed=e); sent += 1
+            else: failed += 1
+        except Exception: failed += 1
+    await ctx.send(embed=ok(f"✅ Sent to **{sent}** guilds. Failed: **{failed}**."))
+
 # ─── Slash: /level ────────────────────────────────────────────────────────────
 
 @bot.tree.command(name="level", description="View your rank card")
@@ -8026,6 +8552,543 @@ async def slash_level(interaction: discord.Interaction, user: discord.User = Non
         if buf:
             await interaction.followup.send(file=discord.File(fp=buf, filename="rank.png")); return
     await interaction.followup.send(embed=err("Rank card unavailable — Pillow not installed on this host."), ephemeral=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  NEW COMMANDS — tempban, report, cleanup, unbanall, serveraudit, ticket rating
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+# ─── Temp-Ban ─────────────────────────────────────────────────────────────────
+
+@bot.command(name="tempban", aliases=["tb"])
+async def cmd_tempban(ctx: commands.Context, member: discord.Member = None,
+                      duration: str = None, *, reason: str = "No reason given."):
+    """
+    Temporarily ban a member. Auto-unbans after the duration.
+    Usage: .tempban @user 7d reason
+    Duration: 10m 1h 2d 1w (max 28d)
+    Requires Mod or above.
+    """
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod_or_fake(ctx, config, "mod", "ban_members"): return
+
+    if not member or not duration:
+        await ctx.send(embed=err(
+            "Usage: `.tempban @user <duration> [reason]`\n"
+            "Examples:\n"
+            "`.tempban @user 1d Raiding`\n"
+            "`.tempban @user 7d Repeated violations`\n"
+            "`.tempban @user 1h Trolling` *(short bans)*"
+        )); return
+
+    if member.bot:
+        await ctx.send(embed=err("Can't temp-ban bots.")); return
+    if member.id == ctx.author.id:
+        await ctx.send(embed=err("Can't ban yourself.")); return
+    if member.id == ctx.guild.owner_id:
+        await ctx.send(embed=err("Can't ban the server owner.")); return
+    if member.top_role >= ctx.guild.me.top_role:
+        await ctx.send(embed=err("Their role is too high for me to ban.")); return
+    if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+        await ctx.send(embed=err("You can't ban someone with an equal or higher role.")); return
+
+    secs = parse_duration(duration)
+    if not secs or secs <= 0:
+        await ctx.send(embed=err("Invalid duration. Examples: `1h`, `7d`, `2d12h`")); return
+    if secs > 86400 * 28:
+        await ctx.send(embed=err("Max temp-ban is 28 days.")); return
+
+    unban_at = datetime.now(timezone.utc) + timedelta(seconds=secs)
+
+    d2, rem = divmod(secs, 86400); h2, rem = divmod(rem, 3600); m2, s2 = divmod(rem, 60)
+    parts = [p for p in [f"{d2}d", f"{h2}h", f"{m2}m", f"{s2}s"] if not p.startswith("0")]
+    dur_str = " ".join(parts) or f"{secs}s"
+
+    try:
+        dm = make_embed(C_ERROR,
+            f"You have been **temp-banned** from **{ctx.guild.name}** for **{dur_str}**.\n"
+            f"**Reason:** {reason}\n"
+            f"**Unbanned automatically:** <t:{int(unban_at.timestamp())}:R>")
+        dm.title = "🔨 Temp-Ban"
+        await member.send(embed=dm)
+    except Exception: pass
+
+    try:
+        await ctx.guild.ban(member, reason=f"Temp-ban by {ctx.author} ({dur_str}): {reason}",
+                            delete_message_days=0)
+    except discord.Forbidden:
+        await ctx.send(embed=err("I don't have permission to ban that member.")); return
+
+    await bot.db.add_tempban(ctx.guild.id, member.id, ctx.author.id, reason, unban_at)
+    case_num = await bot.db.add_case(ctx.guild.id, "tempban", ctx.author.id, member.id, reason,
+                                     {"duration_secs": secs, "unban_at": unban_at})
+
+    e = make_embed(C_ERROR,
+        f"**{member.display_name}** (`{member.id}`) temp-banned for **{dur_str}**.\n"
+        f"**Reason:** {reason}\n"
+        f"**Auto-unbans:** <t:{int(unban_at.timestamp())}:R>\n"
+        f"**Case:** #{case_num}")
+    e.title = "🔨 Member Temp-Banned"
+    await ctx.send(embed=e)
+
+    config = await get_config(ctx.guild.id)
+    _log_mod_action(ctx.guild, config, "🔨 Temp-Ban",
+        f"**User:** {member} (`{member.id}`)\n**Mod:** {ctx.author.mention}\n"
+        f"**Duration:** {dur_str}\n**Reason:** {reason}\n"
+        f"**Unbans:** <t:{int(unban_at.timestamp())}:R>\n**Case:** #{case_num}", C_ERROR)
+
+
+# ─── Report System ─────────────────────────────────────────────────────────────
+
+class ReportActionView(discord.ui.View):
+    def __init__(self, reporter_id: int, target_id: int, guild_id: int):
+        super().__init__(timeout=None)
+        self.reporter_id = reporter_id
+        self.target_id   = target_id
+        self.guild_id    = guild_id
+
+    @discord.ui.button(label="✅ Acknowledged", style=discord.ButtonStyle.success,
+                        custom_id="report:ack")
+    async def btn_ack(self, interaction: discord.Interaction, button: discord.ui.Button):
+        button.disabled = True
+        button.label    = f"✅ Ack'd by {interaction.user.display_name}"
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(
+            embed=make_embed(C_SUCCESS, f"Report acknowledged by {interaction.user.mention}."),
+            ephemeral=True)
+
+    @discord.ui.button(label="🔇 Mute Target", style=discord.ButtonStyle.danger,
+                        custom_id="report:mute")
+    async def btn_mute(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild  = interaction.guild
+        target = guild.get_member(self.target_id)
+        if not target:
+            await interaction.response.send_message(
+                embed=err("Target not found — they may have left."), ephemeral=True); return
+        try:
+            await target.timeout(timedelta(minutes=60),
+                                  reason=f"Muted via report by {interaction.user}")
+            for item in self.children: item.disabled = True
+            await interaction.response.edit_message(view=self)
+            await interaction.followup.send(
+                embed=ok(f"Muted {target.mention} for 1 hour."), ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                embed=err("Missing permissions."), ephemeral=True)
+
+    @discord.ui.button(label="👢 Kick Target", style=discord.ButtonStyle.danger,
+                        custom_id="report:kick")
+    async def btn_kick(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild  = interaction.guild
+        target = guild.get_member(self.target_id)
+        if not target:
+            await interaction.response.send_message(
+                embed=err("Target not found."), ephemeral=True); return
+        try:
+            await target.kick(reason=f"Kicked via report by {interaction.user}")
+            for item in self.children: item.disabled = True
+            await interaction.response.edit_message(view=self)
+            await interaction.followup.send(
+                embed=ok(f"Kicked {target.display_name}."), ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                embed=err("Missing permissions."), ephemeral=True)
+
+    @discord.ui.button(label="🔍 View History", style=discord.ButtonStyle.secondary,
+                        custom_id="report:history")
+    async def btn_history(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cases = await bot.db.get_user_cases(self.guild_id, self.target_id, 10)
+        if not cases:
+            await interaction.response.send_message(
+                embed=make_embed(C_SUCCESS, "No prior mod actions on this user."),
+                ephemeral=True); return
+        lines = []
+        for c in cases:
+            emoji  = _CASE_EMOJIS.get(c.get("action", "?"), "📋")
+            ts_str = f"<t:{int(c['created_at'].timestamp())}:d>" if c.get("created_at") else "?"
+            lines.append(f"{emoji} **#{c['case_number']}** {c.get('action','?')} — {ts_str} — {(c.get('reason') or '?')[:60]}")
+        e = make_embed(C_WARNING, "\n".join(lines))
+        e.title = f"📋 History — Last {len(cases)} actions"
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@bot.command(name="report")
+@commands.cooldown(rate=1, per=60, type=commands.BucketType.user)
+async def cmd_report(ctx: commands.Context, target: discord.Member = None, *, reason: str = None):
+    """
+    Anonymously report a member to staff.
+    Usage: .report @user <reason>
+    """
+    if not ctx.guild: return
+    if not target:
+        await ctx.send(embed=err("Usage: `.report @user <reason>`"), delete_after=8); return
+    if not reason:
+        await ctx.send(embed=err("Please include a reason: `.report @user <reason>`"),
+                       delete_after=8); return
+    if target.id == ctx.author.id:
+        await ctx.send(embed=err("You can't report yourself."), delete_after=8); return
+    if target.bot:
+        await ctx.send(embed=err("Can't report bots."), delete_after=8); return
+
+    config    = await get_config(ctx.guild.id)
+    log_ch_id = (config.get("report_channel_id")
+                 or config.get("mod_log_channel_id")
+                 or config.get("automod_log_channel_id")
+                 or config.get("log_channel_id"))
+    log_ch    = ctx.guild.get_channel(log_ch_id) if log_ch_id else None
+
+    if not log_ch:
+        await ctx.send(embed=err(
+            "No staff log channel is configured. Ask an admin to set one up via `.setup`."),
+            delete_after=10); return
+
+    try: await ctx.message.delete()
+    except Exception: pass
+
+    report_id = await bot.db.add_report(ctx.guild.id, ctx.author.id, target.id, reason)
+
+    e = make_embed(C_WARNING,
+        f"**Reported User:** {target.mention} (`{target.id}`)\n"
+        f"**Reason:** {reason}\n\n"
+        f"*Reporter identity is hidden. Use `.case` history to investigate.*\n"
+        f"Report ID: `{report_id}`")
+    e.title = "🚨 New Member Report"
+    e.set_thumbnail(url=target.display_avatar.url)
+    e.set_footer(text=f"Guild: {ctx.guild.name}")
+
+    view = ReportActionView(ctx.author.id, target.id, ctx.guild.id)
+    try:
+        await log_ch.send(embed=e, view=view)
+    except Exception as exc:
+        logger.warning("report: failed to send to log: %s", exc)
+
+    try:
+        conf = make_embed(C_SUCCESS,
+            f"Your report against **{target.display_name}** has been sent to staff.\n"
+            f"We'll look into it. Thank you for keeping the server safe.")
+        conf.title = "✅ Report Submitted"
+        await ctx.author.send(embed=conf)
+    except Exception: pass
+
+
+# ─── Cleanup (purge by user) ──────────────────────────────────────────────────
+
+@bot.command(name="cleanup", aliases=["purgeuser", "cleanuser"])
+@commands.cooldown(rate=1, per=10, type=commands.BucketType.user)
+async def cmd_cleanup(ctx: commands.Context, target: discord.Member = None, amount: int = 50):
+    """
+    Delete messages from a specific user in the current channel.
+    Usage: .cleanup @user [amount]  (max 500, default 50, requires Mod)
+    """
+    if not ctx.guild: return
+    config = await get_config(ctx.guild.id)
+    if not await _require_mod_or_fake(ctx, config, "mod", "manage_messages"): return
+
+    if not target:
+        await ctx.send(embed=err("Usage: `.cleanup @user [amount]`\nExample: `.cleanup @user 100`")); return
+
+    amount = max(1, min(amount, 500))
+    await ctx.message.delete()
+    status = await ctx.send(embed=make_embed(C_INFO, f"⏳ Scanning for messages from {target.mention}…"))
+
+    def is_target(msg: discord.Message) -> bool:
+        return msg.author.id == target.id
+
+    try:
+        deleted_msgs = await ctx.channel.purge(limit=500, check=is_target, bulk=True)
+        deleted = len(deleted_msgs)
+    except discord.Forbidden:
+        await status.edit(embed=err("Missing Manage Messages permission.")); return
+    except Exception as exc:
+        await status.edit(embed=err(f"Failed: `{exc}`")); return
+
+    await status.edit(embed=ok(f"Deleted **{deleted}** message(s) from {target.mention}."))
+
+    config = await get_config(ctx.guild.id)
+    _log_mod_action(ctx.guild, config, "🧹 User Cleanup",
+        f"**Target:** {target.mention} (`{target.id}`)\n"
+        f"**Deleted:** {deleted} messages\n"
+        f"**Channel:** {ctx.channel.mention}\n"
+        f"**By:** {ctx.author.mention}", C_WARNING)
+
+
+# ─── Unban All ────────────────────────────────────────────────────────────────
+
+@bot.command(name="unbanall", hidden=True)
+async def cmd_unbanall(ctx: commands.Context):
+    """Mass-unban all banned users. Owner only. Requires reaction confirmation."""
+    if not ctx.guild: return
+    if ctx.author.id != bot.owner_id_int:
+        await ctx.message.delete(); return
+
+    try:
+        bans = [entry async for entry in ctx.guild.bans()]
+    except discord.Forbidden:
+        await ctx.send(embed=err("I don't have permission to view the ban list.")); return
+
+    if not bans:
+        await ctx.send(embed=make_embed(C_INFO, "No users are currently banned.")); return
+
+    conf_msg = await ctx.send(embed=make_embed(C_WARNING,
+        f"⚠️ This will unban **{len(bans)} users**.\n"
+        f"React ✅ to confirm or ❌ to cancel.\n"
+        f"*This cannot be undone.*"))
+    await conf_msg.add_reaction("✅")
+    await conf_msg.add_reaction("❌")
+
+    def check(r, u):
+        return u == ctx.author and str(r.emoji) in ("✅", "❌") and r.message.id == conf_msg.id
+
+    try:
+        reaction, _ = await bot.wait_for("reaction_add", timeout=30, check=check)
+    except asyncio.TimeoutError:
+        await conf_msg.edit(embed=make_embed(C_WARNING, "Unban all cancelled — timed out.")); return
+
+    if str(reaction.emoji) == "❌":
+        await conf_msg.edit(embed=make_embed(C_WARNING, "Unban all cancelled.")); return
+
+    progress = await ctx.send(embed=make_embed(C_INFO, f"⏳ Unbanning {len(bans)} users…"))
+    unbanned, failed = 0, 0
+    for entry in bans:
+        try:
+            await ctx.guild.unban(entry.user, reason=f"Mass unban by {ctx.author}")
+            unbanned += 1
+        except Exception:
+            failed += 1
+        if unbanned % 10 == 0:
+            try:
+                await progress.edit(embed=make_embed(C_INFO,
+                    f"⏳ Progress: {unbanned}/{len(bans)} unbanned…"))
+            except Exception: pass
+
+    e = ok(f"✅ Unbanned **{unbanned}** users. Failed: **{failed}**.")
+    e.title = "🔓 Mass Unban Complete"
+    await progress.edit(embed=e)
+
+    config = await get_config(ctx.guild.id)
+    _log_mod_action(ctx.guild, config, "🔓 Mass Unban",
+        f"**Unbanned:** {unbanned} | **Failed:** {failed}\n**By:** {ctx.author.mention}", C_SUCCESS)
+
+
+# ─── Server Audit ─────────────────────────────────────────────────────────────
+
+_AUDIT_DANGEROUS_PERMS = (
+    "administrator", "ban_members", "kick_members", "manage_guild",
+    "manage_roles", "manage_channels", "manage_webhooks", "mention_everyone",
+)
+
+@bot.command(name="serveraudit", aliases=["audit"])
+@commands.has_permissions(administrator=True)
+@commands.cooldown(rate=1, per=30, type=commands.BucketType.guild)
+async def cmd_serveraudit(ctx: commands.Context):
+    """
+    Scan the server for common security/health issues. Admin only.
+    Usage: .serveraudit
+    """
+    if not ctx.guild: return
+    await ctx.message.add_reaction("⏳")
+
+    guild  = ctx.guild
+    issues = []
+    warns  = []
+
+    everyone = guild.default_role
+    for perm in _AUDIT_DANGEROUS_PERMS:
+        if getattr(everyone.permissions, perm, False):
+            issues.append(f"🔴 **@everyone** has `{perm}` — remove immediately")
+
+    for role in guild.roles:
+        if role.name == "@everyone": continue
+        member_count = sum(1 for m in guild.members if role in m.roles)
+        if member_count < 2: continue
+        for perm in _AUDIT_DANGEROUS_PERMS:
+            if getattr(role.permissions, perm, False) and perm != "administrator":
+                if member_count >= 10:
+                    warns.append(f"🟡 Role **@{role.name}** has `{perm}` — {member_count} members have it")
+                break
+
+    for role in guild.roles:
+        if role.name in ("@everyone",): continue
+        if role.permissions.administrator:
+            warns.append(f"🟡 Role **@{role.name}** has `administrator` — {sum(1 for m in guild.members if role in m.roles)} members")
+
+    no_role_members = [m for m in guild.members if not m.bot and len(m.roles) <= 1]
+    if no_role_members:
+        warns.append(f"🟡 **{len(no_role_members)}** member(s) have no roles assigned")
+
+    now = datetime.now(timezone.utc)
+    new_accts = []
+    for m in guild.members:
+        if m.bot: continue
+        acct_age = (now - m.created_at.replace(tzinfo=timezone.utc)).days if m.created_at else 999
+        join_age = (now - m.joined_at.replace(tzinfo=timezone.utc)).days if m.joined_at else 999
+        if acct_age < 7 and join_age < 3:
+            new_accts.append(m)
+    if new_accts:
+        warns.append(f"🟡 **{len(new_accts)}** very new account(s) joined in last 3 days (account <7 days old)")
+
+    broken_channels = []
+    for ch in guild.text_channels:
+        ow = ch.overwrites_for(everyone)
+        if ow.view_channel is False:
+            allowed_roles = [r for r, o in ch.overwrites.items()
+                             if isinstance(r, discord.Role) and o.view_channel is True]
+            if not allowed_roles and not any(
+                o.view_channel is True for r, o in ch.overwrites.items()
+                if isinstance(r, discord.Member)
+            ):
+                broken_channels.append(ch.name)
+    if broken_channels:
+        warns.append(f"🟡 **{len(broken_channels)}** channel(s) may be inaccessible to everyone: "
+                     + ", ".join(f"`#{n}`" for n in broken_channels[:5])
+                     + ("…" if len(broken_channels) > 5 else ""))
+
+    try:
+        webhooks = await guild.webhooks()
+        if len(webhooks) > 20:
+            warns.append(f"🟡 **{len(webhooks)}** webhooks exist — review for unused ones")
+    except discord.Forbidden:
+        pass
+
+    me = guild.me
+    if not me.guild_permissions.ban_members:
+        issues.append("🔴 Bot is missing **Ban Members** permission — moderation broken")
+    if not me.guild_permissions.kick_members:
+        issues.append("🔴 Bot is missing **Kick Members** permission — moderation broken")
+    if not me.guild_permissions.manage_roles:
+        warns.append("🟡 Bot is missing **Manage Roles** — level roles & autoroles won't work")
+    if not me.guild_permissions.manage_channels:
+        warns.append("🟡 Bot is missing **Manage Channels** — anti-raid unlock won't work")
+
+    await ctx.message.remove_reaction("⏳", ctx.guild.me)
+
+    if not issues and not warns:
+        e = make_embed(C_SUCCESS,
+            "✅ No issues found!\n\n"
+            f"Checked: {guild.member_count} members · {len(guild.roles)} roles · "
+            f"{len(guild.text_channels)} channels")
+        e.title = "🛡️ Server Audit — Clean"
+        await ctx.send(embed=e); return
+
+    desc_parts = []
+    if issues:
+        desc_parts.append("**🔴 Critical Issues**\n" + "\n".join(issues))
+    if warns:
+        desc_parts.append("**🟡 Warnings**\n" + "\n".join(warns))
+    desc_parts.append(
+        f"\n*Checked {guild.member_count} members · {len(guild.roles)} roles · "
+        f"{len(guild.text_channels)} channels*"
+    )
+
+    color = C_ERROR if issues else C_WARNING
+    e = make_embed(color, "\n\n".join(desc_parts))
+    e.title = f"🛡️ Server Audit — {len(issues)} critical · {len(warns)} warnings"
+    e.set_footer(text="Fix critical issues first. Green = no issues found.")
+    await ctx.send(embed=e)
+
+
+# ─── Ticket Rating System ─────────────────────────────────────────────────────
+
+class TicketRatingView(discord.ui.View):
+    def __init__(self, guild_id: int, ticket_id: int, closer_id: int):
+        super().__init__(timeout=3600)
+        self.guild_id  = guild_id
+        self.ticket_id = ticket_id
+        self.closer_id = closer_id
+        self.rated     = False
+
+    async def _submit_rating(self, interaction: discord.Interaction, stars: int):
+        if self.rated:
+            await interaction.response.send_message("You already rated this ticket.", ephemeral=True)
+            return
+        self.rated = True
+        for item in self.children:
+            item.disabled = True
+        await bot.db.rate_ticket(self.guild_id, self.ticket_id, interaction.user.id,
+                                  self.closer_id, stars)
+        star_str = "⭐" * stars + "☆" * (5 - stars)
+        await interaction.response.edit_message(
+            embed=make_embed(C_SUCCESS,
+                f"Thanks for rating! You gave **{star_str}** ({stars}/5)\n"
+                f"Your feedback helps us improve."),
+            view=self)
+
+    @discord.ui.button(label="⭐", style=discord.ButtonStyle.secondary, custom_id="rate:1")
+    async def r1(self, i, b): await self._submit_rating(i, 1)
+
+    @discord.ui.button(label="⭐⭐", style=discord.ButtonStyle.secondary, custom_id="rate:2")
+    async def r2(self, i, b): await self._submit_rating(i, 2)
+
+    @discord.ui.button(label="⭐⭐⭐", style=discord.ButtonStyle.secondary, custom_id="rate:3")
+    async def r3(self, i, b): await self._submit_rating(i, 3)
+
+    @discord.ui.button(label="⭐⭐⭐⭐", style=discord.ButtonStyle.secondary, custom_id="rate:4")
+    async def r4(self, i, b): await self._submit_rating(i, 4)
+
+    @discord.ui.button(label="⭐⭐⭐⭐⭐", style=discord.ButtonStyle.success, custom_id="rate:5")
+    async def r5(self, i, b): await self._submit_rating(i, 5)
+
+
+async def send_ticket_rating_dm(user: discord.User, guild_id: int, ticket_id: int,
+                                 closer_id: int):
+    try:
+        e = make_embed(C_PRIMARY,
+            "Your ticket has been closed. How was the support you received?\n\n"
+            "Click a star rating below (you have 1 hour).")
+        e.title = "🎫 Rate Your Support Experience"
+        view = TicketRatingView(guild_id, ticket_id, closer_id)
+        await user.send(embed=e, view=view)
+    except Exception:
+        pass
+
+
+@bot.command(name="ticketstats", aliases=["tsstats", "supportstats"])
+@commands.has_permissions(manage_guild=True)
+async def cmd_ticketstats(ctx: commands.Context):
+    """Show ticket statistics: average rating, totals, top staff. Usage: .ticketstats"""
+    if not ctx.guild: return
+
+    stats = await bot.db.get_ticket_stats(ctx.guild.id)
+
+    total_tickets  = stats.get("total_tickets", 0)
+    open_tickets   = stats.get("open_tickets", 0)
+    closed_tickets = stats.get("closed_tickets", 0)
+    total_ratings  = stats.get("total_ratings", 0)
+    avg_rating     = stats.get("avg_rating", 0.0)
+    top_closers    = stats.get("top_closers", [])
+
+    if total_ratings > 0:
+        full  = int(round(avg_rating))
+        stars = "⭐" * full + "☆" * (5 - full)
+        rating_str = f"{stars} **{avg_rating:.1f}/5** ({total_ratings} rating{'s' if total_ratings != 1 else ''})"
+    else:
+        rating_str = "No ratings yet"
+
+    staff_lines = []
+    for idx, entry in enumerate(top_closers[:5]):
+        m = ctx.guild.get_member(entry["closer_id"])
+        name = m.display_name if m else f"`{entry['closer_id']}`"
+        medals = ["🥇", "🥈", "🥉"]
+        prefix = medals[idx] if idx < 3 else f"`{idx+1}.`"
+        staff_lines.append(f"{prefix} {name} — {entry['count']} ticket{'s' if entry['count'] != 1 else ''} closed")
+
+    e = make_embed(C_PRIMARY)
+    e.title = "🎫 Ticket Statistics"
+    e.add_field(name="Total Tickets",  value=f"{total_tickets:,}", inline=True)
+    e.add_field(name="Open",           value=f"{open_tickets:,}",  inline=True)
+    e.add_field(name="Closed",         value=f"{closed_tickets:,}", inline=True)
+    e.add_field(name="Avg Rating",     value=rating_str, inline=False)
+    if staff_lines:
+        e.add_field(name="🏆 Most Active Staff",
+                    value="\n".join(staff_lines), inline=False)
+    else:
+        e.add_field(name="🏆 Most Active Staff", value="No data yet", inline=False)
+    e.set_footer(text="LXTE's AI — Ticket System")
+    await ctx.send(embed=e)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
