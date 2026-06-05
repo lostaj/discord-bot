@@ -39,6 +39,7 @@ import io, os, re, json, math, time, asyncio, logging, signal, collections, rand
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from urllib.parse import quote
+from email.utils import parsedate_to_datetime as _parsedate_to_datetime
 
 from dotenv import load_dotenv
 import psutil, httpx, discord
@@ -50,6 +51,13 @@ try:
     PILLOW_AVAILABLE = True
 except ImportError:
     PILLOW_AVAILABLE = False
+
+try:
+    from bson import ObjectId as _BsonObjectId
+    _BSON_AVAILABLE = True
+except ImportError:
+    _BsonObjectId = None
+    _BSON_AVAILABLE = False
 
 # ─── Slur / Swear Filter — bypass-resistant, zero dependencies ────────────────
 # Handles ALL known bypass techniques:
@@ -303,7 +311,6 @@ _add(r"[hн][hн]\s*[hн][hн]", "hh")   # HH / heil hitler shorthand
 # ── General swear words (fuck, shit, bitch, ass, etc.) intentionally excluded ─
 # This filter targets SLURS ONLY. Basic profanity is not caught here.
 
-PROFANITY_AVAILABLE = True
 print(f"✅ Slur filter v3 loaded — {len(_SLUR_PATTERNS)} patterns active")
 
 # ── Detection function ────────────────────────────────────────────────────────
@@ -336,7 +343,6 @@ C_GOLD    = 0xFFD700
 # ─── AI Models ────────────────────────────────────────────────────────────────
 # These are Groq model IDs — swap freely if you change providers
 AI_TEXT      = "openai/gpt-oss-20b"   # fast text model
-AI_VISION    = "meta-llama/llama-4-scout-17b-16e-instruct"       # vision (image inputs)
 AI_UNFILTERED = "openai/gpt-oss-20b"        # owner unfiltered — same fast model, less conservative than llama
 MAX_TOKENS  = 1024   # raised from 800 — gives room for fuller answers without blowing context
 TEMPERATURE = 0.60   # slightly higher — more natural, less robotic
@@ -362,6 +368,13 @@ ROBLOX_CHANNELS    = [
     "MacStudio",        # Mac Studio
     "MacPlayer",        # Mac Player
 ]
+_PLATFORM_LABELS = {
+    "WindowsStudio":   "Windows Studio",
+    "WindowsStudio64": "Windows Studio (64-bit)",
+    "WindowsPlayer":   "Windows Player",
+    "MacStudio":       "Mac Studio",
+    "MacPlayer":       "Mac Player",
+}
 # Yahoo Finance scrape-free endpoint
 YAHOO_QUOTE      = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
 # Web search result limit
@@ -588,11 +601,6 @@ BLOCKED = [
     r"new personality", r"you have no (rules?|restrictions?|limits?)",
 ]
 
-# ─── Member query triggers ────────────────────────────────────────────────────
-MEMBER_TRIGGER = re.compile(
-    r"\b(my|your|their|his|her)\s+(level|xp|role|rank|badge|streak|join|account)\b"
-    r"|who (am i|is @|are they)|@\w+|\b\d{17,20}\b", re.I)
-
 # Triggers for live server-wide data (leaderboard, members online, channels, etc.)
 SERVER_TRIGGER = re.compile(
     r"\b("
@@ -798,9 +806,6 @@ def get_role_for_level(level: int) -> Optional[str]:
         if level >= req:
             earned = name
     return earned
-
-def get_role_for_exact_level(level: int) -> Optional[str]:
-    return next((name for req, name in LEVEL_ROLES if req == level), None)
 
 def ts(dt: datetime) -> str:
     return f"<t:{int(dt.timestamp())}:R>"
@@ -1181,8 +1186,7 @@ class KeyRotator:
                         except (ValueError, TypeError):
                             # Some providers return ISO timestamp
                             try:
-                                from email.utils import parsedate_to_datetime
-                                ra = max(0.0, (parsedate_to_datetime(ra_header) -
+                                ra = max(0.0, (_parsedate_to_datetime(ra_header) -
                                                datetime.now(timezone.utc)).total_seconds())
                             except Exception: pass
                     self._mark_rate_limited(idx, ra)
@@ -1286,6 +1290,7 @@ class Database:
         self.user_memory    = db["user_memory"]
         self.cases          = db["cases"]
         self.tempmutes      = db["tempmutes"]
+        self.roblox_history = db["roblox_version_history"]
 
     async def _retry(self, coro_fn, *args, retries: int = 3, **kwargs):
         """
@@ -1340,6 +1345,7 @@ class Database:
             await self.cases.create_index([("guild_id",1),("case_number",1)], unique=True, background=True)
             await self.cases.create_index([("guild_id",1),("target_id",1)], background=True)
             await self.tempmutes.create_index("unmute_at", background=True)
+            await self.roblox_history.create_index("_id", background=True)
             logger.info("Indexes ready")
         except Exception as exc:
             logger.error("Index error: %s", exc)
@@ -1686,6 +1692,27 @@ class Database:
         await self.user_memory.update_one(
             {"user_id": uid},
             {"$set": {"memory": memory_str, "updated_at": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+
+    # ── Roblox Version History (shared across all channels) ──────────────────
+    async def get_roblox_history(self) -> list[str]:
+        """Return ordered list of all seen hashes (oldest first)."""
+        doc = await self.roblox_history.find_one({"_id": "global"})
+        return doc.get("hashes", []) if doc else []
+
+    async def push_roblox_hash(self, new_hash: str):
+        """Append a new hash to the shared history (cap at 50)."""
+        await self.roblox_history.update_one(
+            {"_id": "global"},
+            {
+                "$push": {
+                    "hashes": {
+                        "$each": [new_hash],
+                        "$slice": -50,
+                    }
+                },
+            },
             upsert=True,
         )
 
@@ -2108,8 +2135,7 @@ class AIEngine:
 
         # ── Extract and persist [MEMORY: ...] tag if requested ────────────────
         if update_memory and memory_uid:
-            import re as _re
-            mem_match = _re.search(r"\[MEMORY:\s*(.*?)\]", raw, _re.DOTALL | _re.IGNORECASE)
+            mem_match = re.search(r"\[MEMORY:\s*(.*?)\]", raw, re.DOTALL | re.IGNORECASE)
             if mem_match:
                 new_mem = mem_match.group(1).strip()[:300]
                 raw = raw[:mem_match.start()].rstrip()
@@ -2348,7 +2374,7 @@ _CTX_TRIGGERS: dict[str, re.Pattern] = {
         r"\b(config|settings?|automod|anti.?spam|anti.?nuke|setup|configured|enabled|disabled)\b", re.I),
     "analytics": re.compile(
         r"\b(member\s+count\s+history|growth|analytics|members?\s+over\s+time)\b", re.I),
-    "boosts": re.compile(
+    "leaderboard_boost": re.compile(
         r"\b(boost|boosting|boosted|nitro\s+boost|server\s+boost)\b", re.I),
     "double_xp": re.compile(
         r"\b(double\s*xp|2x\s*xp|xp\s+event|xp\s+boost)\b", re.I),
@@ -2356,13 +2382,10 @@ _CTX_TRIGGERS: dict[str, re.Pattern] = {
         r"\b(server\s+(name|id|info|stats|created|owner)|guild\s+(info|id)|about\s+the\s+server)\b", re.I),
 }
 
-# Sections that are always lightweight and always included
-_ALWAYS_SECTIONS = {"requesting_user", "channel", "recent_chat", "mentioned_members"}
-
 # Hard payload budget: chars before hitting API.
 # gpt-oss-20b context window is 32k tokens ≈ ~120k chars total.
-# System prompt ~4k + history ~10k + question ~1k = ~15k overhead.
-# Leave ~20k for context. Stay well under with 18k.
+# System prompt ~4k + history ~8k + question ~1k = ~13k overhead.
+# 18k for context gives a comfortable margin.
 _CTX_CHAR_BUDGET = 18_000
 
 
@@ -5265,6 +5288,7 @@ class LXTEBot(commands.Bot):
         self.owner_id_int:     int                = 0
         self.start_time:       Optional[datetime] = None
         self._roblox_versions: dict               = {}  # channel -> last hash
+        self._roblox_history:  list               = []  # shared list of all seen hashes
 
     async def on_ready(self):
         await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=".help"), status=discord.Status.online)
@@ -6007,45 +6031,76 @@ class LXTEBot(commands.Bot):
                         continue
 
                     last_hash = self._roblox_versions.get(channel)
+
+                    # First seen — seed history and current, no alert
                     if last_hash is None:
                         self._roblox_versions[channel] = new_hash
+                        if new_hash not in self._roblox_history:
+                            self._roblox_history.append(new_hash)
+                            if len(self._roblox_history) > 50:
+                                self._roblox_history = self._roblox_history[-50:]
+                            await bot.db.push_roblox_hash(new_hash)
                         await bot.db.update_config(0, "roblox_version_" + channel, new_hash)
                         continue
 
                     if new_hash == last_hash:
                         continue
 
+                    # Hash changed — classify the event
+                    is_revert   = new_hash in self._roblox_history
+                    is_upcoming = channel in ("WindowsStudio", "WindowsStudio64", "MacStudio") and \
+                                  self._roblox_versions.get("WindowsPlayer") != new_hash
+
+                    # Persist new hash
                     self._roblox_versions[channel] = new_hash
                     await bot.db.update_config(0, "roblox_version_" + channel, new_hash)
+                    if not is_revert:
+                        self._roblox_history.append(new_hash)
+                        if len(self._roblox_history) > 50:
+                            self._roblox_history = self._roblox_history[-50:]
+                        await bot.db.push_roblox_hash(new_hash)
 
-                    now = datetime.now(timezone.utc)
-                    _PLATFORM_LABELS = {
-                        "WindowsStudio":   "Windows Studio",
-                        "WindowsStudio64": "Windows Studio (64-bit)",
-                        "WindowsPlayer":   "Windows Player",
-                        "MacStudio":       "Mac Studio",
-                        "MacPlayer":       "Mac Player",
-                    }
+                    # Build the single embed
+                    now      = datetime.now(timezone.utc)
                     platform = _PLATFORM_LABELS.get(channel, channel)
-                    e = discord.Embed(color=0xFF0000)
-                    e.title = "\U0001F6A8 Roblox Update Detected!"
-                    e.description = "This is a live update, Roblox is **patched**."
-                    e.add_field(name="Platform",     value=platform,        inline=False)
-                    e.add_field(name="Version Hash", value="`" + new_hash + "`", inline=False)
-                    e.add_field(name="Date",         value=now.strftime("%A, %B %d, %Y %I:%M %p") + " UTC", inline=False)
+                    dl_url   = f"https://setup.rbxcdn.com/{new_hash}-RobloxPlayerLauncher.exe"
+
+                    if is_revert:
+                        color = 0xFEE75C   # yellow
+                        title = "⚠️ Roblox Has Reverted!"
+                        note  = "Roblox rolled back to a previous version."
+                    elif is_upcoming:
+                        color = 0x5865F2   # blurple
+                        title = "🔮 Upcoming Roblox Update Detected"
+                        note  = "Studio is ahead of Player — live update coming soon."
+                    else:
+                        color = 0xED4245   # red
+                        title = "🚨 Roblox Has Updated!"
+                        note  = "Roblox is now patched and live."
+
+                    e = discord.Embed(color=color, timestamp=now)
+                    e.title       = title
+                    e.description = note
+                    e.add_field(name="Platform",      value=platform,                                       inline=False)
+                    e.add_field(name="Version Hash",  value=f"`{new_hash}`",                               inline=False)
+                    e.add_field(name="Date",          value=now.strftime("%A, %B %d, %Y %I:%M %p") + " UTC", inline=False)
+                    if is_revert:
+                        e.add_field(name="Reverted From", value=f"`{last_hash}`", inline=False)
+                    if not is_upcoming:
+                        e.add_field(name="Download", value=f"[Click to download]({dl_url})", inline=False)
                     e.set_footer(text=now.strftime("%m/%d/%Y %I:%M %p") + "  •  " + now.strftime("%d/%m/%Y %H:%M"))
 
                     for g in self.guilds:
                         try:
-                            cfg = await bot.db.get_config(g.id)
+                            cfg   = await bot.db.get_config(g.id)
                             ch_id = cfg.get("roblox_update_channel_id")
                             if not ch_id:
                                 continue
                             ch = g.get_channel(ch_id)
                             if not ch:
                                 continue
-                            ping_id = cfg.get("roblox_update_role_id")
-                            ping_str = "<@&" + str(ping_id) + ">" if ping_id else None
+                            ping_id  = cfg.get("roblox_update_role_id")
+                            ping_str = f"<@&{ping_id}>" if ping_id else None
                             await ch.send(content=ping_str, embed=e)
                         except Exception as exc:
                             logger.warning("roblox alert %s: %s", g.name, exc)
@@ -6360,7 +6415,7 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
                 {"type": "image_url", "image_url": {"url": ctx.message.attachments[0].url}},
                 {"type": "text", "text": question},
             ]
-            model = AI_VISION
+            model = AI_TEXT  # vision handled by same model
         else:
             user_content = question
             model = AI_UNFILTERED if _owner_unfiltered else AI_TEXT
@@ -7450,10 +7505,7 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
         menus  = await bot.db.get_all_role_menus(ctx.guild.id)
         def _default(obj):
             if isinstance(obj, datetime): return obj.isoformat()
-            try:
-                from bson import ObjectId
-                if isinstance(obj, ObjectId): return str(obj)
-            except ImportError: pass
+            if _BSON_AVAILABLE and isinstance(obj, _BsonObjectId): return str(obj)
             return str(obj)
         backup = {
             "guild_id": ctx.guild.id, "guild_name": ctx.guild.name,
@@ -7478,10 +7530,7 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
 
         def _default(obj):
             if isinstance(obj, datetime): return obj.isoformat()
-            try:
-                from bson import ObjectId
-                if isinstance(obj, ObjectId): return str(obj)
-            except ImportError: pass
+            if _BSON_AVAILABLE and isinstance(obj, _BsonObjectId): return str(obj)
             return str(obj)
 
         def _strip(doc: dict) -> dict:
@@ -7604,15 +7653,21 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
         total_warns   = sum(len(g["warns"]) for g in guilds_data)
         total_xp      = sum(len(g["xp_data"]) for g in guilds_data)
         summary = (
-            f"**Snapshot saved** — `{fname}`\n"
+            f"**Snapshot saved to MongoDB** — `{fname}`\n"
             f"Guilds: {total_guilds} · Members: {total_members:,} · "
             f"XP records: {total_xp:,} · Warns: {total_warns:,} · "
             f"AI histories: {len(all_histories):,}"
         )
-        await ctx.send(
-            embed=ok(summary),
-            file=discord.File(fp=io.BytesIO(snapshot_json.encode()), filename=fname),
-        )
+        encoded = snapshot_json.encode()
+        if len(encoded) > 7_500_000:  # Discord 8MB limit safety margin
+            await ctx.send(embed=ok(
+                summary + f"\n\n⚠️ File too large to attach ({len(encoded)//1_048_576}MB). Saved to MongoDB only."
+            ))
+        else:
+            await ctx.send(
+                embed=ok(summary),
+                file=discord.File(fp=io.BytesIO(encoded), filename=fname),
+            )
 
     else:
         await ctx.send(embed=make_embed(C_INFO,
@@ -7996,6 +8051,7 @@ async def _startup():
     for _c in ROBLOX_CHANNELS:
         _v = _saved.get("roblox_version_" + _c)
         if _v: bot._roblox_versions[_c] = _v
+    bot._roblox_history = await db.get_roblox_history()
 
     rotator          = KeyRotator(groq_keys)
     bot.db           = db
