@@ -33,39 +33,12 @@ v24.0.0 — Changes from v23:
   - UPGRADED: `keys` admin action — shows per-key ok/total success rate alongside status.
   - FIXED: auto_web_search previously fired DDG only; now all specialists parallel.
   - FIXED: ask() and ask_stream() had diverged system prompts — now single source of truth.
-
-v24.0.0 — Changes from v23 (all bugs fixed):
-  - FIXED: on_audit_log_entry_create — server log elif-chain was broken; channel/role/guild logs
-           were NEVER firing. Server logs (channel_create/delete/update, role changes, etc.) now
-           correctly use an independent `if` block and fire on every relevant action.
-  - FIXED: ask_stream — streaming HTTP 401/403/429 errors now correctly penalise the key rotator
-           (dead/rate-limited). Previously a streaming failure silently fell through without marking
-           the key, so bad keys kept being selected.
-  - FIXED: msgsync --force flag was documented in the warning message but never handled in code.
-           Users running `.msgsync 500 --force` got the warning again instead of proceeding.
-  - FIXED: auto_web_search result filter is now type-safe. Previously `result.startswith("[")` could
-           crash if result was None or non-string. Now checks isinstance(str) first, and also filters
-           results starting with ❌ (specialist error strings).
-  - FIXED: giveaway_task now announces BEFORE marking ended in DB. Previously a crash between
-           `end_giveaway()` and `do_end_giveaway()` silently killed the giveaway with no winner.
-  - FIXED: ban/kick commands now perform the action BEFORE sending the DM. Previously on Forbidden,
-           the member would receive a "you've been banned/kicked" DM even though nothing happened.
-  - FIXED: run_automod now passes owner_id to _automod_swear. Previously the owner could be caught
-           by the slur filter (owner_id defaulted to 0 in the internal call).
-  - FIXED: cmd_level and cmd_lb now guard against DM usage (no more AttributeError on ctx.guild).
-  - FIXED: cmd_ask removes ⏳ reaction on inner AI exception — no dangling indicator.
-  - FIXED: _trim_history now skips (not stops at) oversized turns — more history is preserved
-           when a single large response is in the middle of the conversation.
-  - FIXED: user memory update now only fires for questions >20 chars (no wasted API calls on "hi").
-  - FIXED: ticket autoclose warns at 75% of timeout (was 50%), min 30min warning lead time.
-  - FIXED: warn auto-timeout now saves record to tempmute DB for full audit trail consistency.
-  - FIXED: build_context now strips .retry prefix from question text for correct trigger matching.
 """
 
 import io, os, re, json, math, time, asyncio, logging, signal, collections, random, functools
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 import psutil, httpx, discord
@@ -121,7 +94,6 @@ _C = r"[cç¢(сċćčĉ]"
 _D = r"[dďđ]"
 _E = r"[e3éèêëęėеë€ę]"
 _F = r"[fƒ]"
-_G = r"[g9ģğġĝ]"
 _H = r"[hнħĥ]"
 _I = r"[i1!|íìîïіїįĩ]"
 _J = r"[jĵ]"
@@ -181,7 +153,7 @@ _RB = r"(?![a-z])"    # right boundary
 #   Still safe: snigger niggardly trigger bigger digger niggle rigging
 
 # _G already includes 'q' for niqqa/niqqer substitution
-_G = r"[g9ģğġĝq]"   # shadow the module-level _G for these patterns
+_G = r"[g9ģğġĝq]"   # includes q for niqqa/niqqer substitution
 
 # Censor-char class: * # ^ ~ used for self-censoring like n*gga
 _CX = r"[\*#\^~]{1,3}"
@@ -417,8 +389,6 @@ _REALTIME_RE = re.compile(
 MAX_HISTORY_TURNS  = 10  # was 30 — 30 turns × big context = key exhaustion
 HISTORY_TTL_DAYS   = 14
 USER_COOLDOWN_SECS = 5.0
-_last_used:       dict[int, float] = {}
-_cmd_cooldowns:   dict[int, float] = {}
 
 # ─── Member Count ─────────────────────────────────────────────────────────────
 MEMBER_COUNT_CHANNEL_ID = 1508204390677352629
@@ -439,8 +409,6 @@ _voice_join_times: dict[tuple[int, int], float] = {}
 TICKET_AUTOCLOSE_HOURS = 48
 
 # ─── Staff Application Q&A ────────────────────────────────────────────────────
-STAFF_APP_OWNER_ID = 1509005864726560919
-
 STAFF_APP_QUESTIONS = [
     "How old are you?",
     "What is your timezone? (e.g. GMT, EST, PST)",
@@ -521,9 +489,6 @@ _nuke_active:      dict[int, bool]        = {}  # separate from _raid_active so 
 # Track executors seen in the current nuke window so we can act on them
 _nuke_executors:  dict[int, dict[int, list[str]]] = collections.defaultdict(lambda: collections.defaultdict(list))
 # guild_id -> {executor_id -> [action, ...]}
-
-# Spam tracker persistence interval (seconds) — flush to DB so restarts don't reset it
-SPAM_PERSIST_INTERVAL = 300
 
 # ─── Warn System (v23) ────────────────────────────────────────────────────────
 WARN_TIMEOUT_THRESHOLD = 3          # warns before auto-timeout
@@ -1429,8 +1394,6 @@ class Database:
         )
         invalidate_config(gid)
 
-    async def get_full_config(self, gid: int) -> dict:
-        return await self.config.find_one({"guild_id": gid}) or {}
 
     # ── Levels ────────────────────────────────────────────────────────────────
     async def get_level_data(self, uid: int, gid: int) -> dict:
@@ -2348,402 +2311,6 @@ async def build_member_context(member: discord.Member, guild: discord.Guild) -> 
     ]
     return "\n".join(lines)
 
-
-async def build_full_server_snapshot(guild: discord.Guild) -> str:
-    """
-    Complete live snapshot of everything the bot knows about the server.
-    Pulls from Discord gateway (in-memory, instant) + MongoDB (async DB queries run in parallel).
-    """
-    now = datetime.now(timezone.utc)
-    lines: list[str] = []
-
-    # ══ 1. SERVER IDENTITY ════════════════════════════════════════════════════
-    lines.append("╔══ SERVER IDENTITY ══╗")
-    owner = guild.owner
-    lines.append(
-        f"Name: {guild.name}  |  ID: {guild.id}\n"
-        f"Owner: {owner.display_name} (@{owner.name}, ID: {owner.id})" if owner else f"Name: {guild.name}  |  ID: {guild.id}"
-    )
-    lines.append(
-        f"Created: {guild.created_at.strftime('%Y-%m-%d')}  |  "
-        f"Verification: {guild.verification_level}  |  "
-        f"MFA required: {guild.mfa_level.value > 0}  |  "
-        f"Explicit filter: {guild.explicit_content_filter}"
-    )
-    lines.append(
-        f"Boost tier: {guild.premium_tier}  |  "
-        f"Boosts: {guild.premium_subscription_count or 0}  |  "
-        f"Max file size: {guild.filesize_limit // 1_048_576}MB  |  "
-        f"Max bitrate: {guild.bitrate_limit // 1000}kbps"
-    )
-    lines.append(f"Features: {', '.join(guild.features) or 'none'}")
-
-    # ══ 2. MEMBER COUNTS & ONLINE STATUS ═════════════════════════════════════
-    lines.append("\n╔══ MEMBERS — LIVE ══╗")
-    all_members  = guild.members
-    humans       = [m for m in all_members if not m.bot]
-    bots_list    = [m for m in all_members if m.bot]
-    online_h     = [m for m in humans if m.status == discord.Status.online]
-    idle_h       = [m for m in humans if m.status == discord.Status.idle]
-    dnd_h        = [m for m in humans if m.status == discord.Status.dnd]
-    offline_h    = [m for m in humans if m.status == discord.Status.offline]
-    mobile_h     = [m for m in humans if getattr(m, "mobile_status", discord.Status.offline) not in (discord.Status.offline, None)]
-    boosters     = [m for m in humans if m.premium_since]
-    admins       = [m for m in humans if m.guild_permissions.administrator]
-    moderators   = [m for m in humans if not m.guild_permissions.administrator and (
-                    m.guild_permissions.kick_members or m.guild_permissions.ban_members or m.guild_permissions.manage_messages)]
-
-    lines.append(
-        f"Total: {len(all_members)}  |  Humans: {len(humans)}  |  Bots: {len(bots_list)}\n"
-        f"🟢 Online: {len(online_h)}  |  🌙 Idle: {len(idle_h)}  |  🔴 DND: {len(dnd_h)}  |  ⚫ Offline: {len(offline_h)}\n"
-        f"📱 On mobile: {len(mobile_h)}  |  🚀 Boosters: {len(boosters)}  |  🛡️ Admins: {len(admins)}  |  ⚖️ Mods: {len(moderators)}"
-    )
-
-    # Who is online right now (names, up to 20)
-    if online_h:
-        names = ", ".join(m.display_name for m in online_h[:20])
-        extra = f" +{len(online_h)-20} more" if len(online_h) > 20 else ""
-        lines.append(f"Online now: {names}{extra}")
-    if idle_h:
-        names = ", ".join(m.display_name for m in idle_h[:10])
-        lines.append(f"Idle: {names}{'...' if len(idle_h) > 10 else ''}")
-    if dnd_h:
-        names = ", ".join(m.display_name for m in dnd_h[:10])
-        lines.append(f"DND: {names}{'...' if len(dnd_h) > 10 else ''}")
-    if boosters:
-        bnames = ", ".join(m.display_name for m in boosters)
-        lines.append(f"Current boosters: {bnames}")
-    if admins:
-        lines.append(f"Admins: {', '.join(m.display_name for m in admins)}")
-    if moderators:
-        lines.append(f"Moderators: {', '.join(m.display_name for m in moderators[:10])}")
-
-    # Bots in the server
-    lines.append(f"Bots: {', '.join(m.display_name for m in bots_list)}")
-
-    # Recently joined (last 10)
-    recent_joins = sorted([m for m in humans if m.joined_at], key=lambda m: m.joined_at, reverse=True)[:10]
-    if recent_joins:
-        rj = " | ".join(f"{m.display_name} (joined {m.joined_at.strftime('%Y-%m-%d')})" for m in recent_joins)
-        lines.append(f"Recently joined (newest first): {rj}")
-
-    # Members playing something / streaming / listening to Spotify
-    playing   = []
-    streaming = []
-    listening = []
-    for m in humans:
-        for act in (m.activities if hasattr(m, "activities") else ([m.activity] if m.activity else [])):
-            if isinstance(act, discord.Spotify):
-                listening.append(f"{m.display_name}: {act.title} by {act.artist}")
-            elif isinstance(act, discord.Streaming):
-                streaming.append(f"{m.display_name}: {act.name}")
-            elif isinstance(act, discord.Game):
-                playing.append(f"{m.display_name}: {act.name}")
-    if playing:   lines.append(f"Playing games: {' | '.join(playing[:10])}")
-    if streaming: lines.append(f"Streaming:      {' | '.join(streaming[:5])}")
-    if listening: lines.append(f"Listening:      {' | '.join(listening[:10])}")
-
-    # AFK members
-    afk_in_server = [(guild.get_member(uid), reason) for uid, (reason, _) in _afk_users.items() if guild.get_member(uid)]
-    if afk_in_server:
-        afk_str = " | ".join(f"{m.display_name}: {r}" for m, r in afk_in_server if m)
-        lines.append(f"AFK members: {afk_str}")
-
-    # ══ 3. VOICE CHANNELS — LIVE OCCUPANTS ═══════════════════════════════════
-    lines.append("\n╔══ VOICE CHANNELS — LIVE ══╗")
-    any_voice = False
-    for vc in sorted(guild.voice_channels, key=lambda c: c.position):
-        vc_humans = [m for m in vc.members if not m.bot]
-        vc_bots   = [m for m in vc.members if m.bot]
-        if vc_humans or vc_bots:
-            any_voice = True
-            member_parts = []
-            for m in vc_humans:
-                vs    = m.voice
-                flags = []
-                if vs and (vs.self_mute or vs.mute):   flags.append("muted")
-                if vs and (vs.self_deaf or vs.deaf):   flags.append("deaf")
-                if vs and vs.self_stream:              flags.append("streaming")
-                if vs and vs.self_video:               flags.append("cam")
-                flag_str = f"[{','.join(flags)}]" if flags else ""
-                member_parts.append(f"{m.display_name}{flag_str}")
-            bot_str = f" + bots: {', '.join(b.display_name for b in vc_bots)}" if vc_bots else ""
-            lines.append(f"  #{vc.name} ({vc.bitrate//1000}kbps, limit {vc.user_limit or '∞'}): {', '.join(member_parts)}{bot_str}")
-        else:
-            lines.append(f"  #{vc.name}: empty")
-    if not any_voice:
-        lines.append("  All voice channels empty")
-
-    # ══ 4. TEXT CHANNELS & CATEGORIES ════════════════════════════════════════
-    lines.append("\n╔══ CHANNELS & CATEGORIES ══╗")
-    # Uncategorised
-    uncategorised = [c for c in guild.text_channels if c.category is None]
-    if uncategorised:
-        lines.append(f"  [No category]: {', '.join(f'#{c.name}' for c in uncategorised)}")
-    # By category
-    for cat in sorted(guild.categories, key=lambda c: c.position):
-        txt = [c for c in cat.channels if isinstance(c, discord.TextChannel)]
-        vcs = [c for c in cat.channels if isinstance(c, discord.VoiceChannel)]
-        ch_str = ", ".join(
-            f"#{c.name}" + (" 🔒" if c.overwrites_for(guild.default_role).read_messages is False else "")
-            + (" 🔞" if getattr(c, "nsfw", False) else "")
-            + (f" [slow:{c.slowmode_delay}s]" if getattr(c, "slowmode_delay", 0) else "")
-            for c in txt
-        )
-        vc_str = f"  voice: {', '.join(f'#{v.name}' for v in vcs)}" if vcs else ""
-        lines.append(f"  [{cat.name}]: {ch_str or '(no text)'}{vc_str}")
-    lines.append(
-        f"Total: {len(guild.text_channels)} text | {len(guild.voice_channels)} voice "
-        f"| {len(guild.categories)} categories | {len(guild.stage_channels)} stages"
-    )
-
-    # ══ 5. ROLES — FULL LIST ══════════════════════════════════════════════════
-    lines.append("\n╔══ ROLES ══╗")
-    sorted_roles = sorted([r for r in guild.roles if r.name != "@everyone"], key=lambda r: r.position, reverse=True)
-    for r in sorted_roles:
-        color   = str(r.color) if r.color.value else "default"
-        flags   = []
-        if r.hoist:       flags.append("hoisted")
-        if r.mentionable: flags.append("mentionable")
-        if r.managed:     flags.append("managed/bot")
-        members_preview = ", ".join(m.display_name for m in r.members[:5] if not m.bot)
-        extra_m = f" +{len(r.members)-5} more" if len(r.members) > 5 else ""
-        lines.append(
-            f"  @{r.name} — {len(r.members)} members | color: {color} | "
-            f"{', '.join(flags) or 'no flags'} | members: {members_preview or 'none'}{extra_m}"
-        )
-
-    # ══ 6. XP LEADERBOARD (top 10) ════════════════════════════════════════════
-    lines.append("\n╔══ XP LEADERBOARD (top 10) ══╗")
-    try:
-        lb_rows = await bot.db.get_leaderboard(guild.id, 10)
-        if lb_rows:
-            for i, row in enumerate(lb_rows):
-                m    = guild.get_member(row["user_id"])
-                name = m.display_name if m else f"<id:{row['user_id']}>"
-                lv   = row.get("level", calculate_level(row.get("total_xp", 0))[0])
-                xp   = row.get("total_xp", 0)
-                stk  = row.get("streak", 0)
-                last = row.get("last_message_date")
-                last_str = last.strftime("%Y-%m-%d") if last else "?"
-                lines.append(f"  #{i+1} {name} — Lv {lv} | {xp:,} XP | 🔥{stk}d streak | last active: {last_str}")
-        else:
-            lines.append("  No XP data yet.")
-    except Exception as exc:
-        lines.append(f"  [XP leaderboard error: {exc}]")
-
-    # ══ 7. MESSAGE LEADERBOARD (top 10) ═══════════════════════════════════════
-    lines.append("\n╔══ MESSAGE LEADERBOARD (top 10) ══╗")
-    try:
-        msg_rows = await bot.db.get_msg_leaderboard(guild.id, 10)
-        if msg_rows:
-            for i, row in enumerate(msg_rows):
-                m     = guild.get_member(row["user_id"])
-                name  = m.display_name if m else f"<id:{row['user_id']}>"
-                cnt   = row.get("total_messages", 0)
-                first = row.get("first_message")
-                last  = row.get("last_message")
-                first_str = first.strftime("%Y-%m-%d") if first else "?"
-                last_str  = last.strftime("%Y-%m-%d") if last else "?"
-                lines.append(f"  #{i+1} {name} — {cnt:,} messages | first: {first_str} | last: {last_str}")
-        else:
-            lines.append("  No message tracking data yet.")
-    except Exception as exc:
-        lines.append(f"  [Message LB error: {exc}]")
-
-    # ══ 8. INVITE LEADERBOARD (top 10) ════════════════════════════════════════
-    lines.append("\n╔══ INVITE LEADERBOARD (top 10) ══╗")
-    try:
-        inv_rows = await bot.db.get_invite_leaderboard(guild.id, 10)
-        if inv_rows:
-            for i, row in enumerate(inv_rows):
-                m    = guild.get_member(row.get("inviter_id", 0))
-                name = m.display_name if m else str(row.get("inviter_id"))
-                cnt  = row.get("total_invites", 0)
-                lines.append(f"  #{i+1} {name} — {cnt} invite{'s' if cnt != 1 else ''}")
-        else:
-            lines.append("  No invite data yet.")
-    except Exception as exc:
-        lines.append(f"  [Invite LB error: {exc}]")
-
-    # ══ 9. BOOST LEADERBOARD ══════════════════════════════════════════════════
-    lines.append("\n╔══ BOOST LEADERBOARD ══╗")
-    try:
-        boost_rows = await bot.db.get_boost_leaderboard(guild.id, 10)
-        if boost_rows:
-            for i, row in enumerate(boost_rows):
-                m    = guild.get_member(row.get("user_id", 0))
-                name = m.display_name if m else str(row.get("user_id"))
-                cnt  = row.get("boost_count", 0)
-                fb   = row.get("first_boost")
-                fb_str = fb.strftime("%Y-%m-%d") if fb else "?"
-                lines.append(f"  #{i+1} {name} — {cnt} boost{'s' if cnt != 1 else ''} | first: {fb_str}")
-        else:
-            lines.append("  No boost data yet.")
-    except Exception as exc:
-        lines.append(f"  [Boost LB error: {exc}]")
-
-    # ══ 10. ACTIVE GIVEAWAYS ══════════════════════════════════════════════════
-    lines.append("\n╔══ ACTIVE GIVEAWAYS ══╗")
-    try:
-        giveaways = await bot.db.get_active_giveaways(guild.id)
-        if giveaways:
-            for g in giveaways:
-                host = guild.get_member(g.get("host_id", 0))
-                hname = host.display_name if host else str(g.get("host_id"))
-                ends  = g.get("ends_at")
-                ends_str = ends.strftime("%Y-%m-%d %H:%M UTC") if ends else "?"
-                lines.append(
-                    f"  Prize: {g.get('prize','?')} | "
-                    f"Host: {hname} | "
-                    f"Entries: {len(g.get('entrants', []))} | "
-                    f"Winners: {g.get('winners', 1)} | "
-                    f"Ends: {ends_str}"
-                )
-        else:
-            lines.append("  No active giveaways.")
-    except Exception as exc:
-        lines.append(f"  [Giveaway error: {exc}]")
-
-    # ══ 11. OPEN TICKETS ══════════════════════════════════════════════════════
-    lines.append("\n╔══ OPEN TICKETS ══╗")
-    try:
-        open_tickets = await bot.db.tickets.find(
-            {"guild_id": guild.id, "closed": False}
-        ).to_list(length=20)
-        if open_tickets:
-            for t in open_tickets:
-                opener = guild.get_member(t.get("user_id", 0))
-                oname  = opener.display_name if opener else str(t.get("user_id"))
-                ch     = guild.get_channel(t.get("channel_id", 0))
-                ch_str = f"#{ch.name}" if ch else "deleted channel"
-                opened = t.get("opened_at")
-                opened_str = opened.strftime("%Y-%m-%d %H:%M UTC") if opened else "?"
-                lines.append(f"  Ticket #{t.get('ticket_id','?')} | {oname} | {ch_str} | opened: {opened_str}")
-        else:
-            lines.append("  No open tickets.")
-    except Exception as exc:
-        lines.append(f"  [Ticket error: {exc}]")
-
-    # ══ 12. MEMBER COUNT HISTORY (last 7 days) ════════════════════════════════
-    lines.append("\n╔══ MEMBER COUNT HISTORY (last 7 days) ══╗")
-    try:
-        history = await bot.db.get_member_count_history(guild.id, 7)
-        if history:
-            for entry in history:
-                lines.append(f"  {entry.get('date','?')}: {entry.get('member_count','?')} members")
-        else:
-            lines.append("  No analytics snapshots yet.")
-    except Exception as exc:
-        lines.append(f"  [Analytics error: {exc}]")
-
-    # ══ 13. DOUBLE XP EVENT STATUS ════════════════════════════════════════════
-    lines.append("\n╔══ DOUBLE XP EVENT ══╗")
-    dxp_until = _doublexp_until.get(guild.id, 0)
-    if time.monotonic() < dxp_until:
-        remaining_secs = int(dxp_until - time.monotonic())
-        h, rem = divmod(remaining_secs, 3600)
-        m_min, s = divmod(rem, 60)
-        lines.append(f"  🔥 ACTIVE — {h}h {m_min}m {s}s remaining")
-    else:
-        lines.append("  Inactive")
-
-    # ══ 14. SERVER CONFIG SUMMARY ═════════════════════════════════════════════
-    lines.append("\n╔══ SERVER CONFIG ══╗")
-    try:
-        config = await get_config(guild.id)
-        def ch_name(key):
-            cid = config.get(key)
-            if not cid: return "not set"
-            ch  = guild.get_channel(cid)
-            return f"#{ch.name}" if ch else f"id:{cid}"
-        def role_name(key):
-            rid = config.get(key)
-            if not rid: return "not set"
-            r   = guild.get_role(rid)
-            return f"@{r.name}" if r else f"id:{rid}"
-        lines.append(
-            f"  Automod: {'✅' if config.get('automod_enabled', True) else '❌'}  |  "
-            f"Anti-nuke: {'✅' if config.get('antinuke_enabled', True) else '❌'}  |  "
-            f"Anti-spam: {'✅' if config.get('antispam_enabled', True) else '❌'}  |  "
-            f"Anti-swear: {'✅' if config.get('anti_swear_enabled', True) else '❌'}"
-        )
-        lines.append(
-            f"  Anti-caps: {'✅' if config.get('anti_caps_enabled') else '❌'}  |  "
-            f"Anti-emoji-spam: {'✅' if config.get('anti_emoji_spam_enabled') else '❌'}  |  "
-            f"Ghost-ping: {'✅' if config.get('anti_ghost_ping_enabled', True) else '❌'}  |  "
-            f"Mass-mention: {'✅' if config.get('anti_mass_mention_enabled', True) else '❌'}"
-        )
-        lines.append(
-            f"  Voice XP: {'✅' if config.get('voice_xp_enabled', True) else '❌'}  |  "
-            f"Web search in AI: {'✅' if config.get('web_search', True) else '❌'}  |  "
-            f"Owner mode: {'✅' if config.get('owner_mode_enabled', True) else '❌'}"
-        )
-        lines.append(f"  Welcome channel: {ch_name('welcome_channel_id')}  |  Welcome DM: {'✅' if config.get('welcome_dm_enabled') else '❌'}")
-        lines.append(f"  Log — messages: {ch_name('message_log_channel_id')}  |  automod: {ch_name('automod_log_channel_id')}  |  mod: {ch_name('mod_log_channel_id')}")
-        lines.append(f"  Log — entry: {ch_name('entry_log_channel_id')}  |  bot: {ch_name('bot_log_channel_id')}")
-        lines.append(f"  Ticket panel: {ch_name('ticket_panel_channel_id')}  |  Boost channel: {ch_name('boost_channel_id')}")
-        ai_channels = config.get("ai_channel_ids", [])
-        if ai_channels:
-            ai_ch_names = ", ".join(
-                f"#{guild.get_channel(cid).name}" if guild.get_channel(cid) else f"id:{cid}"
-                for cid in ai_channels
-            )
-            lines.append(f"  AI locked to: {ai_ch_names}")
-        else:
-            lines.append("  AI channels: unrestricted")
-        autoroles = config.get("autoroles", [])
-        if autoroles:
-            ar_names = ", ".join(
-                f"@{guild.get_role(e.get('role_id')).name}" if guild.get_role(e.get('role_id')) else "?"
-                for e in autoroles
-            )
-            lines.append(f"  Auto-roles: {ar_names}")
-        dxp_role_ids = config.get("double_xp_roles", [])
-        if dxp_role_ids:
-            dxp_names = ", ".join(
-                f"@{guild.get_role(rid).name}" if guild.get_role(rid) else f"id:{rid}"
-                for rid in dxp_role_ids
-            )
-            lines.append(f"  Double XP roles: {dxp_names}")
-        custom_sys = config.get("custom_system_prefix", "")
-        if custom_sys:
-            lines.append(f"  Custom AI prefix: {custom_sys[:80]}{'...' if len(custom_sys) > 80 else ''}")
-    except Exception as exc:
-        lines.append(f"  [Config error: {exc}]")
-
-    # ══ 15. REACTION ROLES & ROLE MENUS ══════════════════════════════════════
-    lines.append("\n╔══ REACTION ROLES & ROLE MENUS ══╗")
-    try:
-        rr_docs = await bot.db.get_all_reaction_roles(guild.id)
-        if rr_docs:
-            for doc in rr_docs[:5]:
-                ch  = guild.get_channel(doc.get("channel_id", 0))
-                mappings = doc.get("mappings", {})
-                map_str  = ", ".join(f"{emoji}→@{guild.get_role(rid).name if guild.get_role(rid) else rid}" for emoji, rid in list(mappings.items())[:5])
-                lines.append(f"  Reaction role msg {doc.get('message_id')} in {f'#{ch.name}' if ch else '?'}: {map_str}")
-        else:
-            lines.append("  No reaction roles set up.")
-    except Exception: pass
-    try:
-        rm_docs = await bot.db.get_all_role_menus(guild.id)
-        if rm_docs:
-            for doc in rm_docs[:5]:
-                roles_in_menu = [guild.get_role(r.get("role_id")) for r in doc.get("roles", [])]
-                r_names = ", ".join(f"@{r.name}" for r in roles_in_menu if r)
-                lines.append(f"  Role menu '{doc.get('menu_id')}': {r_names or 'empty'}")
-        else:
-            lines.append("  No role menus set up.")
-    except Exception: pass
-
-    # ══ TIMESTAMP ═════════════════════════════════════════════════════════════
-    lines.append(f"\n⏱ Snapshot taken: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    snapshot = "\n".join(lines)
-    # Hard cap — large servers can generate 200k+ char snapshots which blow Groq's payload limit.
-    # 80k chars ≈ ~20k tokens, leaving plenty of room for system prompt + history + question.
-    if len(snapshot) > 80_000:
-        snapshot = snapshot[:80_000] + "\n… [snapshot truncated]"
-    return snapshot
 
 
 
@@ -4443,23 +4010,23 @@ def _has_staff_role(member: discord.Member, config: dict, *keys: str) -> bool:
 
 def _is_senior_or_above(member: discord.Member, config: dict) -> bool:
     return _has_staff_role(member, config,
-        "staff_owner_role_id", "staff_manager_role_id",
+        "staff_owner_role_id",
         "staff_senior_mod_role_id")
 
 def _is_mod_or_above(member: discord.Member, config: dict) -> bool:
     return _has_staff_role(member, config,
-        "staff_owner_role_id", "staff_manager_role_id",
+        "staff_owner_role_id",
         "staff_senior_mod_role_id", "staff_mod_role_id")
 
 def _is_trial_or_above(member: discord.Member, config: dict) -> bool:
     return _has_staff_role(member, config,
-        "staff_owner_role_id", "staff_manager_role_id",
+        "staff_owner_role_id",
         "staff_senior_mod_role_id", "staff_mod_role_id",
         "staff_trial_mod_role_id")
 
 def _is_any_staff(member: discord.Member, config: dict) -> bool:
     return _has_staff_role(member, config,
-        "staff_owner_role_id", "staff_manager_role_id",
+        "staff_owner_role_id",
         "staff_senior_mod_role_id", "staff_mod_role_id",
         "staff_trial_mod_role_id", "staff_all_role_id",
         "staff_inv_bypass_role_id")
@@ -4624,8 +4191,7 @@ class OtherTicketModal(discord.ui.Modal, title="Open a Ticket"):
 # ── Staff app reviewer check ─────────────────────────────────────────────────
 async def _is_app_reviewer(user: discord.Member, guild: discord.Guild) -> bool:
     """True if user is the bot owner (env), hard-coded staff-app owner ID, OR has the configured reviewer role."""
-    # Check both the env-var owner and the hardcoded STAFF_APP_OWNER_ID so either works
-    if user.id == STAFF_APP_OWNER_ID or user.id == getattr(bot, 'owner_id_int', 0):
+    if user.id == getattr(bot, 'owner_id_int', 0):
         return True
     config = await get_config(guild.id)
     role_id = config.get("staff_app_reviewer_role_id")
@@ -4791,7 +4357,7 @@ async def _finish_staff_app(channel: discord.TextChannel, session: dict, guild: 
 
     # ── Ping owner with summary + accept/deny buttons ──────────────────────
     view = StaffAppReviewView(applicant_id=session["user_id"], ticket_channel_id=channel.id)
-    await channel.send(content=f"<@{STAFF_APP_OWNER_ID}>", embed=e, view=view)
+    await channel.send(content=f"<@{getattr(bot, 'owner_id_int', 0)}>", embed=e, view=view)
 
 async def _create_ticket(i: discord.Interaction, cid: str, answers: dict):
     guild  = i.guild
@@ -4897,14 +4463,6 @@ class TicketOpenView(discord.ui.View):
         if await bot.db.count_open_tickets(i.guild.id, i.user.id) >= 1:
             await i.response.send_message(embed=err("You already have an open ticket."), ephemeral=True); return
         await i.response.send_message(embed=make_embed(C_PRIMARY, "Select a category:"), view=TicketCategorySelect(), ephemeral=True)
-
-class TicketCloseView(discord.ui.View):
-    """Legacy alias kept for any old persistent buttons already in chat — forwards to TicketControlView logic."""
-    def __init__(self): super().__init__(timeout=None)
-
-    @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.danger, custom_id="ticket:close")
-    async def btn_close(self, i: discord.Interaction, b):
-        await _do_close_ticket(i)
 
 
 # ── Shared ticket helpers ─────────────────────────────────────────────────────
@@ -5722,7 +5280,7 @@ class LXTEBot(commands.Bot):
                     e.title = "🟢 Bot Online"
                     await lc.send(embed=e)
             except Exception: pass
-        self.add_view(TicketOpenView()); self.add_view(TicketCloseView()); self.add_view(TicketControlView())
+        self.add_view(TicketOpenView()); self.add_view(TicketControlView())
         self.add_view(GiveawayEnterView())
         for guild in self.guilds:
             for menu in await self.db.get_all_role_menus(guild.id):
@@ -5749,7 +5307,6 @@ class LXTEBot(commands.Bot):
         self.nightly_task.start()
         self.ticket_autoclose_task.start()
         self.giveaway_task.start()
-        self.spam_persist_task.start()
         self.roblox_version_task.start()
         self.tempmute_task.start()
         # Restore double-XP events that were active before restart
@@ -6333,7 +5890,7 @@ class LXTEBot(commands.Bot):
     async def cleanup_task(self):
         try:
             cutoff = time.monotonic() - 3600
-            for d in (_last_used, _xp_cooldowns, _cmd_cooldowns):
+            for d in (_xp_cooldowns,):
                 for k in [k for k, v in d.items() if v < cutoff]: del d[k]
             # Prune stale user entries from spam/dup trackers — prevents unbounded growth
             now_m = time.monotonic()
@@ -6346,41 +5903,6 @@ class LXTEBot(commands.Bot):
         except Exception as exc:
             logger.warning("cleanup_task: %s", exc)
 
-    @tasks.loop(seconds=SPAM_PERSIST_INTERVAL)
-    async def spam_persist_task(self):
-        """Persist spam tracker state to DB so bot restarts don't reset it.
-        Stores a snapshot; on restart the in-memory dicts start empty but DB
-        can be queried for recent violations if needed (audit trail only)."""
-        if not self.db: return
-        try:
-            snapshots = []
-            now = datetime.now(timezone.utc)
-            for uid, timestamps in list(_spam_tracker.items()):
-                if timestamps:
-                    snapshots.append({
-                        "user_id": uid, "type": "rate",
-                        "count": len(timestamps), "snapshot_at": now,
-                    })
-            for uid, contents in list(_dup_tracker.items()):
-                if contents:
-                    snapshots.append({
-                        "user_id": uid, "type": "dup",
-                        "count": len(contents), "snapshot_at": now,
-                    })
-            if snapshots:
-                # Just upsert a summary document per user — not the raw timestamps
-                from pymongo import UpdateOne
-                ops = [
-                    UpdateOne(
-                        {"user_id": s["user_id"], "type": s["type"]},
-                        {"$set": s},
-                        upsert=True,
-                    )
-                    for s in snapshots
-                ]
-                await self.db._client["lxte_assistant"]["spam_snapshots"].bulk_write(ops, ordered=False)
-        except Exception as exc:
-            logger.warning("spam_persist: %s", exc)
 
     @tasks.loop(seconds=VOICE_XP_INTERVAL)
     async def voice_xp_task(self):
@@ -6562,7 +6084,6 @@ class LXTEBot(commands.Bot):
     @nightly_task.before_loop
     @ticket_autoclose_task.before_loop
     @giveaway_task.before_loop
-    @spam_persist_task.before_loop
     @roblox_version_task.before_loop
     @tempmute_task.before_loop
     async def before_tasks(self): await self.wait_until_ready()
@@ -7064,28 +6585,9 @@ async def cmd_level(ctx: commands.Context, target: discord.Member = None):
     data   = await bot.db.get_level_data(target.id, ctx.guild.id)
     buf    = await generate_rank_card(target, data)
     if buf:
-        await ctx.send(file=discord.File(fp=buf, filename="rank.png")); return
-    total_xp = data.get("total_xp", 0)
-    level, xp_in, xp_need = calculate_level(total_xp)
-    bar       = progress_bar(xp_in, xp_need)
-    badges    = " ".join(a["emoji"] for a in ACHIEVEMENTS if a["id"] in data.get("badges", [])) or "None"
-    cur_role  = get_role_for_level(level)
-    next_role = next_lv = None
-    for req, name in LEVEL_ROLES:
-        if req > level: next_role, next_lv = name, req; break
-    e = make_embed(C_GOLD)
-    e.title = f"{target.display_name}'s Level"
-    e.set_thumbnail(url=target.display_avatar.url)
-    e.add_field(name="Level",    value=f"{level}",                   inline=True)
-    e.add_field(name="Total XP", value=f"{total_xp:,}",              inline=True)
-    e.add_field(name="Messages", value=f"{data.get('messages',0):,}", inline=True)
-    e.add_field(name="Streak",   value=f"🔥 {data.get('streak',0)}d", inline=True)
-    e.add_field(name="Progress", value=f"`{bar}` {xp_in:,}/{xp_need:,} XP", inline=False)
-    if cur_role:  e.add_field(name="Current Role", value=cur_role,                      inline=True)
-    if next_role: e.add_field(name="Next Role",    value=f"{next_role} (Lv {next_lv})", inline=True)
-    e.add_field(name="Badges", value=badges, inline=False)
-    e.set_footer(text="LXTE's AI")
-    await ctx.send(embed=e)
+        await ctx.send(file=discord.File(fp=buf, filename="rank.png"))
+    else:
+        await ctx.send(embed=err("Rank card unavailable — Pillow not installed on this host."))
 
 
 @bot.command(name="leaderboard", aliases=["lb"])
@@ -7944,7 +7446,7 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
 
     elif action == "backup":
         if not ctx.guild: return
-        config = await bot.db.get_full_config(ctx.guild.id)
+        config = await bot.db.get_config(ctx.guild.id)
         menus  = await bot.db.get_all_role_menus(ctx.guild.id)
         def _default(obj):
             if isinstance(obj, datetime): return obj.isoformat()
@@ -8019,7 +7521,7 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
             await bot.db.record_member_count(guild.id, guild.member_count)
 
             # Config & role menus & reaction roles
-            config       = _strip(await bot.db.get_full_config(guild.id))
+            config       = _strip(await bot.db.get_config(guild.id))
             role_menus   = [_strip(m) for m in await bot.db.get_all_role_menus(guild.id)]
             react_roles  = [_strip(r) for r in await bot.db.get_all_reaction_roles(guild.id)]
 
@@ -8466,14 +7968,9 @@ async def slash_level(interaction: discord.Interaction, user: discord.User = Non
     member = interaction.guild.get_member(target.id)
     if member:
         buf = await generate_rank_card(member, data)
-        if buf: await interaction.followup.send(file=discord.File(fp=buf, filename="rank.png")); return
-    total_xp = data.get("total_xp", 0)
-    level, xp_in, xp_need = calculate_level(total_xp)
-    e = make_embed(C_GOLD, f"`{progress_bar(xp_in, xp_need)}` {xp_in}/{xp_need}")
-    e.title = f"{target.display_name}'s Level"
-    e.add_field(name="Level", value=f"{level}", inline=True)
-    e.add_field(name="XP",    value=f"{total_xp:,}", inline=True)
-    await interaction.followup.send(embed=e)
+        if buf:
+            await interaction.followup.send(file=discord.File(fp=buf, filename="rank.png")); return
+    await interaction.followup.send(embed=err("Rank card unavailable — Pillow not installed on this host."), ephemeral=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
