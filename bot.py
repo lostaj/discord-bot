@@ -8249,7 +8249,9 @@ async def cmd_rolepersist(ctx: commands.Context, action: str = None, member: dis
         lines = []
         for doc in docs:
             m = ctx.guild.get_member(doc["user_id"]); r = ctx.guild.get_role(doc["role_id"])
-            lines.append(f"{m.mention if m else f'`{doc["user_id"]}`'} → {r.mention if r else f'`{doc["role_id"]}`'}")
+            uid_str = m.mention if m else f"`{doc['user_id']}`"
+            rid_str = r.mention if r else f"`{doc['role_id']}`"
+            lines.append(f"{uid_str} → {rid_str}")
         e = make_embed(C_INFO, "\n".join(lines)); e.title = "🔒 Role Persists"
         await ctx.send(embed=e); return
     if not member or not role_name:
