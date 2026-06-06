@@ -4717,11 +4717,15 @@ class RoleMenuView(discord.ui.View):
 
 async def update_member_count(guild: discord.Guild):
     ch = guild.get_channel(MEMBER_COUNT_CHANNEL_ID)
-    if not ch: return
+    if not ch:
+        logger.warning("Member count: channel %s not found in guild %s", MEMBER_COUNT_CHANNEL_ID, guild.id)
+        return
     name = MEMBER_COUNT_FORMAT.format(count=guild.member_count)
-    if ch.name != name:
-        try: await ch.edit(name=name, reason="Member count update")
-        except Exception as e: logger.warning("Member count: %s", e)
+    try:
+        await ch.edit(name=name, reason="Member count update")
+        logger.info("Member count updated → %s", name)
+    except Exception as e:
+        logger.warning("Member count edit failed: %s", e)
 
 WELCOME_CHANNEL_ID = 1507918341551952026  # #general — always send here regardless of config
 
