@@ -3937,81 +3937,125 @@ async def _fake_perms_list_embed(guild: discord.Guild) -> discord.Embed:
     return e
 
 
-class FakePermsGrantModal(discord.ui.Modal, title="Grant Fake Perms"):
-    role_name  = discord.ui.TextInput(label="Role Name", placeholder="e.g. Moderator", max_length=100)
-    perms_list = discord.ui.TextInput(
-        label="Permissions (comma-separated)",
-        placeholder="ban_members, kick_members, manage_messages",
-        style=discord.TextStyle.paragraph, max_length=300,
-    )
-    def __init__(self, guild_id: int):
-        super().__init__()
-        self.guild_id = guild_id
-    async def on_submit(self, i: discord.Interaction):
-        role = resolve_role(i.guild, self.role_name.value.strip())
-        if not role:
-            await i.response.send_message(embed=err(f"Role `{self.role_name.value}` not found."), ephemeral=True); return
-        raw   = [p.strip().lower().replace(" ", "_") for p in self.perms_list.value.split(",") if p.strip()]
-        valid = [p for p in raw if p in FAKE_PERM_LABELS]
-        bad   = [p for p in raw if p not in FAKE_PERM_LABELS]
-        if not valid:
-            await i.response.send_message(
-                embed=err(f"No valid perms. Valid: {', '.join(f'`{k}`' for k in FAKE_PERM_LABELS)}"),
-                ephemeral=True); return
-        await bot.db.db["fake_perms"].update_one(
-            {"guild_id": self.guild_id, "role_id": role.id},
-            {"$addToSet": {"perms": {"$each": valid}}}, upsert=True)
-        msg = f"✅ Granted `{', '.join(valid)}` to {role.mention}."
-        if bad: msg += f"\n⚠️ Unknown perms skipped: `{', '.join(bad)}`"
-        await i.response.send_message(embed=ok(msg), ephemeral=True)
+# ── Step 2: pick permissions (multi-select dropdown) ─────────────────────────
 
-
-class FakePermsRevokeModal(discord.ui.Modal, title="Revoke Fake Perms"):
-    role_name  = discord.ui.TextInput(label="Role Name", placeholder="e.g. Moderator", max_length=100)
-    perms_list = discord.ui.TextInput(
-        label="Permissions to revoke (comma-sep, or 'all')",
-        placeholder="ban_members, kick_members  OR  all",
-        style=discord.TextStyle.paragraph, max_length=300,
-    )
-    def __init__(self, guild_id: int):
-        super().__init__()
+class FakePermsPickPermsSelect(discord.ui.Select):
+    """Multi-select dropdown for choosing permissions."""
+    def __init__(self, guild_id: int, role: discord.Role, action: str):
         self.guild_id = guild_id
-    async def on_submit(self, i: discord.Interaction):
-        role = resolve_role(i.guild, self.role_name.value.strip())
-        if not role:
-            await i.response.send_message(embed=err(f"Role `{self.role_name.value}` not found."), ephemeral=True); return
-        raw = self.perms_list.value.strip().lower()
-        if raw == "all":
-            await bot.db.db["fake_perms"].delete_one({"guild_id": self.guild_id, "role_id": role.id})
-            await i.response.send_message(embed=ok(f"✅ All fake perms cleared for {role.mention}."), ephemeral=True)
-        else:
-            perms = [p.strip().replace(" ", "_") for p in raw.split(",") if p.strip()]
+        self.role     = role
+        self.action   = action  # "grant" or "revoke"
+        options = [
+            discord.SelectOption(label=perm.replace("_", " ").title(),
+                                 value=perm,
+                                 description=desc[:100])
+            for perm, desc in FAKE_PERM_LABELS.items()
+        ]
+        super().__init__(
+            placeholder="Select one or more permissions…",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+        )
+
+    async def callback(self, i: discord.Interaction):
+        chosen = self.values
+        if self.action == "grant":
             await bot.db.db["fake_perms"].update_one(
-                {"guild_id": self.guild_id, "role_id": role.id},
-                {"$pullAll": {"perms": perms}})
-            await i.response.send_message(embed=ok(f"✅ Revoked `{', '.join(perms)}` from {role.mention}."), ephemeral=True)
+                {"guild_id": self.guild_id, "role_id": self.role.id},
+                {"$addToSet": {"perms": {"$each": chosen}}},
+                upsert=True,
+            )
+            label = "Granted"
+            color = C_SUCCESS
+        else:
+            await bot.db.db["fake_perms"].update_one(
+                {"guild_id": self.guild_id, "role_id": self.role.id},
+                {"$pullAll": {"perms": chosen}},
+            )
+            label = "Revoked"
+            color = C_ERROR
+        perm_str = ", ".join(f"`{p}`" for p in chosen)
+        await i.response.edit_message(
+            embed=make_embed(color, f"✅ **{label}** {perm_str} for {self.role.mention}."),
+            view=None,
+        )
 
+
+class FakePermsPickPermsView(discord.ui.View):
+    def __init__(self, guild_id: int, role: discord.Role, action: str):
+        super().__init__(timeout=120)
+        self.add_item(FakePermsPickPermsSelect(guild_id, role, action))
+
+
+# ── Step 1: pick a role (role dropdown) ──────────────────────────────────────
+
+class FakePermsPickRoleSelect(discord.ui.Select):
+    """Role dropdown — shows up to 25 server roles."""
+    def __init__(self, guild: discord.Guild, action: str):
+        self.action = action
+        # Skip @everyone and bot-managed roles; take first 25
+        roles = [r for r in reversed(guild.roles) if not r.is_default() and not r.managed][:25]
+        options = [
+            discord.SelectOption(label=r.name[:100], value=str(r.id))
+            for r in roles
+        ] or [discord.SelectOption(label="(no roles found)", value="0")]
+        super().__init__(placeholder="Select a role…", min_values=1, max_values=1, options=options)
+        self.guild = guild
+
+    async def callback(self, i: discord.Interaction):
+        role_id = int(self.values[0])
+        role    = self.guild.get_role(role_id)
+        if not role:
+            await i.response.send_message(embed=err("Role not found."), ephemeral=True); return
+        action_label = "grant to" if self.action == "grant" else "revoke from"
+        e = make_embed(C_PRIMARY,
+            f"Now pick which permissions to **{self.action}** for {role.mention}.")
+        e.title = f"{'➕ Grant' if self.action == 'grant' else '➖ Revoke'} — Step 2/2"
+        await i.response.edit_message(
+            embed=e,
+            view=FakePermsPickPermsView(i.guild.id, role, self.action),
+        )
+
+
+class FakePermsPickRoleView(discord.ui.View):
+    def __init__(self, guild: discord.Guild, action: str):
+        super().__init__(timeout=120)
+        self.add_item(FakePermsPickRoleSelect(guild, action))
+
+
+# ── Main control panel ────────────────────────────────────────────────────────
 
 class FakePermsSetupView(discord.ui.View):
     def __init__(self, owner_id: int, guild_id: int):
         super().__init__(timeout=300)
         self.owner_id = owner_id
         self.guild_id = guild_id
+
     async def interaction_check(self, i: discord.Interaction) -> bool:
         if not i.user.guild_permissions.administrator:
-            await i.response.send_message(embed=err("Admins only."), ephemeral=True); return False
+            await i.response.send_message(embed=err("Admins only."), ephemeral=True)
+            return False
         return True
-    @discord.ui.button(label="➕ Grant Perms",  style=discord.ButtonStyle.success,   row=0)
+
+    @discord.ui.button(label="➕ Grant Perms", style=discord.ButtonStyle.success, row=0)
     async def btn_grant(self, i: discord.Interaction, b):
-        await i.response.send_modal(FakePermsGrantModal(self.guild_id))
-    @discord.ui.button(label="➖ Revoke Perms", style=discord.ButtonStyle.danger,    row=0)
+        e = make_embed(C_PRIMARY, "**Step 1 of 2** — Pick the role you want to **grant** permissions to.")
+        e.title = "➕ Grant Fake Perms"
+        await i.response.send_message(embed=e, view=FakePermsPickRoleView(i.guild, "grant"), ephemeral=True)
+
+    @discord.ui.button(label="➖ Revoke Perms", style=discord.ButtonStyle.danger, row=0)
     async def btn_revoke(self, i: discord.Interaction, b):
-        await i.response.send_modal(FakePermsRevokeModal(self.guild_id))
-    @discord.ui.button(label="📋 View All",     style=discord.ButtonStyle.secondary, row=0)
+        e = make_embed(C_WARNING, "**Step 1 of 2** — Pick the role you want to **revoke** permissions from.")
+        e.title = "➖ Revoke Fake Perms"
+        await i.response.send_message(embed=e, view=FakePermsPickRoleView(i.guild, "revoke"), ephemeral=True)
+
+    @discord.ui.button(label="📋 View All", style=discord.ButtonStyle.secondary, row=0)
     async def btn_view(self, i: discord.Interaction, b):
         e = await _fake_perms_list_embed(i.guild)
         await i.response.send_message(embed=e, ephemeral=True)
-    @discord.ui.button(label="🗑️ Reset All",    style=discord.ButtonStyle.danger,    row=1)
+
+    @discord.ui.button(label="🗑️ Reset All", style=discord.ButtonStyle.danger, row=1)
     async def btn_reset(self, i: discord.Interaction, b):
         await bot.db.db["fake_perms"].delete_many({"guild_id": self.guild_id})
         await i.response.send_message(embed=ok("✅ All fake perms cleared for this server."), ephemeral=True)
@@ -6192,168 +6236,334 @@ def ai_reply_content(answer: str) -> str:
 
 def build_help_embed(category: str, user=None) -> discord.Embed:
     avatar = bot.user.display_avatar.url if bot.user else None
+    footer = "Prefix: .  |  All commands work in any server this bot is in."
 
-    if category == "ai":
-        e = make_embed(C_AI, (
-            "`.ask <question>` — ask anything  (also `.ai` `.q`)\n"
-            "Mention or reply to the bot works too.\n"
-            "Attach an image to analyze it.\n\n"
-            "`.clear` — wipe your chat history\n"
-            "`.retry` — re-run your last question\n\n"
-            "8s cooldown · auto web search · fully filtered"
-        ))
+    # ── Home ──────────────────────────────────────────────────────────────────
+    if category == "home":
+        e = make_embed(C_PRIMARY,
+            "Use the dropdown below to browse all commands.\n"
+            "Prefix: **`.`**   Slash commands also supported where shown.\n\n"
+            "🤖 **AI** — ask questions, image analysis, web search\n"
+            "⬆️ **Leveling** — XP, rank cards, leaderboard, daily\n"
+            "🔨 **Moderation** — warn, ban, mute, purge, cases\n"
+            "📢 **Reports & Safety** — .report, .tempban, .serveraudit\n"
+            "🎟️ **Tickets** — open, claim, close, transcripts, ratings\n"
+            "🎉 **Giveaways** — start, end, reroll, list\n"
+            "📊 **Analytics & Stats** — server growth, leaderboards\n"
+            "💬 **Social & Info** — AFK, invites, user/server info\n"
+            "🛡️ **Staff System** — roles, permissions, abuse protection\n"
+            "🔒 **Admin** — setup, snapshots, config *(admins only)*\n"
+        )
+        e.title = "Help — Command Reference"
+        e.set_thumbnail(url=avatar)
+        e.set_footer(text=footer, icon_url=avatar)
+        return e
+
+    # ── AI ────────────────────────────────────────────────────────────────────
+    elif category == "ai":
+        e = make_embed(C_AI,
+            "**Asking questions**\n"
+            "`.ask <question>` — ask the AI anything  *(also* `.ai` */* `.q`*)*\n"
+            "Mention or reply to the bot — no prefix needed.\n"
+            "Attach an image to have it analysed.\n\n"
+            "**History**\n"
+            "`.clear` — wipe your conversation history  *(also* `.reset` */* `.forget`*)*\n"
+            "`.retry` — re-run your last question with a fresh response\n\n"
+            "**Owner-only**\n"
+            "`.unfiltered` — disable safety filters for owner session\n"
+            "`.filtered` — re-enable safety filters\n\n"
+            "**Notes**\n"
+            "• 8 second cooldown per user\n"
+            "• Auto web search fires for real-time topics (weather, prices, news)\n"
+            "• History kept per channel · expires after 14 days\n"
+            "• The bot remembers things about you across conversations"
+        )
         e.title = "🤖 AI"
-        e.set_footer(text="LXTE's AI", icon_url=avatar)
+        e.set_footer(text=footer, icon_url=avatar)
         return e
 
+    # ── Leveling ──────────────────────────────────────────────────────────────
     elif category == "leveling":
-        e = make_embed(C_GOLD, (
-            f"Messages earn **3–15 XP** (×2 during events).\n"
-            f"+{STREAK_BONUS_XP} XP for daily streak · +{VOICE_XP_PER_TICK} XP/min in voice.\n\n"
-            "`.lb` — XP leaderboard\n"
-            "`.level [@user]` — rank card  (also `.xp` `.profile`)\n"
-            "`/level [@user]` — slash version\n\n"
-            "Roles unlock automatically as you level up."
-        ))
-        e.title = "⬆️ Leveling"
-        e.set_footer(text="LXTE's AI", icon_url=avatar)
+        e = make_embed(C_GOLD,
+            "**Earning XP**\n"
+            f"Messages earn **3–15 XP** (30s cooldown between gains).\n"
+            f"+{STREAK_BONUS_XP} XP bonus for daily streak · +{VOICE_XP_PER_TICK} XP/min in voice.\n"
+            f"Double XP events multiply all gains by 2×.\n\n"
+            "**Commands**\n"
+            "`.level [@user]` — view rank card  *(also* `.xp` */* `.card` */* `.profile`*)*\n"
+            "`/level [@user]` — slash version of rank card\n"
+            "`.lb` — XP leaderboard  *(also* `.leaderboard`*)*\n"
+            "`.daily` — claim your daily XP bonus (once per 24h)\n"
+            "`.roles` — list all level-up roles and their unlock levels\n\n"
+            "**Staff / Admin**\n"
+            "`.doublexp <duration>` — start a 2× XP event  *(e.g.* `2h`*,* `1d`*)  (also* `.2xp`*)*\n"
+            "`.doublexp off` — end the event early\n"
+            "`.syncroles` — force-sync level roles for all members\n"
+            "`.admin resetxp <user_id>` — wipe a user's XP *(admin only)*"
+        )
+        e.title = "⬆️ Leveling & XP"
+        e.set_footer(text=footer, icon_url=avatar)
         return e
 
-    elif category == "analytics":
-        e = make_embed(C_PRIMARY, (
-            "**📊 Server Stats**\n"
-            "`.analytics growth` — member count over 30 days\n"
-            "`.analytics activity` — top 5 most active members\n"
-            "`.analytics streaks` — streak leaderboard\n\n"
-            "**📈 Leaderboards**\n"
-            "`.boostlb` — top boosters\n"
-            "`.invitelb` — top inviters\n"
-            "`.lb` — XP leaderboard\n"
-            "`.msglb` — message leaderboard\n\n"
-            "**👤 Per-User Stats**\n"
-            "`.msgcheck [@user]` — message count, rank & top channels\n"
-            "`.stats` — your AI question count"
-        ))
-        e.title = "📊 Analytics"
-        e.set_footer(text="LXTE's AI", icon_url=avatar)
-        return e
-
-    elif category == "social":
-        e = make_embed(C_INFO, (
-            "`.afk <reason>` — set AFK (auto-cleared when you chat)\n"
-            "`.invites [@user]` — see invite count\n"
-            "`.ping` — check if the bot is alive\n\n"
-            "**ℹ️ Info**\n"
-            "`.roleinfo @role` — role details\n"
-            "`.serverinfo` — server overview\n"
-            "`.userinfo [@user]` — member profile\n"
-            "`.roles` — list all server roles\n\n"
-            "**🎟️ Tickets**\n"
-            "`.ticket` — open a support ticket"
-        ))
-        e.title = "💬 Social & Info"
-        e.set_footer(text="LXTE's AI", icon_url=avatar)
-        return e
-
-    elif category == "giveaways":
-        e = make_embed(C_GOLD, (
-            "`.gstart <time> <prize>` — start a giveaway\n"
-            "Time: `30m` `1h` `2d` `1h30m`\n\n"
-            "`.gend <message_id>` — end early\n"
-            "`.glist` — list active giveaways\n"
-            "`.greroll <message_id>` — reroll winner\n\n"
-            "Click **🎉 Enter** to join. Click again to leave."
-        ))
-        e.title = "🎉 Giveaways"
-        e.set_footer(text="LXTE's AI", icon_url=avatar)
-        return e
-
+    # ── Moderation ────────────────────────────────────────────────────────────
     elif category == "mod":
-        e = make_embed(C_WARNING, (
+        e = make_embed(C_WARNING,
             "**⚠️ Warn System**\n"
-            "`.warn @user reason` — warn (3 warns = auto-mute)\n"
-            "`.warns @user` — view warn history\n"
+            "`.warn @user <reason>` — issue a warning  *(3 warns = 60 min auto-timeout)*\n"
+            "`.warns @user` — view a user's warning history  *(also* `.warnlist`*)*\n"
+            "`.warnings @user` — alias for warns list\n"
             "`.clearwarns @user` — clear all warns *(Mod+)*\n\n"
-            "**🔨 Moderation**\n"
-            "`.kick @user [reason]` — kick *(Mod+)*\n"
-            "`.ban @user [reason]` — ban *(Mod+)*\n"
-            "`.unban <user_id> [reason]` — unban *(Mod+)*\n"
-            "`.tempmute @user 10m [reason]` — timeout *(Trial: max 1h)*\n"
-            "`.unmute @user` — remove timeout *(Mod+)*\n"
-            "`.purge <amount>` — delete messages *(Trial: max 30)*\n"
-            "`.slowmode [seconds]` — slowmode *(Trial: set only)*\n\n"
-            "**📋 Case System**\n"
-            "`.case <number>` — view a specific mod case\n"
-            "`.history @user` — all mod actions against someone\n\n"
-            "**🎁 XP**\n"
-            "`.daily` — claim daily XP bonus\n"
-            "`.doublexp <duration>` — start a double XP event\n\n"
-            "**🛠️ Server**\n"
-            "`.msgsync [limit]` — backfill message history\n"
-            "`.setup` — configure the bot (admins only)\n"
-            "`.syncroles` — sync auto-roles for all members\n\n"
-            "**🎟️ Tickets**\n"
-            "`.ticket` — open a ticket\n"
-            "`.claim` — claim this ticket (staff)\n"
-            "`.close` — close this ticket\n"
-            "`.transcript` — generate transcript (staff)"
-        ))
+            "**🔨 Bans & Kicks**\n"
+            "`.kick @user [reason]` — kick a member *(Mod+)*\n"
+            "`.ban @user [reason]` — permanent ban *(Mod+)*\n"
+            "`.softban @user [reason]` — ban+unban to wipe recent messages *(Mod+)*\n"
+            "`.massban <id1> <id2> …` — ban multiple users at once *(Senior+)*\n"
+            "`.tempban @user <duration> [reason]` — timed ban, auto-unbans  *(also* `.tb`*) (Mod+)*\n"
+            "`.unban <user_id> [reason]` — unban a user *(Mod+)*\n"
+            "`.unbanall` — mass-unban everyone *(owner only, reaction confirm)*\n\n"
+            "**🔇 Mutes**\n"
+            "`.tempmute @user <duration> [reason]` — timeout with auto-lift  *(also* `.mute` */* `.tm`*)*\n"
+            "`.unmute @user` — remove timeout early *(Mod+)*\n\n"
+            "**🧹 Messages**\n"
+            "`.purge <amount>` — delete last N messages *(Trial: max 30)*\n"
+            "`.cleanup @user [amount]` — delete one user's messages, max 500  *(also* `.purgeuser`*)*\n"
+            "`.slowmode [seconds]` — set channel slowmode  *(also* `.slow`*)  (0 = off)*\n\n"
+            "**🔒 Channel Control**\n"
+            "`.lock [reason]` — lock channel to @everyone\n"
+            "`.unlock [reason]` — unlock channel\n"
+            "`.nuke` — delete and recreate channel (wipes history)\n\n"
+            "**✏️ Other**\n"
+            "`.nick @user <name>` — change a member's nickname *(Mod+)*\n"
+            "`.modstats [@user]` — mod action count breakdown"
+        )
         e.title = "🔨 Moderation"
-        e.set_footer(text="LXTE's AI", icon_url=avatar)
+        e.set_footer(text=footer, icon_url=avatar)
         return e
 
+    # ── Cases ─────────────────────────────────────────────────────────────────
+    elif category == "cases":
+        e = make_embed(C_PRIMARY,
+            "Every mod action (warn, kick, ban, mute, tempban) creates a numbered case.\n\n"
+            "**Lookup**\n"
+            "`.case <number>` — view a specific case by number\n"
+            "`.history @user` — all mod actions against a user  *(also* `.modhistory` */* `.mh`*)*\n\n"
+            "**Reports**\n"
+            "`.report @user <reason>` — anonymously report a member to staff\n"
+            "— Deletes your message (identity hidden from embed)\n"
+            "— Staff see action buttons: Acknowledge / Mute / Kick / View History\n"
+            "— You get a DM confirmation\n"
+            "— 60 second cooldown to prevent spam\n\n"
+            "**Audit**\n"
+            "`.serveraudit` — scan server for security issues  *(also* `.audit`*) (admin only)*\n"
+            "Checks: dangerous @everyone perms, new accounts, broken channels, bot permissions\n\n"
+            "**Notes**\n"
+            "• Cases are stored permanently in the database\n"
+            "• Staff can view history on a reported user with one click"
+        )
+        e.title = "📢 Reports & Cases"
+        e.set_footer(text=footer, icon_url=avatar)
+        return e
+
+    # ── Tickets ───────────────────────────────────────────────────────────────
+    elif category == "tickets":
+        e = make_embed(C_INFO,
+            "**Opening & Closing**\n"
+            "`.ticket` — open a ticket from chat  *(also* `.newticket` */* `.openticket`*)*\n"
+            "Click the ticket panel button as normal.\n"
+            "`.close` — close this ticket channel *(staff or opener)*\n"
+            "— Sends transcript to log · DMs opener a star rating request\n\n"
+            "**Staff Controls**\n"
+            "`.claim` — claim this ticket (assigns it to you)\n"
+            "`.adduser @user` — add a user to this ticket\n"
+            "`.removeuser @user` — remove a user from this ticket\n"
+            "`.renameticket <name>` — rename the ticket channel  *(also* `.ticketrename`*)*\n"
+            "`.priority <low|normal|high|urgent>` — set ticket priority\n"
+            "`.transcript` — generate an HTML transcript and DM it to yourself\n\n"
+            "**Ratings & Stats**\n"
+            "After close, the opener gets a DM with ⭐–⭐⭐⭐⭐⭐ rating buttons.\n"
+            "`.ticketstats` — avg rating, total tickets, top staff leaderboard\n"
+            "*(also* `.tsstats` */* `.supportstats`*) — requires Manage Server*\n\n"
+            "**Staff Apps**\n"
+            "`.staffapps [all|pending|accepted|denied]` — list staff applications\n"
+            "*(also* `.sapps` */* `.apps`*) — owner/reviewer only*"
+        )
+        e.title = "🎟️ Tickets"
+        e.set_footer(text=footer, icon_url=avatar)
+        return e
+
+    # ── Giveaways ─────────────────────────────────────────────────────────────
+    elif category == "giveaways":
+        e = make_embed(C_GOLD,
+            "**Running Giveaways**\n"
+            "`.gstart <duration> [winners] <prize>` — start a giveaway\n"
+            "Duration formats: `30m`  `1h`  `2d`  `1h30m`\n"
+            "Winners defaults to 1. Example: `.gstart 24h 3 Nitro`\n\n"
+            "`.gend <message_id>` — end a giveaway early and pick winner(s)\n"
+            "`.greroll <message_id>` — reroll and pick a new winner\n"
+            "`.glist` — list all active giveaways in this server\n\n"
+            "**Entering**\n"
+            "Click **🎉 Enter** on the giveaway message to join.\n"
+            "Click again to leave.\n\n"
+            "**Notes**\n"
+            "• Winners are DM'd and pinged in channel\n"
+            "• Giveaways persist through bot restarts\n"
+            "• Requires Manage Server to run giveaways"
+        )
+        e.title = "🎉 Giveaways"
+        e.set_footer(text=footer, icon_url=avatar)
+        return e
+
+    # ── Analytics ─────────────────────────────────────────────────────────────
+    elif category == "analytics":
+        e = make_embed(C_PRIMARY,
+            "**📊 Server Analytics**\n"
+            "`.analytics growth` — member count chart over 30 days\n"
+            "`.analytics activity` — top 5 most active members this month\n"
+            "`.analytics streaks` — daily streak leaderboard\n"
+            "*(also* `.serverstats`*)*\n\n"
+            "**📈 Leaderboards**\n"
+            "`.lb` — XP leaderboard  *(top 10 by XP)*\n"
+            "`.boostlb` — top server boosters  *(also* `.boosters`*)*\n"
+            "`.invitelb` — top inviters by total invite count\n"
+            "`.msglb` — top members by total messages  *(also* `.messagelb`*)*\n\n"
+            "**👤 Per-User Info**\n"
+            "`.level [@user]` — rank card with XP, level, streak\n"
+            "`.msgcheck [@user]` — message count, rank, top channels  *(also* `.msgstats`*)*\n"
+            "`.stats` — your personal AI question count  *(also* `.usage` */* `.me`*)*\n"
+            "`.invites [@user]` — invite count and breakdown\n"
+            "`.inviteinfo <code>` — info about a specific invite  *(also* `.ii`*)*\n\n"
+            "**🛠️ Admin**\n"
+            "`.msgsync [limit]` — backfill message history for tracking  *(also* `.syncmessages`*)*\n"
+            "`.admin snapshot` — manual daily snapshot"
+        )
+        e.title = "📊 Analytics & Stats"
+        e.set_footer(text=footer, icon_url=avatar)
+        return e
+
+    # ── Social & Info ─────────────────────────────────────────────────────────
+    elif category == "social":
+        e = make_embed(C_INFO,
+            "**💬 Social**\n"
+            "`.afk [reason]` — set yourself AFK (auto-cleared when you send a message)\n"
+            "`.report @user <reason>` — anonymously report someone to staff\n\n"
+            "**ℹ️ Server & User Info**\n"
+            "`.serverinfo` — server overview: members, roles, channels, boosts  *(also* `.si`*)*\n"
+            "`.userinfo [@user]` — member profile: joined, roles, XP, warns  *(also* `.ui` */* `.whois`*)*\n"
+            "`.roleinfo @role` — role details: colour, members, permissions  *(also* `.ri`*)*\n"
+            "`.roles` — list all roles in this server with member counts\n\n"
+            "**📨 Invites**\n"
+            "`.invites [@user]` — see how many people a user has invited\n"
+            "`.invitelb` — server-wide invite leaderboard\n"
+            "`.inviteinfo <code>` — details about a specific invite link  *(also* `.ii`*)*\n"
+            "`.resetinvites @user` — reset a user's invite count *(admin)*\n"
+            "`.resetallinvites` — reset all invite data *(admin, confirmation required)*\n\n"
+            "**🔧 Utility**\n"
+            "`.ping` — check bot latency and uptime\n"
+            "`.about` — bot info and feature list  *(also* `.info`*)*\n"
+            "`.say <message>` — make the bot say something *(mod+)*\n"
+            "`.embed <title | body>` — post a custom embed *(mod+)*\n"
+            "`.shorten <url>` — shorten a URL"
+        )
+        e.title = "💬 Social & Info"
+        e.set_footer(text=footer, icon_url=avatar)
+        return e
+
+    # ── Roles ─────────────────────────────────────────────────────────────────
+    elif category == "roles":
+        e = make_embed(C_PRIMARY,
+            "**Manage Roles**\n"
+            "`.role @user add <RoleName>` — give a role to a member *(Senior Mod+)*\n"
+            "`.role @user remove <RoleName>` — remove a role from a member *(Senior Mod+)*\n\n"
+            "**Role Persist**\n"
+            "`.rolepersist add @user <RoleName>` — re-apply role if user leaves & rejoins *(Senior+)*\n"
+            "`.rolepersist remove @user <RoleName>` — stop persisting a role *(Senior+)*\n"
+            "`.rolepersist list` — view all persisted roles in this server\n\n"
+            "**Role Menus**\n"
+            "Configured via `.setup` → **🎭 Role Menus**\n"
+            "Creates button-based self-assign menus in any channel.\n\n"
+            "**Reaction Roles**\n"
+            "Configured via `.setup` → **⚡ Reaction Roles**\n"
+            "Emoji reactions on a message grant/remove roles.\n\n"
+            "**Auto-Roles**\n"
+            "Configured via `.setup` → **🤖 Autoroles**\n"
+            "Roles assigned automatically on member join."
+        )
+        e.title = "🎭 Roles"
+        e.set_footer(text=footer, icon_url=avatar)
+        return e
+
+    # ── Staff System ──────────────────────────────────────────────────────────
     elif category == "staff":
-        e = make_embed(C_PRIMARY, (
+        e = make_embed(C_PRIMARY,
             "Configure staff roles via `.setup` → **🛡️ Staff Roles**\n\n"
-            "**👑 Manager / Community Manager**\n"
-            "Full access. All mod commands. Exempt from abuse auto-strip.\n\n"
+            "**👑 Owner / Community Manager**\n"
+            "Full access to all bot commands. Exempt from abuse auto-strip.\n\n"
             "**🔵 Senior Moderator**\n"
-            "Warn, kick, ban, unban, mute (28d), unmute, purge (500), slowmode, clear warns.\n\n"
+            "Warn · kick · ban · unban · mute up to 28d · unmute\n"
+            "Purge up to 500 · slowmode (set & remove) · clear warns\n"
+            "Manage roles via `.role` and `.rolepersist`\n\n"
             "**🟢 Moderator**\n"
             "Identical to Senior Mod.\n\n"
             "**🟡 Trial Moderator**\n"
-            "Warn, mute (max 1h), purge (max 30 msgs), slowmode (set only).\n"
+            "Warn · mute (max 1h) · purge (max 30 msgs) · slowmode (set only)\n"
             "❌ Cannot kick, ban, unban, or remove slowmode.\n\n"
-            "**⚪ All Staff (no mod perms)**\n"
-            "Bypasses spam filter. No mod commands. Cosmetic only.\n\n"
-            "**🔗 Invite Link Bypass**\n"
-            "Can post invite links without automod deletion.\n\n"
-            f"**🚨 Abuse Protection**\n"
-            f"• {STAFF_ABUSE_WARN_THRESH}+ actions in {STAFF_ABUSE_WINDOW_SECS}s → public warning\n"
-            f"• {STAFF_ABUSE_STRIP_THRESH}+ actions in {STAFF_ABUSE_WINDOW_SECS}s → all staff roles stripped\n"
-            "Managers and admins are exempt."
-        ))
-        e.title = "🛡️ Staff Roles"
-        e.set_footer(text="LXTE's AI — Use .setup to configure staff roles", icon_url=avatar)
+            "**🔒 Fake Permissions**\n"
+            "`.setup` → **🔒 Fake Perms** — grant bot-level perms to any role\n"
+            "without giving real Discord permissions.\n"
+            "Pick role & permissions via dropdown — no typing needed.\n\n"
+            f"**🚨 Staff Abuse Protection**\n"
+            f"• {STAFF_ABUSE_WARN_THRESH}+ mod actions in {STAFF_ABUSE_WINDOW_SECS}s → public warning posted\n"
+            f"• {STAFF_ABUSE_STRIP_THRESH}+ mod actions in {STAFF_ABUSE_WINDOW_SECS}s → all staff roles stripped\n"
+            "Managers and server admins are exempt."
+        )
+        e.title = "🛡️ Staff System"
+        e.set_footer(text="Use .setup to configure all staff roles", icon_url=avatar)
         return e
 
+    # ── Admin ─────────────────────────────────────────────────────────────────
     elif category == "admin":
-        e = make_embed(C_ERROR, (
-            "`.admin backup` — export server config\n"
-            "`.admin clearuser <id>` — wipe user AI history\n"
-            "`.admin health` — service health check\n"
-            "`.admin keys` — API key status\n"
-            "`.admin resetxp <id>` — wipe user XP\n"
-            "`.admin restore` — import server config\n"
-            "`.admin snapshot` — manual analytics snapshot\n"
-            "`.admin status` — system stats\n"
-            "`.admin synccount` — force member count sync\n"
-            "`.admin unlockraid` — manual raid unlock"
-        ))
-        e.title = "🛡️ Admin"
-        e.set_footer(text="LXTE's AI", icon_url=avatar)
+        e = make_embed(C_ERROR,
+            "**⚙️ Setup**\n"
+            "`.setup` — full interactive server config panel  *(also* `.config`*)*\n"
+            "Covers: log channels, welcome, automod, staff roles, tickets, role menus,\n"
+            "reaction roles, autoroles, AI settings, fake perms, giveaway channel.\n\n"
+            "**📦 Backup & Restore**\n"
+            "`.admin backup` — export full server config to JSON\n"
+            "`.admin restore` — import config from attached JSON\n"
+            "`.admin snapshot` — manually trigger daily analytics snapshot\n\n"
+            "**🔧 User Management**\n"
+            "`.admin clearuser <user_id>` — wipe a user's AI conversation history\n"
+            "`.admin resetxp <user_id>` — reset a user's XP and level to zero\n\n"
+            "**📡 System**\n"
+            "`.admin status` — RAM, latency, uptime, guild count\n"
+            "`.admin health` — ping all external services (AI, DB, web)\n"
+            "`.admin keys` — API key pool status and per-key success rates\n"
+            "`.admin synccount` — force member count channel update\n"
+            "`.admin unlockraid` — manually lift anti-raid lockdown\n\n"
+            "**🌐 Owner-only**\n"
+            "`.guilds` — list every server the bot is in\n"
+            "`.broadcast <message>` — send a message to all servers\n"
+            "`.botdm @user <message>` — DM a user as the bot  *(also* `.senddm`*)*\n"
+            "`.blacklistserver <guild_id>` — blacklist & leave a server\n"
+            "`.setavatar` / `.setbanner` / `.setname` / `.setnick` — change bot appearance\n"
+            "`.restart` — restart the bot process\n"
+            "`.robloxnotify <#channel>` — set Roblox version update alert channel"
+        )
+        e.title = "🔒 Admin & Owner"
+        e.set_footer(text="Most admin commands require Administrator permission", icon_url=avatar)
         return e
 
-    # Home
-    e = make_embed(C_PRIMARY, (
-        "Pick a category below.\n"
-        "Prefix: `.`   Built by **AJ**\n\n"
-        "`.ping` — check the bot is alive\n"
-        "`.help` — this menu"
-    ))
-    e.title = "LXTE's AI — Help"
+    # ── Home fallback ─────────────────────────────────────────────────────────
+    e = make_embed(C_PRIMARY,
+        "Use the dropdown below to browse all commands.\n"
+        "Prefix: **`.`**   Slash commands also supported where shown.\n\n"
+        "🤖 **AI** · ⬆️ **Leveling** · 🔨 **Moderation** · 📢 **Reports & Cases**\n"
+        "🎟️ **Tickets** · 🎉 **Giveaways** · 📊 **Analytics** · 💬 **Social & Info**\n"
+        "🎭 **Roles** · 🛡️ **Staff System** · 🔒 **Admin**\n"
+    )
+    e.title = "Help — Command Reference"
     e.set_thumbnail(url=avatar)
-    e.set_footer(text="LXTE's AI v24", icon_url=avatar)
+    e.set_footer(text=footer, icon_url=avatar)
     return e
 
 
@@ -6364,17 +6574,20 @@ class HelpView(discord.ui.View):
         self._message = None
 
         options = [
-            discord.SelectOption(label="Home",       value="home",      emoji="🏠"),
-            discord.SelectOption(label="AI",          value="ai",        emoji="🤖"),
-            discord.SelectOption(label="Analytics",   value="analytics", emoji="📊"),
-            discord.SelectOption(label="Giveaways",   value="giveaways", emoji="🎉"),
-            discord.SelectOption(label="Leveling",    value="leveling",  emoji="⬆️"),
-            discord.SelectOption(label="Moderation",  value="mod",       emoji="🔨"),
-            discord.SelectOption(label="Social & Info", value="social",  emoji="💬"),
-            discord.SelectOption(label="Staff Roles",   value="staff",   emoji="🛡️"),
+            discord.SelectOption(label="Home",             value="home",      emoji="🏠"),
+            discord.SelectOption(label="AI",               value="ai",        emoji="🤖"),
+            discord.SelectOption(label="Leveling & XP",    value="leveling",  emoji="⬆️"),
+            discord.SelectOption(label="Moderation",       value="mod",       emoji="🔨"),
+            discord.SelectOption(label="Reports & Cases",  value="cases",     emoji="📢"),
+            discord.SelectOption(label="Tickets",          value="tickets",   emoji="🎟️"),
+            discord.SelectOption(label="Giveaways",        value="giveaways", emoji="🎉"),
+            discord.SelectOption(label="Analytics & Stats",value="analytics", emoji="📊"),
+            discord.SelectOption(label="Social & Info",    value="social",    emoji="💬"),
+            discord.SelectOption(label="Roles",            value="roles",     emoji="🎭"),
+            discord.SelectOption(label="Staff System",     value="staff",     emoji="🛡️"),
         ]
-        if ctx.author.id == getattr(ctx.bot, "owner_id_int", 0):
-            options.append(discord.SelectOption(label="Admin", value="admin", emoji="🔒"))
+        if ctx.author.guild_permissions.administrator or ctx.author.id == getattr(ctx.bot, "owner_id_int", 0):
+            options.append(discord.SelectOption(label="Admin & Owner", value="admin", emoji="🔒"))
 
         select          = discord.ui.Select(placeholder="Pick a category…", options=options)
         select.callback = self.on_select
