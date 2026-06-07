@@ -4357,7 +4357,22 @@ class LXTEBot(commands.Bot):
         elif before.channel is not None and after.channel is None: _voice_join_times.pop(key, None)
 
     async def on_command_error(self, ctx: commands.Context, error):
-        if isinstance(error, commands.CommandNotFound): return
+        if isinstance(error, commands.CommandNotFound):
+            # Fuzzy match — find the closest command name
+            typed = ctx.invoked_with.lower()
+            all_names = [n for cmd in self.commands for n in [cmd.name] + list(cmd.aliases)]
+            close = [n for n in all_names if n.startswith(typed[0]) and abs(len(n) - len(typed)) <= 2]
+            if not close:
+                # Levenshtein-lite: find names with ≤2 char difference
+                def _dist(a, b):
+                    if abs(len(a)-len(b)) > 3: return 99
+                    return sum(1 for x, y in zip(a.ljust(len(b)), b.ljust(len(a))) if x != y)
+                close = sorted([n for n in all_names if _dist(typed, n) <= 2], key=lambda n: _dist(typed, n))
+            suggestion = f"\nDid you mean **`.{close[0]}`**?" if close else ""
+            e = make_embed(C_ERROR, f"❓ Unknown command **`.{ctx.invoked_with}`**.{suggestion}\nType `.help` to see all commands.")
+            e.title = "Unknown Command"
+            await ctx.send(embed=e, delete_after=10)
+            return
         if isinstance(error, commands.MissingPermissions):
             await ctx.send(embed=err("You don't have permission to do that."))
         elif isinstance(error, commands.CommandOnCooldown):
@@ -4365,7 +4380,13 @@ class LXTEBot(commands.Bot):
                 ready = int(time.time() + error.retry_after)
                 await ctx.send(embed=err(f"Slow down — ready <t:{ready}:R>."))
         elif isinstance(error, commands.MissingRequiredArgument):
-            await ctx.send(embed=err(f"Missing argument. Usage: `.{ctx.command.name} <...>`"))
+            # Pull the usage string from the command's docstring if available
+            usage = getattr(ctx.command, 'usage', None)
+            doc   = (ctx.command.help or ctx.command.brief or "")
+            # Extract "Usage: ..." from docstring
+            usage_line = next((l.strip() for l in doc.splitlines() if "usage:" in l.lower()), None)
+            hint = f"\n{usage_line}" if usage_line else f"\nUsage: `.{ctx.command.name} <{error.param.name}>`"
+            await ctx.send(embed=err(f"Missing required argument: **{error.param.name}**.{hint}"))
         else:
             await ctx.send(embed=err(f"Something went wrong:\n```{str(error)[:400]}```"))
             logger.error("Unhandled: %s", error, exc_info=error)
@@ -4648,23 +4669,21 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
     # ── Home ──────────────────────────────────────────────────────────────────
     if category == "home":
         e = make_embed(C_PRIMARY,
-            "**LXTE's Bot** — Feature-rich bot built for the LXTE Clan.\n\n"
-            "**Quick Access:**\n"
-            "• Type `.help` to view this menu\n"
-            "• Current prefix: **`.`**\n\n"
+            "**LXTE's Bot** — built for the LXTE Clan.\n"
+            "Use the dropdown below to browse commands. Prefix: **`.`**\n\u200b"
         )
-        e.title = "LXTE's AI"
-        e.add_field(name="⬆️ Leveling",           value="`.help leveling`",  inline=True)
-        e.add_field(name="🔨 Moderation",         value="`.help mod`",       inline=True)
-        e.add_field(name="📢 Reports & Cases",    value="`.help cases`",     inline=True)
-        e.add_field(name="🎟️ Tickets",            value="`.help tickets`",   inline=True)
-        e.add_field(name="🎉 Giveaways",          value="`.help giveaways`", inline=True)
-        e.add_field(name="📊 Analytics & Stats",  value="`.help analytics`", inline=True)
-        e.add_field(name="💬 Social & Info",      value="`.help social`",    inline=True)
-        e.add_field(name="🎭 Roles",              value="`.help roles`",     inline=True)
-        e.add_field(name="🛡️ Staff System",       value="`.help staff`",     inline=True)
-        e.add_field(name="🔒 Admin",              value="`.help admin`",     inline=True)
-        e.add_field(name="​",               value="​",            inline=True)
+        e.title = "LXTE's Bot — Help"
+        e.add_field(name="⬆️ Leveling",          value="XP, rank cards, leaderboard",    inline=True)
+        e.add_field(name="🔨 Moderation",        value="Warn, kick, ban, mute, purge",    inline=True)
+        e.add_field(name="📢 Reports & Cases",   value="Case log, reports, audit",        inline=True)
+        e.add_field(name="🎟️ Tickets",           value="Support tickets, transcripts",    inline=True)
+        e.add_field(name="🎉 Giveaways",         value="Start, end, reroll giveaways",    inline=True)
+        e.add_field(name="📊 Analytics",         value="Server stats, leaderboards",      inline=True)
+        e.add_field(name="💬 Social & Info",     value="AFK, server info, user info",     inline=True)
+        e.add_field(name="🎭 Roles",             value="Role menus, reaction roles",      inline=True)
+        e.add_field(name="🛡️ Staff System",      value="Staff roles, permissions, abuse", inline=True)
+        e.add_field(name="🔒 Admin",             value="Setup, config, system tools",     inline=True)
+        e.add_field(name="\u200b",               value="\u200b",                          inline=True)
         e.set_thumbnail(url=avatar)
         e.set_footer(text=footer, icon_url=avatar)
         return e
@@ -4678,15 +4697,13 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             f"Double XP events multiply all gains by 2×.\n\n"
             "**Commands**\n"
             "`.level [@user]` — view rank card  *(also* `.xp` */* `.card` */* `.profile`*)*\n"
-            "`/level [@user]` — slash version of rank card\n"
             "`.lb` — XP leaderboard  *(also* `.leaderboard`*)*\n"
-            "`.daily` — claim your daily XP bonus (once per 24h)\n"
-            "`.roles` — list all level-up roles and their unlock levels\n\n"
+            "`.roles` — list all roles in the server\n\n"
             "**Staff / Admin**\n"
             "`.doublexp <duration>` — start a 2× XP event  *(e.g.* `2h`*,* `1d`*)  (also* `.2xp`*)*\n"
             "`.doublexp off` — end the event early\n"
-            "`.syncroles` — force-sync level roles for all members\n"
-            "`.admin resetxp <user_id>` — wipe a user's XP *(admin only)*"
+            "`.syncroles` — force-sync level roles for all members  *(admin only)*\n"
+            "`.admin resetxp <user_id>` — wipe a user's XP  *(admin only)*"
         )
         e.title = "⬆️ Leveling & XP"
         e.set_footer(text=footer, icon_url=avatar)
@@ -4697,29 +4714,25 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
         e = make_embed(C_WARNING,
             "**⚠️ Warn System**\n"
             "`.warn @user <reason>` — issue a warning  *(3 warns = 60 min auto-timeout)*\n"
-            "`.warns @user` — view a user's warning history  *(also* `.warnlist`*)*\n"
-            "`.clearwarns @user` — clear all warns *(Mod+)*\n\n"
+            "`.warns @user` — view a user's warning history\n"
+            "`.clearwarns @user` — clear all warns  *(Mod+)*\n\n"
             "**🔨 Bans & Kicks**\n"
-            "`.kick @user [reason]` — kick a member *(Mod+)*\n"
-            "`.ban @user [reason]` — permanent ban *(Mod+)*\n"
-            "`.softban @user [reason]` — ban+unban to wipe recent messages *(Mod+)*\n"
-            "`.massban <id1> <id2> …` — ban multiple users at once *(Senior+)*\n"
-            "`.tempban @user <duration> [reason]` — timed ban, auto-unbans  *(also* `.tb`*) (Mod+)*\n"
-            "`.unban <user_id> [reason]` — unban a user *(Mod+)*\n\n"
+            "`.kick @user [reason]` — kick a member  *(Mod+)*\n"
+            "`.ban @user [reason]` — permanent ban  *(Mod+)*\n"
+            "`.tempban @user <duration> [reason]` — timed ban, auto-unbans  *(also* `.tb`*)  (Mod+)*\n"
+            "`.unban <user_id> [reason]` — unban a user  *(Mod+)*\n\n"
             "**🔇 Mutes**\n"
             "`.tempmute @user <duration> [reason]` — timeout with auto-lift  *(also* `.mute` */* `.tm`*)*\n"
-            "`.unmute @user` — remove timeout early *(Mod+)*\n\n"
+            "`.unmute @user` — remove timeout early  *(Mod+)*\n\n"
             "**🧹 Messages**\n"
-            "`.purge <amount>` — delete last N messages *(Trial: max 30)*\n"
-            "`.cleanup @user [amount]` — delete one user's messages, max 500  *(also* `.purgeuser`*)*\n"
+            "`.purge <amount>` — delete last N messages  *(Trial: max 30)*\n"
+            "`.cleanup @user [amount]` — delete one user's messages  *(also* `.purgeuser`*)*\n"
             "`.slowmode [seconds]` — set channel slowmode  *(also* `.slow`*)  (0 = off)*\n\n"
             "**🔒 Channel Control**\n"
             "`.lock [reason]` — lock channel to @everyone\n"
-            "`.unlock [reason]` — unlock channel\n"
-            "`.nuke` — delete and recreate channel (wipes history)\n\n"
+            "`.unlock [reason]` — unlock channel\n\n"
             "**✏️ Other**\n"
-            "`.nick @user <name>` — change a member's nickname *(Mod+)*\n"
-            "`.modstats [@user]` — mod action count breakdown"
+            "`.nick @user <name>` — change a member's nickname  *(Mod+)*"
         )
         e.title = "🔨 Moderation"
         e.set_footer(text=footer, icon_url=avatar)
@@ -4733,17 +4746,13 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.case <number>` — view a specific case by number\n"
             "`.history @user` — all mod actions against a user  *(also* `.modhistory` */* `.mh`*)*\n\n"
             "**Reports**\n"
-            "`.report @user <reason>` — anonymously report a member to staff\n"
-            "— Deletes your message (identity hidden from embed)\n"
+            "`.report @user <reason>` — report a member to staff\n"
+            "— Deletes your message automatically\n"
             "— Staff see action buttons: Acknowledge / Mute / Kick / View History\n"
-            "— You get a DM confirmation\n"
-            "— 60 second cooldown to prevent spam\n\n"
-            "**Audit**\n"
-            "`.serveraudit` — scan server for security issues  *(also* `.audit`*) (admin only)*\n"
-            "Checks: dangerous @everyone perms, new accounts, broken channels, bot permissions\n\n"
+            "— You get a DM confirmation\n\n"
             "**Notes**\n"
             "• Cases are stored permanently in the database\n"
-            "• Staff can view history on a reported user with one click"
+            "• Staff can view full history on any user with `.history @user`"
         )
         e.title = "📢 Reports & Cases"
         e.set_footer(text=footer, icon_url=avatar)
@@ -4754,23 +4763,19 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
         e = make_embed(C_INFO,
             "**Opening & Closing**\n"
             "`.ticket` — open a ticket from chat  *(also* `.newticket` */* `.openticket`*)*\n"
-            "Click the ticket panel button as normal.\n"
-            "`.close` — close this ticket channel *(staff or opener)*\n"
-            "— Sends transcript to log · DMs opener a star rating request\n\n"
-            "**Staff Controls**\n"
-            "`.claim` — claim this ticket (assigns it to you)\n"
-            "`.adduser @user` — add a user to this ticket\n"
-            "`.removeuser @user` — remove a user from this ticket\n"
-            "`.renameticket <name>` — rename the ticket channel  *(also* `.ticketrename`*)*\n"
-            "`.priority <low|normal|high|urgent>` — set ticket priority\n"
-            "`.transcript` — generate an HTML transcript and DM it to yourself\n\n"
+            "Or click the ticket panel button in the designated channel.\n"
+            "`.close` — close this ticket channel  *(staff or opener)*\n"
+            "— Saves a transcript · DMs opener a star rating request\n\n"
+            "**Staff Controls** *(buttons inside the ticket channel)*\n"
+            "📌 **Claim** — assign the ticket to yourself\n"
+            "🔒 **Close** — close and archive\n"
+            "📄 **Transcript** — download the full chat log as HTML\n\n"
+            "`.transcript` — manually generate a transcript  *(Manage Channels)*\n\n"
             "**Ratings & Stats**\n"
             "After close, the opener gets a DM with ⭐–⭐⭐⭐⭐⭐ rating buttons.\n"
-            "`.ticketstats` — avg rating, total tickets, top staff leaderboard\n"
-            "*(also* `.tsstats` */* `.supportstats`*) — requires Manage Server*\n\n"
+            "`.ticketstats` — avg rating, total tickets, top staff  *(Manage Server)*\n\n"
             "**Staff Apps**\n"
-            "`.staffapps [all|pending|accepted|denied]` — list staff applications\n"
-            "*(also* `.sapps` */* `.apps`*) — owner/reviewer only*"
+            "`.staffapps [all|pending|accepted|denied]` — list staff applications  *(owner only)*"
         )
         e.title = "🎟️ Tickets"
         e.set_footer(text=footer, icon_url=avatar)
@@ -4803,21 +4808,17 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
         e = make_embed(C_PRIMARY,
             "**📊 Server Analytics**\n"
             "`.analytics growth` — member count chart over 30 days\n"
-            "`.analytics activity` — top 5 most active members this month\n"
+            "`.analytics activity` — top 5 most active members\n"
             "`.analytics streaks` — daily streak leaderboard\n"
             "*(also* `.serverstats`*)*\n\n"
             "**📈 Leaderboards**\n"
             "`.lb` — XP leaderboard  *(top 10 by XP)*\n"
-            "`.boostlb` — top server boosters  *(also* `.boosters`*)*\n"
             "`.invitelb` — top inviters by total invite count\n"
             "`.msglb` — top members by total messages  *(also* `.messagelb`*)*\n\n"
             "**👤 Per-User Info**\n"
             "`.level [@user]` — rank card with XP, level, streak\n"
             "`.msgcheck [@user]` — message count, rank, top channels  *(also* `.msgstats`*)*\n"
-            "`.invites [@user]` — invite count and breakdown\n"
-            "\n"
-            "**🛠️ Admin**\n"
-            "`.msgsync [limit]` — backfill message history for tracking  *(also* `.syncmessages`*)*"
+            "`.invites [@user]` — invite count and breakdown"
         )
         e.title = "📊 Analytics & Stats"
         e.set_footer(text=footer, icon_url=avatar)
@@ -4827,23 +4828,22 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
     elif category == "social":
         e = make_embed(C_INFO,
             "**💬 Social**\n"
-            "`.afk [reason]` — set yourself AFK (auto-cleared when you send a message)\n"
-            "`.report @user <reason>` — anonymously report someone to staff\n\n"
+            "`.afk [reason]` — set yourself AFK  *(auto-cleared when you next send a message)*\n"
+            "`.report @user <reason>` — report someone to staff\n\n"
             "**ℹ️ Server & User Info**\n"
             "`.serverinfo` — server overview: members, roles, channels, boosts  *(also* `.si`*)*\n"
             "`.userinfo [@user]` — member profile: joined, roles, XP, warns  *(also* `.ui` */* `.whois`*)*\n"
             "`.roleinfo @role` — role details: colour, members, permissions  *(also* `.ri`*)*\n"
-            "`.roles` — list all roles in this server with member counts\n\n"
+            "`.roles` — list all roles in this server\n\n"
             "**📨 Invites**\n"
             "`.invites [@user]` — see how many people a user has invited\n"
             "`.invitelb` — server-wide invite leaderboard\n"
-            "`.resetinvites @user` — reset a user's invite count *(admin)*\n"
-            "`.resetallinvites` — reset all invite data *(admin, confirmation required)*\n\n"
+            "`.resetinvites @user` — reset a user's invite count  *(Senior Mod+)*\n"
+            "`.resetallinvites` — reset all invite data  *(admin, confirmation required)*\n\n"
             "**🔧 Utility**\n"
             "`.ping` — check bot latency and uptime\n"
             "`.about` — bot info and feature list  *(also* `.info`*)*\n"
-            "`.say <message>` — make the bot say something *(mod+)*\n"
-            "`.embed <title | body>` — post a custom embed *(mod+)*"
+            "`.embed` — open the embed builder to post a custom embed  *(Manage Messages)*"
         )
         e.title = "💬 Social & Info"
         e.set_footer(text=footer, icon_url=avatar)
@@ -4908,12 +4908,12 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.admin resetxp <user_id>` — reset a user's XP and level to zero\n\n"
             "**📡 System**\n"
             "`.admin status` — RAM, latency, uptime, guild count\n"
-            "`.admin health` — ping all external services (DB, web)\n"
+            "`.admin health` — ping all external services (DB)\n"
             "`.admin synccount` — force member count channel update\n"
             "`.admin unlockraid` — manually lift anti-raid lockdown\n\n"
             "**🌐 Owner-only**\n"
             "`.restart` — restart the bot process\n"
-            "`.robloxnotify <#channel>` — set Roblox version update alert channel"
+            "`.robloxnotify <#channel> [role]` — set Roblox update alert channel"
         )
         e.title = "🔒 Admin & Owner"
         e.set_footer(text="Most admin commands require Administrator permission", icon_url=avatar)
@@ -4921,9 +4921,8 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
 
     # ── Home fallback ─────────────────────────────────────────────────────────
     e = make_embed(C_PRIMARY,
-        "Use the dropdown below to browse all commands.\n"
-        "Prefix: **`.`**   Slash commands also supported where shown.\n\n"
-        "🤖 **AI** · ⬆️ **Leveling** · 🔨 **Moderation** · 📢 **Reports & Cases**\n"
+        "Use the dropdown below to browse all commands. Prefix: **`.`**\n\n"
+        "⬆️ **Leveling** · 🔨 **Moderation** · 📢 **Reports & Cases**\n"
         "🎟️ **Tickets** · 🎉 **Giveaways** · 📊 **Analytics** · 💬 **Social & Info**\n"
         "🎭 **Roles** · 🛡️ **Staff System** · 🔒 **Admin**\n"
     )
@@ -4941,7 +4940,6 @@ class HelpView(discord.ui.View):
 
         options = [
             discord.SelectOption(label="Home",             value="home",      emoji="🏠"),
-            discord.SelectOption(label="AI",               value="ai",        emoji="🤖"),
             discord.SelectOption(label="Leveling & XP",    value="leveling",  emoji="⬆️"),
             discord.SelectOption(label="Moderation",       value="mod",       emoji="🔨"),
             discord.SelectOption(label="Reports & Cases",  value="cases",     emoji="📢"),
@@ -4973,7 +4971,7 @@ class HelpView(discord.ui.View):
 
 @bot.command(name="help", aliases=["h"])
 async def cmd_help(ctx: commands.Context, category: str = "home"):
-    valid = {"home", "ai", "leveling", "mod", "cases", "tickets", "giveaways",
+    valid = {"home", "leveling", "mod", "cases", "tickets", "giveaways",
              "analytics", "social", "roles", "staff", "admin"}
     cat = category.lower().strip()
     if cat not in valid:
