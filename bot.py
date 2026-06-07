@@ -86,11 +86,11 @@ C_WARNING = 0xFEE75C
 C_GOLD    = 0xFFD700
 
 # ─── AI Models ────────────────────────────────────────────────────────────────
-# These are Groq model IDs — swap freely if you change providers
-AI_TEXT      = "openai/gpt-oss-20b"   # fast text model
-AI_UNFILTERED = "openai/gpt-oss-20b"        # owner unfiltered — same fast model, less conservative than llama
-MAX_TOKENS  = 1024   # raised from 800 — gives room for fuller answers without blowing context
-TEMPERATURE = 0.60   # slightly higher — more natural, less robotic
+# Groq compound-beta: single API call that includes native web search tool use
+AI_TEXT       = "compound-beta"   # Groq compound model — handles web search internally
+AI_UNFILTERED = "compound-beta"   # owner mode — same model, unrestricted system prompt
+MAX_TOKENS  = 1024
+TEMPERATURE = 0.60
 
 # ─── Real-time / Web Search ───────────────────────────────────────────────────
 # DuckDuckGo Instant Answer API — no key needed
@@ -299,6 +299,26 @@ _doublexp_until: dict[int, float] = {}
 
 # ─── AFK ──────────────────────────────────────────────────────────────────────
 _afk_users: dict[int, tuple[str, float]] = {}
+
+# ─── Join Log (in-memory ring buffer — last 50 per guild, also persisted to DB) ─
+_join_log: dict[int, list[dict]] = collections.defaultdict(list)   # guild_id -> [{user_id, name, joined_at, inviter_id, account_age_days}]
+_JOIN_LOG_MAX = 50
+
+# ─── Leave Log (last 50 per guild) ───────────────────────────────────────────
+_leave_log: dict[int, list[dict]] = collections.defaultdict(list)  # guild_id -> [{user_id, name, left_at, roles}]
+_LEAVE_LOG_MAX = 50
+
+# ─── Voice session tracking (start times + cumulative per user) ───────────────
+_voice_session_start: dict[tuple[int,int], float] = {}  # (uid, gid) -> monotonic join time (same as _voice_join_times)
+_voice_total_mins: dict[tuple[int,int], int] = {}       # (uid, gid) -> total minutes in voice this session
+
+# ─── Presence cache (last seen status per user) ───────────────────────────────
+_last_seen: dict[int, float] = {}           # uid -> UTC timestamp of last message/activity
+_user_status: dict[int, str] = {}           # uid -> "online"|"idle"|"dnd"|"offline"
+
+# ─── Message rate cache (messages per hour per user, for activity tracking) ───
+_msg_rate: dict[int, collections.deque] = collections.defaultdict(lambda: collections.deque(maxlen=500))
+# uid -> deque of UTC timestamps of recent messages
 
 # ─── Owner unfiltered mode ────────────────────────────────────────────────────
 # When True, the owner's AI interactions bypass all safety filters.
@@ -947,9 +967,12 @@ class KeyRotator:
                 self._mark_ok(idx)
 
                 data = r.json()
-                content = data["choices"][0]["message"]["content"]
+                msg = data["choices"][0]["message"]
+                content = msg.get("content") or ""
+                # compound-beta may return a list of blocks (text + tool_use)
                 if isinstance(content, list):
-                    return "".join(b.get("text", "") for b in content if isinstance(b, dict)).strip()
+                    text_parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                    return "".join(text_parts).strip()
                 return (content or "").strip()
 
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
@@ -1036,6 +1059,11 @@ class Database:
         self.reports        = db["reports"]
         self.ticket_ratings = db["ticket_ratings"]
 
+    @property
+    def db(self):
+        """Expose the lxte_assistant database directly (allows bot.db.db["collection"])."""
+        return self._client["lxte_assistant"]
+
     async def _retry(self, coro_fn, *args, retries: int = 3, **kwargs):
         """
         v23: Retry wrapper for transient MongoDB errors.
@@ -1090,6 +1118,9 @@ class Database:
             await self.cases.create_index([("guild_id",1),("target_id",1)], background=True)
             await self.tempmutes.create_index("unmute_at", background=True)
             await self.roblox_history.create_index("_id", background=True)
+            await db["join_log"].create_index([("guild_id", 1), ("joined_at", -1)], background=True)
+            await db["leave_log"].create_index([("guild_id", 1), ("left_at", -1)], background=True)
+            await db["join_log"].create_index("user_id", background=True)
             await self.tempbans.create_index("unban_at", background=True)
             await self.tempbans.create_index([("guild_id",1),("user_id",1)], background=True)
             await self.reports.create_index([("guild_id",1),("created_at",-1)], background=True)
@@ -2162,6 +2193,31 @@ async def build_member_context(member: discord.Member, guild: discord.Guild) -> 
         f"│  AI questions asked: {stats.get('questions', 0):,}",
         f"└─ AFK: {_afk_users[member.id][0] if member.id in _afk_users else 'no'}",
     ]
+    # Last seen (from cache)
+    ls = _last_seen.get(member.id, 0)
+    if ls:
+        mins_ago = int((time.time() - ls) // 60)
+        if mins_ago < 60:
+            lines.insert(-1, f"│  Last active: {mins_ago}m ago")
+        elif mins_ago < 1440:
+            lines.insert(-1, f"│  Last active: {mins_ago // 60}h ago")
+        else:
+            lines.insert(-1, f"│  Last active: {mins_ago // 1440}d ago")
+    # Message rate (messages in last hour)
+    now_ts = time.time()
+    recent_msgs = [t for t in list(_msg_rate.get(member.id, [])) if now_ts - t < 3600]
+    if recent_msgs:
+        lines.insert(-1, f"│  Messages last hour: {len(recent_msgs)}")
+    # Invite breakdown
+    try:
+        inv_doc = await bot.db.get_invite_doc(guild.id, member.id)
+        if inv_doc:
+            lines.insert(-1,
+                f"│  Invites: {inv_doc.get('total_invites',0)} total "
+                f"({inv_doc.get('regular',0)} regular, {inv_doc.get('left',0)} left, "
+                f"{inv_doc.get('fake',0)} fake, {inv_doc.get('bonus',0)} bonus)"
+            )
+    except Exception: pass
     return "\n".join(lines)
 
 
@@ -2185,6 +2241,8 @@ _CTX_TRIGGERS: dict[str, re.Pattern] = {
         r"\b(invite\s+leaderboard|most\s+invites?|top\s+inviters?)\b", re.I),
     "leaderboard_boost": re.compile(
         r"\b(boost\s+leaderboard|most\s+boost|top\s+boosters?)\b", re.I),
+    "double_xp": re.compile(
+        r"\b(double\s*xp|2x\s*xp|xp\s+event|xp\s+boost)\b", re.I),
     "members_online": re.compile(
         r"\b(who.{0,20}(online|here|active|present)|online\s+members?|how\s+many\s+(online|people|members?)|member\s+(count|list))\b", re.I),
     "voice": re.compile(
@@ -2201,19 +2259,19 @@ _CTX_TRIGGERS: dict[str, re.Pattern] = {
         r"\b(config|settings?|automod|anti.?spam|anti.?nuke|setup|configured|enabled|disabled)\b", re.I),
     "analytics": re.compile(
         r"\b(member\s+count\s+history|growth|analytics|members?\s+over\s+time)\b", re.I),
-    "leaderboard_boost": re.compile(
-        r"\b(boost|boosting|boosted|nitro\s+boost|server\s+boost)\b", re.I),
-    "double_xp": re.compile(
-        r"\b(double\s*xp|2x\s*xp|xp\s+event|xp\s+boost)\b", re.I),
     "server_identity": re.compile(
         r"\b(server\s+(name|id|info|stats|created|owner)|guild\s+(info|id)|about\s+the\s+server)\b", re.I),
+    "mod_log": re.compile(
+        r"\b(mod\s*(log|action|case|history)|recent\s*(ban|kick|warn|mute)|who\s*(was\s*)?(banned|kicked|warned|muted))\b", re.I),
+    "warnings": re.compile(
+        r"\b(warn(ings?|ed)?|infractions?|punishment)\b", re.I),
 }
 
 # Hard payload budget: chars before hitting API.
-# gpt-oss-20b context window is 32k tokens ≈ ~120k chars total.
+# compound-beta context window is 128k tokens ≈ ~480k chars total.
 # System prompt ~4k + history ~8k + question ~1k = ~13k overhead.
-# 18k for context gives a comfortable margin.
-_CTX_CHAR_BUDGET = 18_000
+# Raise to 32k to use more of compound-beta's larger window.
+_CTX_CHAR_BUDGET = 32_000
 
 
 async def _build_server_sections(
@@ -2245,27 +2303,55 @@ async def _build_server_sections(
             f"| Created: {guild.created_at.strftime('%Y-%m-%d')}"
         ))
 
-    # ── Newest / recent joins
+    # ── Newest / recent joins (uses persisted join_log for accuracy across restarts)
     if "newest_member" in needed:
-        humans = [m for m in guild.members if not m.bot and m.joined_at]
-        if humans:
-            sorted_joins = sorted(humans, key=lambda m: m.joined_at, reverse=True)
-            newest       = sorted_joins[0]
-            lines_nj     = [
-                f"Newest member: {newest.display_name} (@{newest.name}) — "
-                f"joined {newest.joined_at.strftime('%Y-%m-%d %H:%M UTC')} "
-                f"({ts(newest.joined_at)})"
+        log = _join_log.get(guild.id, [])
+        if log:
+            newest = log[-1]
+            joined_dt = newest.get("joined_at")
+            joined_str = joined_dt.strftime("%Y-%m-%d %H:%M UTC") if isinstance(joined_dt, datetime) else str(joined_dt)
+            inviter_str = f" (invited by {newest.get('inviter_name', '?')})" if newest.get("inviter_id") else ""
+            lines_nj = [
+                f"Newest member: {newest.get('display_name','?')} (@{newest.get('username','?')}) — "
+                f"joined {joined_str}{inviter_str} | account age: {newest.get('account_age_days','?')}d"
             ]
-            if len(sorted_joins) > 1:
-                recent = sorted_joins[1:11]
+            if len(log) > 1:
+                recent = log[-11:-1][::-1]
                 rj_str = " | ".join(
-                    f"{m.display_name} ({m.joined_at.strftime('%Y-%m-%d')})"
-                    for m in recent
+                    f"{e.get('display_name','?')} ({e['joined_at'].strftime('%Y-%m-%d') if isinstance(e.get('joined_at'), datetime) else '?'})"
+                    for e in recent
                 )
                 lines_nj.append(f"Recent joins (last 10): {rj_str}")
+            # Recent leaves
+            leave_log = _leave_log.get(guild.id, [])
+            if leave_log:
+                recent_leaves = leave_log[-5:][::-1]
+                rl_str = " | ".join(
+                    f"{e.get('display_name','?')} ({e['left_at'].strftime('%Y-%m-%d') if isinstance(e.get('left_at'), datetime) else '?'}, "
+                    f"was here {e.get('time_in_server_days','?')}d)"
+                    for e in recent_leaves
+                )
+                lines_nj.append(f"Recent leaves (last 5): {rl_str}")
             _add_section("╔══ NEWEST MEMBERS ══╗", "\n".join(lines_nj))
+        else:
+            # Fallback to Discord cache
+            humans = [m for m in guild.members if not m.bot and m.joined_at]
+            if humans:
+                sorted_joins = sorted(humans, key=lambda m: m.joined_at, reverse=True)
+                newest = sorted_joins[0]
+                lines_nj = [
+                    f"Newest member: {newest.display_name} (@{newest.name}) — "
+                    f"joined {newest.joined_at.strftime('%Y-%m-%d %H:%M UTC')} ({ts(newest.joined_at)})"
+                ]
+                if len(sorted_joins) > 1:
+                    rj_str = " | ".join(
+                        f"{m.display_name} ({m.joined_at.strftime('%Y-%m-%d')})"
+                        for m in sorted_joins[1:11]
+                    )
+                    lines_nj.append(f"Recent joins (last 10): {rj_str}")
+                _add_section("╔══ NEWEST MEMBERS ══╗", "\n".join(lines_nj))
 
-    # ── Online members
+    # ── Online members (enriched with last_seen cache)
     if "members_online" in needed:
         humans   = [m for m in guild.members if not m.bot]
         online_h = [m for m in humans if m.status == discord.Status.online]
@@ -2284,6 +2370,17 @@ async def _build_server_sections(
             content += f"Idle: {', '.join(m.display_name for m in idle_h[:15])}\n"
         if boosters:
             content += f"Boosters: {', '.join(m.display_name for m in boosters)}\n"
+        # Most recently active (by last_seen cache)
+        now_ts = time.time()
+        recently_active = sorted(
+            [(m, _last_seen.get(m.id, 0)) for m in humans if _last_seen.get(m.id, 0) > now_ts - 3600],
+            key=lambda x: x[1], reverse=True
+        )[:10]
+        if recently_active:
+            ra_str = ", ".join(
+                f"{m.display_name} ({int((now_ts - t)//60)}m ago)" for m, t in recently_active
+            )
+            content += f"Active last hour: {ra_str}\n"
         _add_section("╔══ MEMBERS ONLINE ══╗", content.rstrip())
 
     # ── Voice channels
@@ -2416,7 +2513,7 @@ async def _build_server_sections(
                 f"  Automod: {'✅' if config.get('automod_enabled', True) else '❌'} | "
                 f"Anti-spam: {'✅' if config.get('antispam_enabled', True) else '❌'} | "
                 f"Anti-nuke: {'✅' if config.get('antinuke_enabled', True) else '❌'} | "
-                    f"  Voice XP: {'✅' if config.get('voice_xp_enabled', True) else '❌'} | "
+                f"Voice XP: {'✅' if config.get('voice_xp_enabled', True) else '❌'} | "
                 f"Web search: {'✅' if config.get('web_search', True) else '❌'}"
             )
             _add_section("╔══ SERVER CONFIG ══╗", cfg_str)
@@ -2439,6 +2536,79 @@ async def _build_server_sections(
             remaining = int(dxp_until - time.monotonic())
             h, rem = divmod(remaining, 3600); m_min, s = divmod(rem, 60)
             _add_section("╔══ DOUBLE XP ══╗", f"  🔥 ACTIVE — {h}h {m_min}m {s}s remaining")
+
+    # ── Recent mod actions (always include for staff context)
+    if "mod_log" in needed or "members_online" in needed:
+        try:
+            recent_cases = await bot.db.db["mod_cases"].find(
+                {"guild_id": guild.id},
+                sort=[("created_at", -1)],
+                limit=5,
+            ).to_list(length=5)
+            if recent_cases:
+                mc_lines = []
+                for case in recent_cases:
+                    mod    = guild.get_member(case.get("mod_id", 0))
+                    target = guild.get_member(case.get("user_id", 0))
+                    mc_lines.append(
+                        f"  Case #{case.get('case_id','?')} [{case.get('action','?')}] "
+                        f"{target.display_name if target else case.get('user_id','?')} "
+                        f"by {mod.display_name if mod else '?'} — {case.get('reason','no reason')[:60]}"
+                    )
+                _add_section("╔══ RECENT MOD ACTIONS ══╗", "\n".join(mc_lines))
+        except Exception:
+            pass
+
+    # ── Recent warns (useful for AI to reference)
+    if "warnings" in needed or "mod_log" in needed:
+        try:
+            recent_warns = await bot.db.db["warnings"].find(
+                {"guild_id": guild.id},
+                sort=[("created_at", -1)],
+                limit=5,
+            ).to_list(length=5)
+            if recent_warns:
+                w_lines = []
+                for w in recent_warns:
+                    target = guild.get_member(w.get("user_id", 0))
+                    mod    = guild.get_member(w.get("mod_id", 0))
+                    w_lines.append(
+                        f"  {target.display_name if target else w.get('user_id','?')} "
+                        f"warned by {mod.display_name if mod else '?'}: {w.get('reason','?')[:80]}"
+                    )
+                _add_section("╔══ RECENT WARNINGS ══╗", "\n".join(w_lines))
+        except Exception:
+            pass
+
+    # ── Staff applications summary
+    if "tickets" in needed or "config" in needed:
+        try:
+            pending_apps = await bot.db.db["staff_applications"].count_documents(
+                {"guild_id": guild.id, "status": "pending"}
+            )
+            total_apps = await bot.db.db["staff_applications"].count_documents({"guild_id": guild.id})
+            if total_apps > 0:
+                _add_section("╔══ STAFF APPLICATIONS ══╗",
+                    f"  Pending: {pending_apps} | Total: {total_apps}")
+        except Exception:
+            pass
+
+    # ── Active mutes / timeouts
+    if "mod_log" in needed or "members_online" in needed:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            muted = [
+                m for m in guild.members
+                if not m.bot and m.timed_out_until and m.timed_out_until > now_utc
+            ]
+            if muted:
+                m_lines = [
+                    f"  {m.display_name} — until {m.timed_out_until.strftime('%H:%M UTC')}"
+                    for m in muted[:10]
+                ]
+                _add_section("╔══ ACTIVE TIMEOUTS ══╗", "\n".join(m_lines))
+        except Exception:
+            pass
 
     return "\n".join(lines)
 
@@ -4065,7 +4235,7 @@ class FakePermsSetupView(discord.ui.View):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ── Config key helpers ────────────────────────────────────────────────────────
-def _sr(config: dict, key: str) -> int | None:
+def _sr(config: dict, key: str) -> Optional[int]:
     """Return a single staff role ID from config, or None."""
     return config.get(key) or None
 
@@ -4085,12 +4255,14 @@ def _is_senior_or_above(member: discord.Member, config: dict) -> bool:
 
 def _is_mod_or_above(member: discord.Member, config: dict) -> bool:
     return _has_staff_role(member, config,
-        "staff_owner_role_id",
+        "staff_owner_role_id", "staff_community_manager_role_id",
+        "staff_partnership_manager_role_id",
         "staff_senior_mod_role_id", "staff_mod_role_id")
 
 def _is_trial_or_above(member: discord.Member, config: dict) -> bool:
     return _has_staff_role(member, config,
-        "staff_owner_role_id",
+        "staff_owner_role_id", "staff_community_manager_role_id",
+        "staff_partnership_manager_role_id",
         "staff_senior_mod_role_id", "staff_mod_role_id",
         "staff_trial_mod_role_id")
 
@@ -4717,15 +4889,11 @@ class RoleMenuView(discord.ui.View):
 
 async def update_member_count(guild: discord.Guild):
     ch = guild.get_channel(MEMBER_COUNT_CHANNEL_ID)
-    if not ch:
-        logger.warning("Member count: channel %s not found in guild %s", MEMBER_COUNT_CHANNEL_ID, guild.id)
-        return
+    if not ch: return
     name = MEMBER_COUNT_FORMAT.format(count=guild.member_count)
-    try:
-        await ch.edit(name=name, reason="Member count update")
-        logger.info("Member count updated → %s", name)
-    except Exception as e:
-        logger.warning("Member count edit failed: %s", e)
+    if ch.name != name:
+        try: await ch.edit(name=name, reason="Member count update")
+        except Exception as e: logger.warning("Member count: %s", e)
 
 WELCOME_CHANNEL_ID = 1507918341551952026  # #general — always send here regardless of config
 
@@ -5349,6 +5517,25 @@ class LXTEBot(commands.Bot):
             for vc in guild.voice_channels:
                 for m in vc.members:
                     if not m.bot: _voice_join_times[(m.id, guild.id)] = time.monotonic()
+        # ── Restore join/leave log ring buffers from DB ───────────────────────
+        for guild in self.guilds:
+            try:
+                joins = await bot.db.db["join_log"].find(
+                    {"guild_id": guild.id}, sort=[("joined_at", -1)], limit=_JOIN_LOG_MAX
+                ).to_list(_JOIN_LOG_MAX)
+                _join_log[guild.id] = list(reversed(joins))
+            except Exception: pass
+            try:
+                leaves = await bot.db.db["leave_log"].find(
+                    {"guild_id": guild.id}, sort=[("left_at", -1)], limit=_LEAVE_LOG_MAX
+                ).to_list(_LEAVE_LOG_MAX)
+                _leave_log[guild.id] = list(reversed(leaves))
+            except Exception: pass
+        # ── Seed presence cache from current member status ────────────────────
+        for guild in self.guilds:
+            for m in guild.members:
+                if not m.bot:
+                    _user_status[m.id] = str(m.status)
         self.cleanup_task.start()
         self.voice_xp_task.start()
         self.xp_decay_task.start()
@@ -5424,6 +5611,9 @@ class LXTEBot(commands.Bot):
                 logger.warning("track_message: %s", exc)
 
             now  = time.monotonic()
+            # Track last_seen and message rate
+            _last_seen[message.author.id] = time.time()
+            _msg_rate[message.author.id].append(time.time())
             last = _xp_cooldowns.get(message.author.id, 0)
             if now - last >= XP_COOLDOWN_SEC:
                 _xp_cooldowns[message.author.id] = now
@@ -5529,6 +5719,13 @@ class LXTEBot(commands.Bot):
                 e.set_footer(text=f"{guild.premium_subscription_count} boosts — Tier {guild.premium_tier}")
                 try: await bc.send(content=after.mention, embed=e)
                 except Exception: pass
+
+    async def on_presence_update(self, before: discord.Member, after: discord.Member):
+        """Cache user status changes in memory."""
+        status_str = str(after.status)  # "online", "idle", "dnd", "offline"
+        _user_status[after.id] = status_str
+        if status_str in ("online", "idle", "dnd"):
+            _last_seen[after.id] = time.time()
 
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
         if before.author.bot or not before.guild or before.content == after.content: return
@@ -5835,6 +6032,32 @@ class LXTEBot(commands.Bot):
         # NOTE: kick detection is now handled by on_audit_log_entry_create (v18)
         # on_member_remove fires for both leaves and kicks — we can't tell which
         # without the audit log, so we don't call handle_antinuke_kick here anymore.
+        # Decrement inviter's count when a member leaves
+        try:
+            inv_ref = await bot.db.db["invite_refs"].find_one({"guild_id": member.guild.id, "user_id": member.id})
+            if inv_ref and inv_ref.get("inviter_id"):
+                await bot.db.decrement_invite_count(member.guild.id, inv_ref["inviter_id"])
+        except Exception:
+            pass
+        # ── Persist leave to leave_log collection + in-memory buffer ─────────
+        try:
+            leave_doc = {
+                "guild_id":     member.guild.id,
+                "user_id":      member.id,
+                "username":     member.name,
+                "display_name": member.display_name,
+                "left_at":      datetime.now(timezone.utc),
+                "joined_at":    member.joined_at,
+                "time_in_server_days": round((datetime.now(timezone.utc) - member.joined_at).total_seconds() / 86400, 1) if member.joined_at else None,
+                "roles":        [r.name for r in member.roles if r.name != "@everyone"],
+                "avatar_url":   str(member.display_avatar.url) if member.display_avatar else None,
+            }
+            await bot.db.db["leave_log"].insert_one(leave_doc)
+            _leave_log[member.guild.id].append(leave_doc)
+            if len(_leave_log[member.guild.id]) > _LEAVE_LOG_MAX:
+                _leave_log[member.guild.id] = _leave_log[member.guild.id][-_LEAVE_LOG_MAX:]
+        except Exception as exc:
+            logger.warning("leave_log persist error: %s", exc)
         lc = get_log_channel(member.guild, config, "entry")
         if lc:
             e = make_embed(C_WARNING)
@@ -5865,7 +6088,39 @@ class LXTEBot(commands.Bot):
         except Exception: pass
         used = await find_used_invite(member.guild)
         if used and used.inviter:
-            await self.db.increment_invite_count(member.guild.id, used.inviter.id)
+            age_days = (datetime.now(timezone.utc) - member.created_at).days
+            is_fake = age_days < 7
+            await self.db.increment_invite_count(member.guild.id, used.inviter.id, fake=is_fake)
+            try:
+                await self.db.db["invite_refs"].update_one(
+                    {"guild_id": member.guild.id, "user_id": member.id},
+                    {"$set": {"inviter_id": used.inviter.id}}, upsert=True,
+                )
+            except Exception:
+                pass
+        # ── Persist join to join_log collection + in-memory ring buffer ────────
+        try:
+            join_doc = {
+                "guild_id":       member.guild.id,
+                "user_id":        member.id,
+                "username":       member.name,
+                "display_name":   member.display_name,
+                "joined_at":      datetime.now(timezone.utc),
+                "account_created": member.created_at,
+                "account_age_days": (datetime.now(timezone.utc) - member.created_at).days,
+                "inviter_id":     used.inviter.id if used and used.inviter else None,
+                "inviter_name":   used.inviter.name if used and used.inviter else None,
+                "invite_code":    used.code if used else None,
+                "avatar_url":     str(member.display_avatar.url) if member.display_avatar else None,
+                "bot":            member.bot,
+            }
+            await bot.db.db["join_log"].insert_one(join_doc)
+            # In-memory ring buffer
+            _join_log[member.guild.id].append(join_doc)
+            if len(_join_log[member.guild.id]) > _JOIN_LOG_MAX:
+                _join_log[member.guild.id] = _join_log[member.guild.id][-_JOIN_LOG_MAX:]
+        except Exception as exc:
+            logger.warning("join_log persist error: %s", exc)
         if not _raid_active.get(member.guild.id, False):
             for entry in config.get("autoroles", []):
                 role = member.guild.get_role(entry.get("role_id"))
@@ -6240,25 +6495,29 @@ def ai_reply_content(answer: str) -> str:
 
 def build_help_embed(category: str, user=None) -> discord.Embed:
     avatar = bot.user.display_avatar.url if bot.user else None
-    footer = "Prefix: .  |  All commands work in any server this bot is in."
+    footer = "Prefix: .  |  Use the menu below to browse categories."
 
     # ── Home ──────────────────────────────────────────────────────────────────
     if category == "home":
         e = make_embed(C_PRIMARY,
-            "Use the dropdown below to browse all commands.\n"
-            "Prefix: **`.`**   Slash commands also supported where shown.\n\n"
-            "🤖 **AI** — ask questions, image analysis, web search\n"
-            "⬆️ **Leveling** — XP, rank cards, leaderboard, daily\n"
-            "🔨 **Moderation** — warn, ban, mute, purge, cases\n"
-            "📢 **Reports & Safety** — .report, .tempban, .serveraudit\n"
-            "🎟️ **Tickets** — open, claim, close, transcripts, ratings\n"
-            "🎉 **Giveaways** — start, end, reroll, list\n"
-            "📊 **Analytics & Stats** — server growth, leaderboards\n"
-            "💬 **Social & Info** — AFK, invites, user/server info\n"
-            "🛡️ **Staff System** — roles, permissions, abuse protection\n"
-            "🔒 **Admin** — setup, snapshots, config *(admins only)*\n"
+            "**LXTE's AI** — Feature-rich bot built for the LXTE Clan.\n\n"
+            "**Quick Access:**\n"
+            "• Type `.help` to view this menu\n"
+            "• Current prefix: **`.`**\n\n"
         )
-        e.title = "Help — Command Reference"
+        e.title = "LXTE's AI"
+        e.add_field(name="🤖 AI & Chat",         value="`.help ai`",        inline=True)
+        e.add_field(name="⬆️ Leveling",           value="`.help leveling`",  inline=True)
+        e.add_field(name="🔨 Moderation",         value="`.help mod`",       inline=True)
+        e.add_field(name="📢 Reports & Cases",    value="`.help cases`",     inline=True)
+        e.add_field(name="🎟️ Tickets",            value="`.help tickets`",   inline=True)
+        e.add_field(name="🎉 Giveaways",          value="`.help giveaways`", inline=True)
+        e.add_field(name="📊 Analytics & Stats",  value="`.help analytics`", inline=True)
+        e.add_field(name="💬 Social & Info",      value="`.help social`",    inline=True)
+        e.add_field(name="🎭 Roles",              value="`.help roles`",     inline=True)
+        e.add_field(name="🛡️ Staff System",       value="`.help staff`",     inline=True)
+        e.add_field(name="🔒 Admin",              value="`.help admin`",     inline=True)
+        e.add_field(name="​",               value="​",            inline=True)
         e.set_thumbnail(url=avatar)
         e.set_footer(text=footer, icon_url=avatar)
         return e
@@ -6661,10 +6920,7 @@ async def cmd_ask(ctx: commands.Context, *, question: str = "What's in this imag
 
         # Build server context + append live web search results if enabled
         ctx_str = await build_context(ctx, recent_chat)
-        if config.get('web_search', True) and not has_image:
-            web_ctx = await auto_web_search(question)
-            if web_ctx:
-                ctx_str = ctx_str + web_ctx
+        # compound-beta handles web search natively — no pre-fetch needed
 
         # Inject per-user AI memory
         mem_doc = await bot.db.get_user_memory(ctx.author.id)
@@ -6797,14 +7053,14 @@ async def cmd_robloxnotify(ctx: commands.Context, channel: discord.TextChannel =
     await ctx.send(embed=ok(msg))
 
 
-@bot.command(name="roles")
+@bot.command(name="roles", aliases=["rolelist", "allroles"])
 async def cmd_roles(ctx: commands.Context):
     roles = [r.name for r in sorted(ctx.guild.roles, key=lambda r: r.position, reverse=True) if r.name != "@everyone"]
     e = make_embed(C_PRIMARY, "\n".join(roles) or "No roles.")
     e.title = f"Roles [{len(roles)}]"
     await ctx.send(embed=e)
 
-@bot.command(name="syncroles")
+@bot.command(name="syncroles", aliases=["syncr", "rolesync"])
 @commands.has_permissions(administrator=True)
 async def cmd_syncroles(ctx: commands.Context):
     msg = await ctx.send(embed=make_embed(C_INFO, "⏳ Syncing roles for all members…"))
@@ -6832,7 +7088,7 @@ async def cmd_syncroles(ctx: commands.Context):
     e = ok(f"Sync complete.\n**Members checked:** {len(ctx.guild.members)}\n**Role assignments made:** {fixed}\n**Errors:** {errors}")
     await msg.edit(embed=e)
   
-@bot.command(name="retry")
+@bot.command(name="retry", aliases=["re", "redo"])
 async def cmd_retry(ctx: commands.Context):
     history = await bot.db.get_history(ctx.author.id, ctx.channel.id)
     if not history: await ctx.send(embed=err("No history to retry.")); return
@@ -6845,10 +7101,7 @@ async def cmd_retry(ctx: commands.Context):
     asyncio.create_task(keep_typing(ctx.channel, stop))
     try:
         ctx_str = await build_context(ctx)
-        if config.get("web_search", True):
-            web_ctx = await auto_web_search(last_q)
-            if web_ctx:
-                ctx_str = ctx_str + web_ctx
+        # compound-beta handles web search natively
         answer = await bot.ai.ask(
             last_q, snap, AI_UNFILTERED if _owner_unfiltered else AI_TEXT,
             context=ctx_str,
@@ -6903,35 +7156,51 @@ async def cmd_lb(ctx: commands.Context):
     await ctx.send(embed=e)
 
 
-@bot.command(name="afk")
+@bot.command(name="afk", aliases=["away"])
 async def cmd_afk(ctx: commands.Context, *, reason: str = "AFK"):
     _afk_users[ctx.author.id] = (reason[:100], time.time())
     await ctx.send(embed=make_embed(C_WARNING, f"💤 {ctx.author.mention} is now AFK: **{reason[:100]}**"))
 
 
-@bot.command(name="invites")
+@bot.command(name="invites", aliases=["inv", "invite"])
 async def cmd_invites(ctx: commands.Context, target: discord.Member = None):
+    if not ctx.guild: return
     target = target or ctx.author
-    count  = await bot.db.get_invite_count(ctx.guild.id, target.id)
-    e = make_embed(C_SUCCESS, f"**{target.display_name}** has invited **{count}** member(s).")
+    doc     = await bot.db.get_invite_doc(ctx.guild.id, target.id)
+    total   = doc.get("total_invites", 0)
+    regular = doc.get("regular", 0)
+    left    = doc.get("left", 0)
+    fake    = doc.get("fake", 0)
+    bonus   = doc.get("bonus", 0)
+    e = make_embed(C_SUCCESS,
+        f"**{target.mention}** has **{total}** invite{'s' if total != 1 else ''}.\n"
+        f"({regular} regular, {left} left, {fake} fake, {bonus} bonus)"
+    )
+    e.title = f"📨 Invites — {target.display_name}"
     e.set_thumbnail(url=target.display_avatar.url)
     await ctx.send(embed=e)
 
 
-@bot.command(name="invitelb")
+@bot.command(name="invitelb", aliases=["invlb", "inviteleaderboard"])
 async def cmd_invitelb(ctx: commands.Context):
+    if not ctx.guild: return
     rows = await bot.db.get_invite_leaderboard(ctx.guild.id, 10)
     if not rows: await ctx.send(embed=make_embed(C_WARNING, "No invite data yet.")); return
     medals = ["🥇","🥈","🥉"]
     lines  = []
     for idx, r in enumerate(rows):
-        m = ctx.guild.get_member(r.get("inviter_id", 0))
-        name = m.display_name if m else str(r.get("inviter_id"))
-        count = r.get("total_invites", 0)
-        prefix = medals[idx] if idx < 3 else f"`{idx+1}.`"
-        lines.append(f"{prefix} {name} — {count} invite{'s' if count != 1 else ''}")
+        m       = ctx.guild.get_member(r.get("inviter_id", 0))
+        name    = m.mention if m else f"<@{r.get('inviter_id')}>"
+        total   = r.get("total_invites", 0)
+        regular = r.get("regular", 0)
+        left    = r.get("left", 0)
+        fake    = r.get("fake", 0)
+        bonus   = r.get("bonus", 0)
+        prefix  = medals[idx] if idx < 3 else f"`{idx+1}.`"
+        lines.append(f"{prefix} {name} • **{total}** invites. ({regular} regular, {left} left, {fake} fake, {bonus} bonus)")
     e = make_embed(C_GOLD, "\n".join(lines))
-    e.title = "📨 Invite Leaderboard"
+    e.title = "📨 Invites Leaderboard"
+    e.set_footer(text="LXTE's AI")
     await ctx.send(embed=e)
 
 
@@ -6947,13 +7216,13 @@ async def cmd_msglb(ctx: commands.Context):
     lines  = []
     for idx, row in enumerate(rows):
         member = ctx.guild.get_member(row["user_id"])
-        name   = member.display_name if member else f"<@{row['user_id']}>"
+        name   = member.mention if member else f"<@{row['user_id']}>"
         count  = row.get("total_messages", 0)
         prefix = medals[idx] if idx < 3 else f"`{idx+1}.`"
-        lines.append(f"{prefix} {name} — **{count:,}** message{'s' if count != 1 else ''}")
+        lines.append(f"{prefix} {name} • **{count:,}** messages sent.")
     e = make_embed(C_INFO, "\n".join(lines))
-    e.title = "💬 Message Leaderboard"
-    e.set_footer(text="LXTE's AI • v19")
+    e.title = "💬 Messages Leaderboard"
+    e.set_footer(text="LXTE's AI")
     await ctx.send(embed=e)
 
 
@@ -7237,7 +7506,7 @@ async def cmd_clear(ctx: commands.Context):
     await ctx.send(embed=make_embed(C_WARNING, "🗑️ Your chat history has been wiped."))
 
 
-@bot.command(name="purge")
+@bot.command(name="purge", aliases=["bulkdelete", "bd"])
 @commands.cooldown(rate=1, per=5, type=commands.BucketType.user)
 async def cmd_purge(ctx: commands.Context, amount: int = 10):
     if not ctx.guild: return
@@ -7266,7 +7535,7 @@ async def cmd_purge(ctx: commands.Context, amount: int = 10):
 
 # ─── Warn System (v23) ────────────────────────────────────────────────────────
 
-@bot.command(name="warn")
+@bot.command(name="warn", aliases=["w"])
 async def cmd_warn(ctx: commands.Context, member: discord.Member = None, *, reason: str = "No reason given."):
     """Warn a user. 3 warns = 60min timeout. Usage: .warn @user reason"""
     if not ctx.guild: return
@@ -7339,7 +7608,7 @@ async def cmd_warns(ctx: commands.Context, member: discord.Member = None):
     await ctx.send(embed=e)
 
 
-@bot.command(name="clearwarns")
+@bot.command(name="clearwarns", aliases=["cw", "delwarns"])
 async def cmd_clearwarns(ctx: commands.Context, member: discord.Member = None):
     """Clear all warns for a user. Usage: .clearwarns @user"""
     if not ctx.guild: return
@@ -7356,7 +7625,7 @@ async def cmd_clearwarns(ctx: commands.Context, member: discord.Member = None):
 
 # ─── Daily XP (v23) ───────────────────────────────────────────────────────────
 
-@bot.command(name="daily")
+@bot.command(name="daily", aliases=["claim", "reward"])
 async def cmd_daily(ctx: commands.Context):
     """Claim your daily XP bonus once every 24 hours."""
     if not ctx.guild:
@@ -7408,7 +7677,7 @@ async def cmd_ticket(ctx: commands.Context):
     await ctx.send(embed=make_embed(C_PRIMARY, "Select a category:"), view=view, delete_after=60)
 
 
-@bot.command(name="claim")
+@bot.command(name="claim", aliases=["take"])
 @commands.has_permissions(manage_channels=True)
 async def cmd_claim(ctx: commands.Context):
     """Claim the current ticket channel. Usage: .claim"""
@@ -7429,7 +7698,7 @@ async def cmd_claim(ctx: commands.Context):
     await ctx.send(embed=e)
 
 
-@bot.command(name="close")
+@bot.command(name="close", aliases=["closeticket", "ct"])
 async def cmd_close(ctx: commands.Context):
     """Close the current ticket channel. Usage: .close"""
     ticket_data = await bot.db.get_ticket(ctx.channel.id)
@@ -7457,7 +7726,7 @@ async def cmd_close(ctx: commands.Context):
     except Exception: pass
 
 
-@bot.command(name="transcript")
+@bot.command(name="transcript", aliases=["trans", "tlog"])
 @commands.has_permissions(manage_channels=True)
 async def cmd_transcript(ctx: commands.Context):
     """Generate and DM yourself a transcript of the current ticket. Usage: .transcript"""
@@ -7496,7 +7765,7 @@ async def cmd_about(ctx: commands.Context):
 
 # ─── Giveaway commands ────────────────────────────────────────────────────────
 
-@bot.command(name="gstart")
+@bot.command(name="gstart", aliases=["gs"])
 @commands.has_permissions(manage_guild=True)
 @commands.cooldown(rate=1, per=10, type=commands.BucketType.guild)
 async def cmd_gstart(ctx: commands.Context, duration: str = None, *, prize: str = None):
@@ -7532,7 +7801,7 @@ async def cmd_gstart(ctx: commands.Context, duration: str = None, *, prize: str 
         await ctx.message.delete()
 
 
-@bot.command(name="gend")
+@bot.command(name="gend", aliases=["ge"])
 @commands.has_permissions(manage_guild=True)
 async def cmd_gend(ctx: commands.Context, message_id: int = None):
     if not message_id:
@@ -7546,7 +7815,7 @@ async def cmd_gend(ctx: commands.Context, message_id: int = None):
         await ctx.send(embed=ok("Giveaway ended."))
 
 
-@bot.command(name="greroll")
+@bot.command(name="greroll", aliases=["gr"])
 @commands.has_permissions(manage_guild=True)
 async def cmd_greroll(ctx: commands.Context, message_id: int = None):
     if not message_id:
@@ -7562,7 +7831,7 @@ async def cmd_greroll(ctx: commands.Context, message_id: int = None):
     await ctx.send(embed=make_embed(C_GOLD, f"🎉 New winner(s): {mentions}\nCongratulations on **{giveaway['prize']}**!"))
 
 
-@bot.command(name="glist")
+@bot.command(name="glist", aliases=["gl"])
 async def cmd_glist(ctx: commands.Context):
     active = await bot.db.get_active_giveaways(ctx.guild.id)
     if not active: await ctx.send(embed=make_embed(C_INFO, "No active giveaways.")); return
@@ -7923,7 +8192,7 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
 
 # ─── Ping ─────────────────────────────────────────────────────────────────────
 
-@bot.command(name="ping")
+@bot.command(name="ping", aliases=["latency", "pong"])
 async def cmd_ping(ctx: commands.Context):
     """Check if the bot is alive. Shows latency and prefix."""
     latency = round(bot.latency * 1000)
@@ -7969,7 +8238,7 @@ async def cmd_slowmode(ctx: commands.Context, seconds: int = 0):
 
 # ─── Kick ──────────────────────────────────────────────────────────────────────
 
-@bot.command(name="kick")
+@bot.command(name="kick", aliases=["k"])
 async def cmd_kick(ctx: commands.Context, member: discord.Member = None, *, reason: str = "No reason given."):
     """Kick a member. Requires Mod or above. Usage: .kick @user [reason]"""
     if not ctx.guild: return
@@ -8012,7 +8281,7 @@ async def cmd_kick(ctx: commands.Context, member: discord.Member = None, *, reas
 
 # ─── Ban ───────────────────────────────────────────────────────────────────────
 
-@bot.command(name="ban")
+@bot.command(name="ban", aliases=["b"])
 async def cmd_ban(ctx: commands.Context, member: discord.Member = None, *, reason: str = "No reason given."):
     """Ban a member. Requires Mod or above. Usage: .ban @user [reason]"""
     if not ctx.guild: return
@@ -8055,7 +8324,7 @@ async def cmd_ban(ctx: commands.Context, member: discord.Member = None, *, reaso
 
 # ─── Unban ─────────────────────────────────────────────────────────────────────
 
-@bot.command(name="unban")
+@bot.command(name="unban", aliases=["ub"])
 async def cmd_unban(ctx: commands.Context, user_id: int = None, *, reason: str = "No reason given."):
     """Unban a user by ID. Requires Mod or above. Usage: .unban <user_id> [reason]"""
     if not ctx.guild: return
@@ -8157,7 +8426,7 @@ async def cmd_tempmute(ctx: commands.Context, member: discord.Member = None, dur
 
 # ─── Unmute ────────────────────────────────────────────────────────────────────
 
-@bot.command(name="unmute")
+@bot.command(name="unmute", aliases=["um", "untimeout"])
 async def cmd_unmute(ctx: commands.Context, member: discord.Member = None, *, reason: str = "Manually unmuted."):
     """Remove a mute/timeout from a member. Requires Mod or above. Usage: .unmute @user"""
     if not ctx.guild: return
@@ -8187,7 +8456,7 @@ _CASE_EMOJIS = {
     "unban": "🔓", "tempmute": "🔇", "unmute": "🔊",
 }
 
-@bot.command(name="case")
+@bot.command(name="case", aliases=["c", "modcase"])
 @commands.has_permissions(manage_messages=True)
 async def cmd_case(ctx: commands.Context, num: int = None):
     """Look up a mod case by number. Usage: .case 12"""
@@ -8263,7 +8532,7 @@ async def cmd_history(ctx: commands.Context, member: discord.Member = None):
 
 # ─── Bot Customization (owner only) ──────────────────────────────────────────
 
-@bot.command(name="setavatar", hidden=True)
+@bot.command(name="setavatar", aliases=["avatar", "pfp"], hidden=True)
 async def cmd_setavatar(ctx: commands.Context, url: str = None):
     if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
     if not url: await ctx.send(embed=err("Usage: `.setavatar <image_url>`"), delete_after=8); return
@@ -8274,7 +8543,7 @@ async def cmd_setavatar(ctx: commands.Context, url: str = None):
         await ctx.send(embed=ok("✅ Avatar updated."))
     except Exception as exc: await ctx.send(embed=err(f"Failed: `{exc}`"))
 
-@bot.command(name="setbanner", hidden=True)
+@bot.command(name="setbanner", aliases=["banner"], hidden=True)
 async def cmd_setbanner(ctx: commands.Context, url: str = None):
     if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
     if not url: await ctx.send(embed=err("Usage: `.setbanner <image_url>`"), delete_after=8); return
@@ -8285,7 +8554,7 @@ async def cmd_setbanner(ctx: commands.Context, url: str = None):
         await ctx.send(embed=ok("✅ Banner updated."))
     except Exception as exc: await ctx.send(embed=err(f"Failed: `{exc}`"))
 
-@bot.command(name="setnick", hidden=True)
+@bot.command(name="setnick", aliases=["botnick"], hidden=True)
 async def cmd_setnick(ctx: commands.Context, *, nick: str = None):
     if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
     if not ctx.guild: return
@@ -8295,7 +8564,7 @@ async def cmd_setnick(ctx: commands.Context, *, nick: str = None):
         await ctx.send(embed=ok(f"✅ Nickname {'cleared' if not new else f'set to `{new}`'}."))
     except Exception as exc: await ctx.send(embed=err(f"Failed: `{exc}`"))
 
-@bot.command(name="setname", hidden=True)
+@bot.command(name="setname", aliases=["botname"], hidden=True)
 async def cmd_setname(ctx: commands.Context, *, name: str = None):
     if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
     if not name: await ctx.send(embed=err("Usage: `.setname <username>`"), delete_after=8); return
@@ -8307,7 +8576,7 @@ async def cmd_setname(ctx: commands.Context, *, name: str = None):
 
 # ─── Channel Management ───────────────────────────────────────────────────────
 
-@bot.command(name="lock")
+@bot.command(name="lock", aliases=["lc"])
 async def cmd_lock(ctx: commands.Context, channel: discord.TextChannel = None, *, reason: str = "Locked by staff."):
     if not ctx.guild: return
     config = await get_config(ctx.guild.id)
@@ -8323,7 +8592,7 @@ async def cmd_lock(ctx: commands.Context, channel: discord.TextChannel = None, *
     except discord.Forbidden:
         await ctx.send(embed=err("Missing permissions."))
 
-@bot.command(name="unlock")
+@bot.command(name="unlock", aliases=["ulc"])
 async def cmd_unlock(ctx: commands.Context, channel: discord.TextChannel = None, *, reason: str = "Unlocked by staff."):
     if not ctx.guild: return
     config = await get_config(ctx.guild.id)
@@ -8339,7 +8608,7 @@ async def cmd_unlock(ctx: commands.Context, channel: discord.TextChannel = None,
     except discord.Forbidden:
         await ctx.send(embed=err("Missing permissions."))
 
-@bot.command(name="nuke")
+@bot.command(name="nuke", aliases=["wipe"])
 async def cmd_nuke(ctx: commands.Context, channel: discord.TextChannel = None):
     if not ctx.guild: return
     if ctx.author.id != bot.owner_id_int and not ctx.author.guild_permissions.administrator:
@@ -8363,7 +8632,7 @@ async def cmd_nuke(ctx: commands.Context, channel: discord.TextChannel = None):
 
 # ─── Nick ────────────────────────────────────────────────────────────────────
 
-@bot.command(name="nick")
+@bot.command(name="nick", aliases=["nickname", "setnickname"])
 async def cmd_nick(ctx: commands.Context, member: discord.Member = None, *, nick: str = None):
     if not ctx.guild: return
     config = await get_config(ctx.guild.id)
@@ -8381,7 +8650,7 @@ async def cmd_nick(ctx: commands.Context, member: discord.Member = None, *, nick
 
 # ─── Softban / Massban ────────────────────────────────────────────────────────
 
-@bot.command(name="softban")
+@bot.command(name="softban", aliases=["sb"])
 async def cmd_softban(ctx: commands.Context, member: discord.Member = None, *, reason: str = "No reason given."):
     if not ctx.guild: return
     config = await get_config(ctx.guild.id)
@@ -8404,7 +8673,7 @@ async def cmd_softban(ctx: commands.Context, member: discord.Member = None, *, r
     except discord.Forbidden:
         await ctx.send(embed=err("Missing permissions."))
 
-@bot.command(name="massban")
+@bot.command(name="massban", aliases=["mb"])
 async def cmd_massban(ctx: commands.Context, *, ids: str = None):
     if not ctx.guild: return
     if ctx.author.id != bot.owner_id_int and not ctx.author.guild_permissions.administrator:
@@ -8431,7 +8700,7 @@ async def cmd_massban(ctx: commands.Context, *, ids: str = None):
 
 # ─── Role Management ─────────────────────────────────────────────────────────
 
-@bot.command(name="role")
+@bot.command(name="role", aliases=["giverole"])
 async def cmd_role(ctx: commands.Context, action: str = None, member: discord.Member = None, *, role_name: str = None):
     if not ctx.guild: return
     config = await get_config(ctx.guild.id)
@@ -8453,7 +8722,7 @@ async def cmd_role(ctx: commands.Context, action: str = None, member: discord.Me
     except discord.Forbidden:
         await ctx.send(embed=err("Missing permissions to manage that role."))
 
-@bot.command(name="rolepersist")
+@bot.command(name="rolepersist", aliases=["rp"])
 async def cmd_rolepersist(ctx: commands.Context, action: str = None, member: discord.Member = None, *, role_name: str = None):
     if not ctx.guild: return
     config = await get_config(ctx.guild.id)
@@ -8487,7 +8756,7 @@ async def cmd_rolepersist(ctx: commands.Context, action: str = None, member: dis
 
 # ─── Mod Stats / Warnings alias ──────────────────────────────────────────────
 
-@bot.command(name="modstats")
+@bot.command(name="modstats", aliases=["ms"])
 async def cmd_modstats(ctx: commands.Context, target: discord.Member = None):
     if not ctx.guild: return
     config = await get_config(ctx.guild.id)
@@ -8532,7 +8801,7 @@ async def cmd_warnings(ctx: commands.Context, member: discord.Member = None):
 
 # ─── Ticket Extras ────────────────────────────────────────────────────────────
 
-@bot.command(name="adduser")
+@bot.command(name="adduser", aliases=["au"])
 async def cmd_adduser(ctx: commands.Context, member: discord.Member = None):
     if not ctx.guild: return
     config = await get_config(ctx.guild.id)
@@ -8545,7 +8814,7 @@ async def cmd_adduser(ctx: commands.Context, member: discord.Member = None):
         await ctx.send(embed=ok(f"✅ {member.mention} added to this ticket."))
     except discord.Forbidden: await ctx.send(embed=err("Missing permissions."))
 
-@bot.command(name="removeuser")
+@bot.command(name="removeuser", aliases=["ru"])
 async def cmd_removeuser(ctx: commands.Context, member: discord.Member = None):
     if not ctx.guild: return
     config = await get_config(ctx.guild.id)
@@ -8572,7 +8841,7 @@ async def cmd_renameticket(ctx: commands.Context, *, name: str = None):
         await ctx.send(embed=ok(f"✅ Renamed to `ticket-{safe}`."))
     except discord.Forbidden: await ctx.send(embed=err("Missing permissions."))
 
-@bot.command(name="priority")
+@bot.command(name="priority", aliases=["prio"])
 async def cmd_priority(ctx: commands.Context):
     if not ctx.guild: return
     config = await get_config(ctx.guild.id)
@@ -8589,7 +8858,7 @@ async def cmd_priority(ctx: commands.Context):
 
 # ─── Utility ─────────────────────────────────────────────────────────────────
 
-@bot.command(name="shorten")
+@bot.command(name="shorten", aliases=["short", "url"])
 async def cmd_shorten(ctx: commands.Context, url: str = None):
     if not url: await ctx.send(embed=err("Usage: `.shorten <url>`")); return
     try:
@@ -8622,7 +8891,7 @@ class EmbedBuilderModal(discord.ui.Modal, title="Create Embed"):
         except Exception as exc:
             await i.response.send_message(embed=err(f"Failed: `{exc}`"), ephemeral=True)
 
-@bot.command(name="embed")
+@bot.command(name="embed", aliases=["ce"])
 async def cmd_embed(ctx: commands.Context):
     if not ctx.guild: return
     if ctx.author.id != bot.owner_id_int and not ctx.author.guild_permissions.administrator:
@@ -8633,7 +8902,7 @@ async def cmd_embed(ctx: commands.Context):
         async def open_modal(self, i: discord.Interaction, b): await i.response.send_modal(EmbedBuilderModal())
     await ctx.send("Click to open the embed builder:", view=EmbedTrigger(), delete_after=60)
 
-@bot.command(name="say")
+@bot.command(name="say", aliases=["echo"])
 async def cmd_say(ctx: commands.Context, channel: discord.TextChannel = None, *, text: str = None):
     if not ctx.guild: return
     if ctx.author.id != bot.owner_id_int and not ctx.author.guild_permissions.administrator:
@@ -8679,7 +8948,7 @@ async def cmd_inviteinfo(ctx: commands.Context, code: str = None):
     except discord.NotFound: await ctx.send(embed=err(f"Invite `{code}` not found or expired."))
     except Exception as exc: await ctx.send(embed=err(f"Failed: `{exc}`"))
 
-@bot.command(name="resetinvites")
+@bot.command(name="resetinvites", aliases=["rinv"])
 async def cmd_resetinvites(ctx: commands.Context, member: discord.Member = None):
     if not ctx.guild: return
     config = await get_config(ctx.guild.id)
@@ -8701,13 +8970,17 @@ async def cmd_resetallinvites(ctx: commands.Context):
     try: reaction, _ = await bot.wait_for("reaction_add", timeout=30, check=check)
     except asyncio.TimeoutError: await conf.edit(embed=make_embed(C_WARNING, "Cancelled.")); return
     if str(reaction.emoji) == "❌": await conf.edit(embed=make_embed(C_WARNING, "Cancelled.")); return
-    result = await bot.db.db["invites"].delete_many({"guild_id": ctx.guild.id})
-    await conf.edit(embed=ok(f"✅ Reset invite data for **{result.deleted_count}** users."))
+    owner_id = bot.owner_id_int
+    result = await bot.db.db["invites"].delete_many({
+        "guild_id": ctx.guild.id,
+        "inviter_id": {"$ne": owner_id},
+    })
+    await conf.edit(embed=ok(f"✅ Reset invite data for **{result.deleted_count}** users (owner excluded)."))
 
 
 # ─── Owner / Multi-guild Tools ────────────────────────────────────────────────
 
-@bot.command(name="restart", hidden=True)
+@bot.command(name="restart", aliases=["reboot"], hidden=True)
 async def cmd_restart(ctx: commands.Context):
     if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
     await ctx.send(embed=make_embed(C_WARNING, "🔄 Restarting…"))
@@ -8715,7 +8988,7 @@ async def cmd_restart(ctx: commands.Context):
     await bot.close()
     _os.execv(sys.executable, [sys.executable] + sys.argv)
 
-@bot.command(name="guilds", hidden=True)
+@bot.command(name="guilds", aliases=["servers"], hidden=True)
 async def cmd_guilds(ctx: commands.Context):
     if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
     lines = [f"**{g.name}** — {g.member_count:,} members (`{g.id}`)"
@@ -8723,7 +8996,7 @@ async def cmd_guilds(ctx: commands.Context):
     e = make_embed(C_INFO, "\n".join(lines[:30])); e.title = f"🌐 Guilds ({len(bot.guilds)})"
     await ctx.send(embed=e)
 
-@bot.command(name="blacklistserver", hidden=True)
+@bot.command(name="blacklistserver", aliases=["bls"], hidden=True)
 async def cmd_blacklistserver(ctx: commands.Context, guild_id: int = None, *, reason: str = "No reason."):
     if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
     if not guild_id: await ctx.send(embed=err("Usage: `.blacklistserver <guild_id> [reason]`"), delete_after=8); return
@@ -8739,7 +9012,7 @@ async def cmd_blacklistserver(ctx: commands.Context, guild_id: int = None, *, re
         await g.leave()
     await ctx.send(embed=ok(f"✅ Guild `{guild_id}` blacklisted and left."))
 
-@bot.command(name="broadcast", hidden=True)
+@bot.command(name="broadcast", aliases=["bc"], hidden=True)
 async def cmd_broadcast(ctx: commands.Context, *, message: str = None):
     if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
     if not message: await ctx.send(embed=err("Usage: `.broadcast <message>`"), delete_after=8); return
@@ -8935,7 +9208,7 @@ class ReportActionView(discord.ui.View):
         await interaction.response.send_message(embed=e, ephemeral=True)
 
 
-@bot.command(name="report")
+@bot.command(name="report", aliases=["rep"])
 @commands.cooldown(rate=1, per=60, type=commands.BucketType.user)
 async def cmd_report(ctx: commands.Context, target: discord.Member = None, *, reason: str = None):
     """
@@ -9037,7 +9310,7 @@ async def cmd_cleanup(ctx: commands.Context, target: discord.Member = None, amou
 
 # ─── Unban All ────────────────────────────────────────────────────────────────
 
-@bot.command(name="unbanall", hidden=True)
+@bot.command(name="unbanall", aliases=["massunban"], hidden=True)
 async def cmd_unbanall(ctx: commands.Context):
     """Mass-unban all banned users. Owner only. Requires reaction confirmation."""
     if not ctx.guild: return
