@@ -208,16 +208,12 @@ _JOIN_LOG_MAX = 50
 _leave_log: dict[int, list[dict]] = collections.defaultdict(list)  # guild_id -> [{user_id, name, left_at, roles}]
 _LEAVE_LOG_MAX = 50
 
-# ─── Voice session tracking (start times + cumulative per user) ───────────────
-_voice_session_start: dict[tuple[int,int], float] = {}  # (uid, gid) -> monotonic join time (same as _voice_join_times)
-
 # ─── Presence cache (last seen status per user) ───────────────────────────────
 _last_seen: dict[int, float] = {}           # uid -> UTC timestamp of last message/activity
 _user_status: dict[int, str] = {}           # uid -> "online"|"idle"|"dnd"|"offline"
 
-# ─── Message rate cache (messages per hour per user, for activity tracking) ───
+# ─── Message rate cache (timestamps of recent messages per user) ──────────────
 _msg_rate: dict[int, collections.deque] = collections.defaultdict(lambda: collections.deque(maxlen=500))
-# uid -> deque of UTC timestamps of recent messages
 
 
 # ─── Config cache — see get_config() above ───────────────────────────────────
@@ -1355,9 +1351,14 @@ def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
 
     ticket_panel = config.get("ticket_panel_channel_id")
     ticket_roles = config.get("ticket_staff_role_ids", [])
+    log_any      = any(config.get(k) for k in (
+        "message_log_channel_id", "automod_log_channel_id", "mod_log_channel_id",
+        "entry_log_channel_id", "bot_log_channel_id", "log_channel_id",
+    ))
+    welcome_ch   = config.get("welcome_channel_id")
     essentials_done = sum([bool(ticket_panel), bool(ticket_roles), log_any, bool(welcome_ch)])
     e.description = (
-        f"**{essentials_done}/5 essentials configured** \u2014 click a section below to set it up.\n"
+        f"**{essentials_done}/4 essentials configured** \u2014 click a section below to set it up.\n"
         "New here? Start with **\U0001f3ab Tickets** then **\U0001f4cb Logs** then **\U0001f916 AI**.\n\u200b"
     )
 
@@ -1381,13 +1382,6 @@ def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
             f"\u2696\ufe0f {ch('mod_log_channel_id')}\n"
             f"\U0001f6aa {ch('entry_log_channel_id')}\n"
             f"\U0001f916 {ch('bot_log_channel_id')}"
-        ),
-        inline=True,
-    )
-
-    e.add_field(
-        name=ai_label,
-        value=(
         ),
         inline=True,
     )
@@ -5096,7 +5090,24 @@ async def cmd_level(ctx: commands.Context, target: discord.Member = None):
     if buf:
         await ctx.send(file=discord.File(fp=buf, filename="rank.png"))
     else:
-        await ctx.send(embed=err("Rank card unavailable — Pillow not installed on this host."))
+        total_xp = data.get("total_xp", 0)
+        level, xp_in, xp_need = calculate_level(total_xp)
+        role_name = get_role_for_level(level) or "Unranked"
+        bar = progress_bar(xp_in, xp_need)
+        streak = data.get("streak", 0)
+        msgs   = data.get("messages", 0)
+        e = make_embed(C_PRIMARY)
+        e.title = f"⬆️ {target.display_name}'s Level"
+        e.set_thumbnail(url=target.display_avatar.url)
+        e.add_field(name="Level",    value=str(level),       inline=True)
+        e.add_field(name="XP",       value=f"{total_xp:,}",  inline=True)
+        e.add_field(name="Role",     value=role_name,         inline=True)
+        e.add_field(name="Progress", value=f"`{bar}` {xp_in:,}/{xp_need:,}", inline=False)
+        e.add_field(name="Messages", value=f"{msgs:,}",       inline=True)
+        if streak > 0:
+            e.add_field(name="Streak", value=f"🔥 {streak}d",  inline=True)
+        e.set_footer(text="LXTE's AI")
+        await ctx.send(embed=e)
 
 
 @bot.command(name="leaderboard", aliases=["lb"])
@@ -5378,8 +5389,22 @@ async def cmd_warn(ctx: commands.Context, member: discord.Member = None, *, reas
     await ctx.send(embed=e)
 
     try:
-        dm = make_embed(C_WARNING, f"You were warned in **{ctx.guild.name}**.\nReason: {reason}\nTotal warns: {warn_count}")
+        remaining = max(0, WARN_TIMEOUT_THRESHOLD - warn_count)
+        if warn_count >= WARN_TIMEOUT_THRESHOLD:
+            consequence = f"⏱️ You have been **auto-timed out** for **{WARN_TIMEOUT_MINUTES} minutes**."
+        elif remaining == 1:
+            consequence = f"⚠️ **One more warn** will result in a **{WARN_TIMEOUT_MINUTES}-minute timeout**."
+        else:
+            consequence = f"You are **{remaining} warn(s)** away from an auto-timeout."
+        dm = make_embed(C_WARNING,
+            f"You received a warning in **{ctx.guild.name}**.\n\n"
+            f"**Reason:** {reason}\n"
+            f"**Warned by:** {ctx.author.display_name}\n"
+            f"**Total warns:** {warn_count} / {WARN_TIMEOUT_THRESHOLD}\n\n"
+            f"{consequence}"
+        )
         dm.title = "⚠️ You've Been Warned"
+        dm.set_footer(text=f"Case #{case_num} • {ctx.guild.name}")
         await member.send(embed=dm)
     except Exception:
         pass
@@ -5520,15 +5545,15 @@ async def cmd_transcript(ctx: commands.Context):
 
 @bot.command(name="about", aliases=["info"])
 async def cmd_about(ctx: commands.Context):
-    e = make_embed(C_AI)
-    e.title       = "LXTE's AI v24"
+    e = make_embed(C_PRIMARY)
+    e.title       = "LXTE's Bot v28"
     e.description = "Built by AJ. Smart AI with real-time web search, leveling, giveaways, tickets, multi-select setup, reaction roles, automod, anti-raid, boost tracking, invite tracking, analytics."
     e.set_thumbnail(url=bot.user.display_avatar.url if bot.user else None)
     e.add_field(name="Prefix",   value="`.`",                  inline=True)
     e.add_field(name="Memory",   value="Per channel, 14 days", inline=True)
     e.add_field(name="Cooldown", value="5s",                   inline=True)
     e.add_field(name="Real-time", value="🌐 Web search · ☁️ Weather · 💹 Crypto · 🎮 Roblox", inline=False)
-    e.set_footer(text=f"{len(bot.guilds)} server(s)  •  Built by AJ  •  v26")
+    e.set_footer(text=f"{len(bot.guilds)} server(s)  •  Built by AJ  •  v28")
     await ctx.send(embed=e)
 
 
@@ -5666,9 +5691,6 @@ async def cmd_doublexp(ctx: commands.Context, duration: str = ""):
     e = make_embed(C_GOLD, f"All members earn **2× XP** for the next **{' '.join(parts)}**! 🚀")
     e.title = "⚡ Double XP Event Started!"
     await ctx.send(embed=e)
-
-
-# ─── Owner filter toggle ──────────────────────────────────────────────────────
 
 
 # ─── Admin commands ───────────────────────────────────────────────────────────
@@ -6066,9 +6088,6 @@ async def cmd_history(ctx: commands.Context, member: discord.Member = None):
 #  NEW COMMANDS — v26
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ─── Bot Customization (owner only) ──────────────────────────────────────────
-
-
 # ─── Channel Management ───────────────────────────────────────────────────────
 
 @bot.command(name="lock", aliases=["lc"])
@@ -6166,10 +6185,17 @@ class EmbedBuilderModal(discord.ui.Modal, title="Create Embed"):
         except Exception as exc:
             await i.response.send_message(embed=err(f"Failed: `{exc}`"), ephemeral=True)
 
-    class EmbedTrigger(discord.ui.View):
-        def __init__(self): super().__init__(timeout=60)
-        @discord.ui.button(label="📝 Open Builder", style=discord.ButtonStyle.primary)
-        async def open_modal(self, i: discord.Interaction, b): await i.response.send_modal(EmbedBuilderModal())
+
+class EmbedTrigger(discord.ui.View):
+    def __init__(self): super().__init__(timeout=60)
+    @discord.ui.button(label="📝 Open Builder", style=discord.ButtonStyle.primary)
+    async def open_modal(self, i: discord.Interaction, b): await i.response.send_modal(EmbedBuilderModal())
+
+
+@bot.command(name="embed", aliases=["embedbuilder"])
+@commands.has_permissions(manage_messages=True)
+async def cmd_embed(ctx: commands.Context):
+    """Open the embed builder. Requires Manage Messages. Usage: .embed"""
     await ctx.send("Click to open the embed builder:", view=EmbedTrigger(), delete_after=60)
 
 @bot.command(name="resetinvites", aliases=["rinv"])
@@ -6488,16 +6514,6 @@ async def cmd_cleanup(ctx: commands.Context, target: discord.Member = None, amou
         f"**Channel:** {ctx.channel.mention}\n"
         f"**By:** {ctx.author.mention}", C_WARNING)
 
-
-# ─── Unban All ────────────────────────────────────────────────────────────────
-
-
-# ─── Server Audit ─────────────────────────────────────────────────────────────
-
-_AUDIT_DANGEROUS_PERMS = (
-    "administrator", "ban_members", "kick_members", "manage_guild",
-    "manage_roles", "manage_channels", "manage_webhooks", "mention_everyone",
-)
 
 class TicketRatingView(discord.ui.View):
     def __init__(self, guild_id: int, ticket_id: int, closer_id: int):
