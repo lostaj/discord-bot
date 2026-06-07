@@ -7626,7 +7626,7 @@ async def cmd_clearwarns(ctx: commands.Context, member: discord.Member = None):
 
 # ─── Daily XP (v23) ───────────────────────────────────────────────────────────
 
-@bot.command(name="daily", aliases=["claim", "reward"])
+@bot.command(name="daily", aliases=["reward"])
 async def cmd_daily(ctx: commands.Context):
     """Claim your daily XP bonus once every 24 hours."""
     if not ctx.guild:
