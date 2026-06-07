@@ -65,6 +65,20 @@ BOOST_XP_REWARD   = 200
 _xp_cooldowns:     dict[int, float] = {}
 _voice_join_times: dict[tuple[int, int], float] = {}
 
+# ─── Roblox Version Tracker ───────────────────────────────────────────────────
+ROBLOX_VERSION_URL = "https://clientsettingscdn.roblox.com/v2/client-version/{channel}"
+ROBLOX_CHANNELS    = [
+    "WindowsPlayer", "WindowsStudio", "WindowsStudio64",
+    "MacPlayer",     "MacStudio",
+]
+_PLATFORM_LABELS = {
+    "WindowsPlayer":    "🪟 Windows Player",
+    "WindowsStudio":    "🪟 Windows Studio (32-bit)",
+    "WindowsStudio64":  "🪟 Windows Studio (64-bit)",
+    "MacPlayer":        "🍎 Mac Player",
+    "MacStudio":        "🍎 Mac Studio",
+}
+
 # ─── Tickets ──────────────────────────────────────────────────────────────────
 TICKET_AUTOCLOSE_HOURS = 48
 
