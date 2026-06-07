@@ -1577,18 +1577,21 @@ class WelcomeSetupView(discord.ui.View):
     def __init__(self, owner_id: int, guild_id: int):
         super().__init__(timeout=180)
         self.guild_id = guild_id
-        self.add_item(SingleChannelSelect("welcome_channel_id", guild_id, self, "Pick welcome channel…"))
+        self.add_item(SingleChannelSelect("welcome_channel_id",      guild_id, self, "1️⃣ Pick welcome channel (join messages)…"))
+        self.add_item(SingleChannelSelect("leave_channel_id",        guild_id, self, "2️⃣ Pick leave channel (goodbye messages)…"))
+        self.add_item(SingleChannelSelect("member_count_channel_id", guild_id, self, "3️⃣ Pick member count voice channel…"))
 
     async def refresh(self, interaction): pass
 
-    @discord.ui.button(label="Toggle DM Welcome", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Toggle DM Welcome (on/off)", style=discord.ButtonStyle.secondary, row=3)
     async def btn_dm(self, i: discord.Interaction, b):
         config = await get_config(self.guild_id)
         await bot.db.update_config(self.guild_id, "welcome_dm_enabled", not config.get("welcome_dm_enabled", False))
         config = await get_config(self.guild_id)
-        await i.response.edit_message(embed=make_embed(C_SUCCESS, f"DM welcome: {'✅' if config.get('welcome_dm_enabled') else '❌'}"), view=self)
+        state = "✅ ON — new members will receive a DM when they join" if config.get("welcome_dm_enabled") else "❌ OFF — no DM sent"
+        await i.response.send_message(embed=make_embed(C_SUCCESS, f"DM Welcome is now: {state}"), ephemeral=True)
 
-    @discord.ui.button(label="Set Custom Message", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="✏️ Customise Welcome Message", style=discord.ButtonStyle.primary, row=3)
     async def btn_msg(self, i: discord.Interaction, b):
         await i.response.send_modal(WelcomeMsgModal(self.guild_id))
 
@@ -2862,8 +2865,28 @@ async def _create_ticket(i: discord.Interaction, cid: str, answers: dict):
     guild  = i.guild
     user   = i.user
     config = await get_config(guild.id)
+
+    # ── Auto-close orphaned tickets whose channel was manually deleted ─────────
+    # Prevents users being permanently stuck with "you already have an open ticket"
     if await bot.db.count_open_tickets(guild.id, user.id) >= 1:
-        await i.response.send_message(embed=err("You already have an open ticket. Close it first."), ephemeral=True); return
+        open_tickets = await bot.db.tickets.find(
+            {"guild_id": guild.id, "user_id": user.id, "closed": False}
+        ).to_list(length=10)
+        for ot in open_tickets:
+            ch_id = ot.get("channel_id")
+            if ch_id and not guild.get_channel(ch_id):
+                await bot.db.close_ticket(ch_id)
+                logger.info("Auto-closed orphaned ticket %s for user %s (channel deleted)", ch_id, user.id)
+
+    # Re-check after cleanup
+    if await bot.db.count_open_tickets(guild.id, user.id) >= 1:
+        ot = await bot.db.tickets.find_one({"guild_id": guild.id, "user_id": user.id, "closed": False})
+        ch_ref = f" Your current ticket is here: <#{ot['channel_id']}>" if ot else ""
+        await i.response.send_message(
+            embed=err(f"You already have an open ticket.{ch_ref} Close it before opening a new one."),
+            ephemeral=True,
+        )
+        return
     ticket_num = config.get("ticket_counter", 0) + 1
     await bot.db.update_config(guild.id, "ticket_counter", ticket_num)
     cat_id   = config.get("ticket_category_id")
@@ -2959,8 +2982,19 @@ class TicketOpenView(discord.ui.View):
 
     @discord.ui.button(label="🎫 Open a Ticket", style=discord.ButtonStyle.primary, custom_id="ticket:open")
     async def btn_open(self, i: discord.Interaction, b):
+        # Auto-close orphaned tickets if their channel was manually deleted
         if await bot.db.count_open_tickets(i.guild.id, i.user.id) >= 1:
-            await i.response.send_message(embed=err("You already have an open ticket."), ephemeral=True); return
+            open_tickets = await bot.db.tickets.find(
+                {"guild_id": i.guild.id, "user_id": i.user.id, "closed": False}
+            ).to_list(length=10)
+            for ot in open_tickets:
+                ch_id = ot.get("channel_id")
+                if ch_id and not i.guild.get_channel(ch_id):
+                    await bot.db.close_ticket(ch_id)
+        if await bot.db.count_open_tickets(i.guild.id, i.user.id) >= 1:
+            ot = await bot.db.tickets.find_one({"guild_id": i.guild.id, "user_id": i.user.id, "closed": False})
+            ch_ref = f" Your ticket: <#{ot['channel_id']}>" if ot else ""
+            await i.response.send_message(embed=err(f"You already have an open ticket.{ch_ref}"), ephemeral=True); return
         await i.response.send_message(embed=make_embed(C_PRIMARY, "Select a category:"), view=TicketCategorySelect(), ephemeral=True)
 
 
@@ -3145,43 +3179,21 @@ class RoleMenuView(discord.ui.View):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def update_member_count(guild: discord.Guild):
-    ch = guild.get_channel(MEMBER_COUNT_CHANNEL_ID)
+    # Try config first, fall back to hardcoded MEMBER_COUNT_CHANNEL_ID
+    config = await get_config(guild.id)
+    ch_id  = config.get("member_count_channel_id") or MEMBER_COUNT_CHANNEL_ID
+    ch = guild.get_channel(ch_id)
     if not ch: return
-    name = MEMBER_COUNT_FORMAT.format(count=guild.member_count)
+    fmt  = config.get("member_count_format") or MEMBER_COUNT_FORMAT
+    name = fmt.format(count=guild.member_count)
     if ch.name != name:
         try: await ch.edit(name=name, reason="Member count update")
         except Exception as e: logger.warning("Member count: %s", e)
 
-WELCOME_CHANNEL_ID = 1507918341551952026  # #general — always send here regardless of config
-
 async def send_welcome(member: discord.Member, config: dict):
-    # ── Hardcoded general channel: ghost ping then short welcome embed ─────────
-    general_ch = member.guild.get_channel(WELCOME_CHANNEL_ID)
-    if general_ch:
-        try:
-            # Ghost ping — send then immediately delete so they get the notification
-            ping_msg = await general_ch.send(member.mention)
-            await ping_msg.delete()
-        except Exception: pass
-        try:
-            count = member.guild.member_count
-            e = discord.Embed(
-                description=(
-                    f"**{member.display_name}** just joined 🎉\n"
-                    f"You're member **#{count}** — welcome to LXTE! 🌸\n"
-                    f"Check out <#1509420949194145803> and have fun."
-                ),
-                color=C_PRIMARY,
-                timestamp=datetime.now(timezone.utc),
-            )
-            e.set_thumbnail(url=member.display_avatar.url)
-            await general_ch.send(embed=e)
-        except Exception as exc:
-            logger.warning("Welcome (general): %s", exc)
-
-    # ── Configurable welcome channel (set via .setup) ──────────────────────────
+    # ── Welcome channel — set via .setup > Welcome Messages ────────────────────
     ch_id = config.get("welcome_channel_id")
-    if ch_id and ch_id != WELCOME_CHANNEL_ID:
+    if ch_id:
         ch = member.guild.get_channel(ch_id)
         if ch:
             title = config.get("welcome_title", WELCOME_TITLE)
@@ -3190,13 +3202,14 @@ async def send_welcome(member: discord.Member, config: dict):
             )
             e = discord.Embed(title=title, description=msg, color=C_PRIMARY, timestamp=datetime.now(timezone.utc))
             if member.guild.icon: e.set_thumbnail(url=member.guild.icon.url)
-            e.set_footer(text=f"Member #{member.guild.member_count}  •  LXTE's AI")
+            e.set_footer(text=f"Member #{member.guild.member_count}  •  LXTE's Bot")
             try: await ch.send(content=member.mention, embed=e)
             except Exception as exc: logger.warning("Welcome: %s", exc)
 
     if config.get("welcome_dm_enabled"):
         try: await member.send(f"Welcome to **{member.guild.name}**! Check out the rules and enjoy your stay.")
         except Exception: pass
+
 
 # ─── Staff bypass helper ─────────────────────────────────────────────────────
 
@@ -4387,9 +4400,23 @@ class LXTEBot(commands.Bot):
             usage_line = next((l.strip() for l in doc.splitlines() if "usage:" in l.lower()), None)
             hint = f"\n{usage_line}" if usage_line else f"\nUsage: `.{ctx.command.name} <{error.param.name}>`"
             await ctx.send(embed=err(f"Missing required argument: **{error.param.name}**.{hint}"))
+        elif isinstance(error, commands.BotMissingPermissions):
+            perms = ", ".join(error.missing_permissions)
+            await ctx.send(embed=err(f"I\'m missing permissions to do that: `{perms}`\nPlease check my role has the right permissions."))
+        elif isinstance(error, commands.CheckFailure):
+            await ctx.send(embed=err("You don\'t have permission to use that command."))
+        elif isinstance(error, commands.BadArgument):
+            doc   = (ctx.command.help or ctx.command.brief or "")
+            usage_line = next((l.strip() for l in doc.splitlines() if "usage:" in l.lower()), None)
+            hint = f"\n{usage_line}" if usage_line else f"\nUsage: `.{ctx.command.name}`"
+            await ctx.send(embed=err(f"Invalid argument — double-check what you typed.{hint}"))
+        elif isinstance(error, commands.NoPrivateMessage):
+            await ctx.send(embed=err("This command can only be used in a server."))
         else:
-            await ctx.send(embed=err(f"Something went wrong:\n```{str(error)[:400]}```"))
-            logger.error("Unhandled: %s", error, exc_info=error)
+            # Unwrap the original error if it's wrapped in CommandInvokeError
+            original = getattr(error, "original", error)
+            await ctx.send(embed=err(f"Something went wrong:\n```{str(original)[:400]}```"))
+            logger.error("Unhandled command error in %s: %s", ctx.command, original, exc_info=original)
 
     # ── Background tasks ──────────────────────────────────────────────────────
 
@@ -4442,7 +4469,10 @@ class LXTEBot(commands.Bot):
             guild = self.get_guild(ticket.get("guild_id"))
             if not guild: continue
             ch = guild.get_channel(ch_id)
-            if not ch: continue
+            if not ch:
+                # Channel was manually deleted — mark ticket closed so user can open a new one
+                await self.db.close_ticket(ch_id)
+                continue
             config   = await get_config(guild.id)
             auto_h   = config.get("ticket_autoclose_hours", TICKET_AUTOCLOSE_HOURS)
             raw_last = ticket.get("last_activity") or ticket.get("opened_at")
@@ -5498,8 +5528,19 @@ async def cmd_setup(ctx: commands.Context):
 @commands.cooldown(rate=1, per=10, type=commands.BucketType.user)
 async def cmd_ticket(ctx: commands.Context):
     """Open a ticket from a text command (same as clicking the panel button)."""
+    # Auto-close orphaned tickets if their channel was manually deleted
     if await bot.db.count_open_tickets(ctx.guild.id, ctx.author.id) >= 1:
-        await ctx.send(embed=err("You already have an open ticket. Close it first.")); return
+        open_tickets = await bot.db.tickets.find(
+            {"guild_id": ctx.guild.id, "user_id": ctx.author.id, "closed": False}
+        ).to_list(length=10)
+        for ot in open_tickets:
+            ch_id = ot.get("channel_id")
+            if ch_id and not ctx.guild.get_channel(ch_id):
+                await bot.db.close_ticket(ch_id)
+    if await bot.db.count_open_tickets(ctx.guild.id, ctx.author.id) >= 1:
+        ot = await bot.db.tickets.find_one({"guild_id": ctx.guild.id, "user_id": ctx.author.id, "closed": False})
+        ch_ref = f" Your ticket: <#{ot['channel_id']}>" if ot else ""
+        await ctx.send(embed=err(f"You already have an open ticket.{ch_ref} Close it first.")); return
     view = TicketCategorySelect()
     await ctx.send(embed=make_embed(C_PRIMARY, "Select a category:"), view=view, delete_after=60)
 
