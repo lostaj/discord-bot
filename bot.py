@@ -35,7 +35,7 @@ v24.0.0 — Changes from v23:
   - FIXED: ask() and ask_stream() had diverged system prompts — now single source of truth.
 """
 
-import io, os, re, json, math, time, asyncio, logging, signal, collections, random, functools
+import io, os, re, json, math, time, asyncio, logging, signal, collections, random
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from urllib.parse import quote
@@ -310,7 +310,6 @@ _LEAVE_LOG_MAX = 50
 
 # ─── Voice session tracking (start times + cumulative per user) ───────────────
 _voice_session_start: dict[tuple[int,int], float] = {}  # (uid, gid) -> monotonic join time (same as _voice_join_times)
-_voice_total_mins: dict[tuple[int,int], int] = {}       # (uid, gid) -> total minutes in voice this session
 
 # ─── Presence cache (last seen status per user) ───────────────────────────────
 _last_seen: dict[int, float] = {}           # uid -> UTC timestamp of last message/activity
@@ -5955,76 +5954,6 @@ class LXTEBot(commands.Bot):
             if diff_lines:
                 await _slog("🌐 Server Updated", "\n".join(diff_lines) + f"\n**By:** {exec_str}", C_INFO)
 
-        elif action == discord.AuditLogAction.emoji_create:
-            await _slog("😄 Emoji Added", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_SUCCESS)
-
-        elif action == discord.AuditLogAction.emoji_delete:
-            await _slog("🗑️ Emoji Deleted", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_WARNING)
-
-        elif action == discord.AuditLogAction.emoji_update:
-            await _slog("✏️ Emoji Updated", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_INFO)
-
-        elif action == discord.AuditLogAction.sticker_create:
-            await _slog("🎟️ Sticker Added", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_SUCCESS)
-
-        elif action == discord.AuditLogAction.sticker_delete:
-            await _slog("🗑️ Sticker Deleted", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_WARNING)
-
-        elif action == discord.AuditLogAction.invite_create:
-            code = getattr(target, "code", "?") if target else "?"
-            ch_inv = getattr(target, "channel", None)
-            ch_str = ch_inv.mention if ch_inv else "?"
-            uses   = getattr(target, "max_uses", "∞")
-            await _slog("🔗 Invite Created",
-                f"**Code:** `{code}` → {ch_str}\n**Max uses:** {uses}\n**By:** {exec_str}", C_INFO)
-
-        elif action == discord.AuditLogAction.invite_delete:
-            code = getattr(target, "code", "?") if target else "?"
-            await _slog("🗑️ Invite Deleted", f"**Code:** `{code}`\n**By:** {exec_str}", C_WARNING)
-
-        elif action == discord.AuditLogAction.webhook_create:
-            wname = getattr(target, "name", "?") if target else "?"
-            await _slog("🪝 Webhook Created", f"**{wname}**\n**By:** {exec_str}", C_INFO)
-
-        elif action == discord.AuditLogAction.webhook_delete:
-            wname = getattr(target, "name", "?") if target else "?"
-            await _slog("🗑️ Webhook Deleted", f"**{wname}**\n**By:** {exec_str}", C_WARNING)
-
-        elif action == discord.AuditLogAction.webhook_update:
-            wname = getattr(target, "name", "?") if target else "?"
-            await _slog("✏️ Webhook Updated", f"**{wname}**\n**By:** {exec_str}", C_INFO)
-
-        elif action == discord.AuditLogAction.integration_create:
-            await _slog("🔌 Integration Added", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_INFO)
-
-        elif action == discord.AuditLogAction.integration_delete:
-            await _slog("🔌 Integration Removed", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_WARNING)
-
-        elif action == discord.AuditLogAction.overwrite_create:
-            ch_name = getattr(target, "name", "?") if target else "?"
-            await _slog("🔒 Permission Override Added", f"**#{ch_name}**\n**By:** {exec_str}", C_INFO)
-
-        elif action == discord.AuditLogAction.overwrite_delete:
-            ch_name = getattr(target, "name", "?") if target else "?"
-            await _slog("🔓 Permission Override Removed", f"**#{ch_name}**\n**By:** {exec_str}", C_INFO)
-
-        elif action == discord.AuditLogAction.thread_create:
-            await _slog("🧵 Thread Created", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_SUCCESS)
-
-        elif action == discord.AuditLogAction.thread_delete:
-            await _slog("🗑️ Thread Deleted", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_WARNING)
-
-        elif action == discord.AuditLogAction.stage_instance_create:
-            await _slog("🎙️ Stage Started", f"**By:** {exec_str}", C_SUCCESS)
-
-        elif action == discord.AuditLogAction.stage_instance_delete:
-            await _slog("🎙️ Stage Ended", f"**By:** {exec_str}", C_WARNING)
-
-        elif action == discord.AuditLogAction.scheduled_event_create:
-            await _slog("📅 Event Created", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_SUCCESS)
-
-        elif action == discord.AuditLogAction.scheduled_event_delete:
-            await _slog("🗑️ Event Deleted", f"**{getattr(target, 'name', '?')}**\n**By:** {exec_str}", C_WARNING)
 
     async def on_member_remove(self, member: discord.Member):
         if member.bot: return
@@ -8013,181 +7942,10 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
             _join_timestamps[guild.id].clear()
         await ctx.send(embed=ok("All servers unlocked."))
 
-    elif action == "backup":
-        if not ctx.guild: return
-        config = await bot.db.get_config(ctx.guild.id)
-        menus  = await bot.db.get_all_role_menus(ctx.guild.id)
-        def _default(obj):
-            if isinstance(obj, datetime): return obj.isoformat()
-            if _BSON_AVAILABLE and isinstance(obj, _BsonObjectId): return str(obj)
-            return str(obj)
-        backup = {
-            "guild_id": ctx.guild.id, "guild_name": ctx.guild.name,
-            "exported_at": datetime.now(timezone.utc).isoformat(),
-            "config": {k: v for k, v in config.items() if k != "_id"},
-            "role_menus": [{k: v for k, v in m.items() if k != "_id"} for m in menus],
-        }
-        data = json.dumps(backup, indent=2, default=_default)
-        await ctx.send(embed=ok("Backup created."), file=discord.File(fp=io.BytesIO(data.encode()), filename=f"lxte_backup_{ctx.guild.id}.json"))
-
-    elif action == "restore":
-        if not ctx.message.attachments: await ctx.send(embed=err("Attach a backup JSON file.")); return
-        try:
-            backup = json.loads(await ctx.message.attachments[0].read())
-            config = {k: v for k, v in backup.get("config", {}).items() if k not in ("_id", "guild_id")}
-            for key, value in config.items(): await bot.db.update_config(ctx.guild.id, key, value)
-            await ctx.send(embed=ok(f"Config restored. ({len(config)} keys)"))
-        except Exception as exc: await ctx.send(embed=err(str(exc)[:300]))
-
-    elif action == "snapshot":
-        await ctx.send(embed=make_embed(C_INFO, "⏳ Building full snapshot, this may take a moment…"))
-
-        def _default(obj):
-            if isinstance(obj, datetime): return obj.isoformat()
-            if _BSON_AVAILABLE and isinstance(obj, _BsonObjectId): return str(obj)
-            return str(obj)
-
-        def _strip(doc: dict) -> dict:
-            return {k: v for k, v in doc.items() if k != "_id"}
-
-        now_utc  = datetime.now(timezone.utc)
-        now_mono = time.monotonic()
-
-        # ── Bot health ────────────────────────────────────────────────────────
-        proc = psutil.Process()
-        mem_mb = round(proc.memory_info().rss / 1_048_576, 1)
-        rotator = bot.ai._r
-        key_statuses = []
-        for i in range(rotator.count):
-            if rotator._dead[i]:
-                key_statuses.append({"key": i + 1, "status": "dead"})
-            elif rotator._avail_at[i] > now_mono:
-                key_statuses.append({"key": i + 1, "status": "cooldown",
-                                     "remaining_s": round(rotator._avail_at[i] - now_mono)})
-            else:
-                key_statuses.append({"key": i + 1, "status": "ready"})
-
-        health = {
-            "discord_latency_ms": round(bot.latency * 1000),
-            "uptime":             format_uptime(bot.start_time),
-            "ram_mb":             mem_mb,
-            "pillow":             PILLOW_AVAILABLE,
-            "mongodb":            await bot.db.ping(),
-            "guild_count":        len(bot.guilds),
-            "api_keys":           key_statuses,
-        }
-
-        # ── Per-guild data ────────────────────────────────────────────────────
-        guilds_data = []
-        for guild in bot.guilds:
-            # Record member count (existing behaviour)
-            await bot.db.record_member_count(guild.id, guild.member_count)
-
-            # Config & role menus & reaction roles
-            config       = _strip(await bot.db.get_config(guild.id))
-            role_menus   = [_strip(m) for m in await bot.db.get_all_role_menus(guild.id)]
-            react_roles  = [_strip(r) for r in await bot.db.get_all_reaction_roles(guild.id)]
-
-            # XP / levels (all members in this guild)
-            xp_data      = [_strip(d) for d in await bot.db.get_all_level_data(guild.id)]
-
-            # Warns (all members in this guild)
-            warns        = [_strip(w) for w in await bot.db.get_all_warns(guild.id)]
-
-            # Active giveaways
-            giveaways    = [_strip(g) for g in await bot.db.get_active_giveaways(guild.id)]
-
-            # Member count history (last 30 days)
-            mc_history   = [_strip(e) for e in await bot.db.get_member_count_history(guild.id, 30)]
-
-            # Channel & role structure (live from Discord)
-            channels = [
-                {"id": c.id, "name": c.name, "type": str(c.type),
-                 "category": c.category.name if c.category else None,
-                 "position": c.position}
-                for c in guild.channels
-            ]
-            roles = [
-                {"id": r.id, "name": r.name, "colour": str(r.colour),
-                 "hoist": r.hoist, "mentionable": r.mentionable,
-                 "permissions": r.permissions.value, "position": r.position}
-                for r in guild.roles
-            ]
-
-            # Moderation: bans
-            bans = []
-            try:
-                async for ban_entry in guild.bans():
-                    bans.append({"user_id": ban_entry.user.id,
-                                 "username": str(ban_entry.user),
-                                 "reason": ban_entry.reason})
-            except discord.Forbidden:
-                bans = ["[no permission to read bans]"]
-
-            guilds_data.append({
-                "guild_id":         guild.id,
-                "guild_name":       guild.name,
-                "member_count":     guild.member_count,
-                "config":           config,
-                "role_menus":       role_menus,
-                "reaction_roles":   react_roles,
-                "xp_data":          xp_data,
-                "warns":            warns,
-                "giveaways":        giveaways,
-                "member_count_history": mc_history,
-                "channels":         channels,
-                "roles":            roles,
-                "bans":             bans,
-            })
-
-        # ── AI conversation histories (all users, all channels) ───────────────
-        all_histories = [_strip(h) for h in await bot.db.get_all_histories()]
-
-        # ── Global usage stats ────────────────────────────────────────────────
-        global_stats = _strip(await bot.db.global_stats()) if hasattr(bot.db, "global_stats") else {}
-
-        # ── Assemble final document ───────────────────────────────────────────
-        snapshot = {
-            "snapshot_version": "v24",
-            "taken_at":         now_utc.isoformat(),
-            "health":           health,
-            "guilds":           guilds_data,
-            "ai_histories":     all_histories,
-            "global_stats":     global_stats,
-        }
-
-        # ── Save to MongoDB ───────────────────────────────────────────────────
-        await bot.db.save_snapshot(snapshot)
-
-        # ── Send as JSON file ─────────────────────────────────────────────────
-        snapshot_json = json.dumps(snapshot, indent=2, default=_default)
-        fname = f"lxte_snapshot_{now_utc.strftime('%Y%m%d_%H%M%S')}.json"
-        total_guilds  = len(guilds_data)
-        total_members = sum(g["member_count"] for g in guilds_data)
-        total_warns   = sum(len(g["warns"]) for g in guilds_data)
-        total_xp      = sum(len(g["xp_data"]) for g in guilds_data)
-        summary = (
-            f"**Snapshot saved to MongoDB** — `{fname}`\n"
-            f"Guilds: {total_guilds} · Members: {total_members:,} · "
-            f"XP records: {total_xp:,} · Warns: {total_warns:,} · "
-            f"AI histories: {len(all_histories):,}"
-        )
-        encoded = snapshot_json.encode()
-        if len(encoded) > 7_500_000:  # Discord 8MB limit safety margin
-            await ctx.send(embed=ok(
-                summary + f"\n\n⚠️ File too large to attach ({len(encoded)//1_048_576}MB). Saved to MongoDB only."
-            ))
-        else:
-            await ctx.send(
-                embed=ok(summary),
-                file=discord.File(fp=io.BytesIO(encoded), filename=fname),
-            )
-
     else:
         await ctx.send(embed=make_embed(C_INFO,
             "`status` `health` `keys` `synccount`\n"
-            "`snapshot` — full dump: members, XP, config, roles, channels, bans, warns, AI histories, health → MongoDB + JSON\n"
-            "`clearuser <id>` `resetxp <id>` `unlockraid` `backup` `restore`"
+            "`clearuser <id>` `resetxp <id>` `unlockraid`"
         ))
 
 
@@ -8533,46 +8291,6 @@ async def cmd_history(ctx: commands.Context, member: discord.Member = None):
 
 # ─── Bot Customization (owner only) ──────────────────────────────────────────
 
-@bot.command(name="setavatar", aliases=["avatar", "pfp"], hidden=True)
-async def cmd_setavatar(ctx: commands.Context, url: str = None):
-    if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
-    if not url: await ctx.send(embed=err("Usage: `.setavatar <image_url>`"), delete_after=8); return
-    try:
-        async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get(url); r.raise_for_status()
-        await bot.user.edit(avatar=r.content)
-        await ctx.send(embed=ok("✅ Avatar updated."))
-    except Exception as exc: await ctx.send(embed=err(f"Failed: `{exc}`"))
-
-@bot.command(name="setbanner", aliases=["banner"], hidden=True)
-async def cmd_setbanner(ctx: commands.Context, url: str = None):
-    if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
-    if not url: await ctx.send(embed=err("Usage: `.setbanner <image_url>`"), delete_after=8); return
-    try:
-        async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get(url); r.raise_for_status()
-        await bot.user.edit(banner=r.content)
-        await ctx.send(embed=ok("✅ Banner updated."))
-    except Exception as exc: await ctx.send(embed=err(f"Failed: `{exc}`"))
-
-@bot.command(name="setnick", aliases=["botnick"], hidden=True)
-async def cmd_setnick(ctx: commands.Context, *, nick: str = None):
-    if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
-    if not ctx.guild: return
-    try:
-        new = None if nick in (None, "clear", "reset") else nick[:32]
-        await ctx.guild.me.edit(nick=new)
-        await ctx.send(embed=ok(f"✅ Nickname {'cleared' if not new else f'set to `{new}`'}."))
-    except Exception as exc: await ctx.send(embed=err(f"Failed: `{exc}`"))
-
-@bot.command(name="setname", aliases=["botname"], hidden=True)
-async def cmd_setname(ctx: commands.Context, *, name: str = None):
-    if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
-    if not name: await ctx.send(embed=err("Usage: `.setname <username>`"), delete_after=8); return
-    try:
-        await bot.user.edit(username=name[:32])
-        await ctx.send(embed=ok(f"✅ Username set to `{name}`."))
-    except Exception as exc: await ctx.send(embed=err(f"Failed: `{exc}`"))
 
 
 # ─── Channel Management ───────────────────────────────────────────────────────
@@ -8723,36 +8441,6 @@ async def cmd_role(ctx: commands.Context, action: str = None, member: discord.Me
     except discord.Forbidden:
         await ctx.send(embed=err("Missing permissions to manage that role."))
 
-@bot.command(name="rolepersist", aliases=["rp"])
-async def cmd_rolepersist(ctx: commands.Context, action: str = None, member: discord.Member = None, *, role_name: str = None):
-    if not ctx.guild: return
-    config = await get_config(ctx.guild.id)
-    if not await _require_mod_or_fake(ctx, config, "senior", "manage_roles"): return
-    if action not in ("add", "remove", "list"):
-        await ctx.send(embed=err("Usage: `.rolepersist add @user Role` | `.rolepersist remove @user Role` | `.rolepersist list`")); return
-    if action == "list":
-        docs = await bot.db.db["role_persist"].find({"guild_id": ctx.guild.id}).to_list(50)
-        if not docs: await ctx.send(embed=make_embed(C_INFO, "No role persists configured.")); return
-        lines = []
-        for doc in docs:
-            m = ctx.guild.get_member(doc["user_id"]); r = ctx.guild.get_role(doc["role_id"])
-            uid_str = m.mention if m else f"`{doc['user_id']}`"
-            rid_str = r.mention if r else f"`{doc['role_id']}`"
-            lines.append(f"{uid_str} → {rid_str}")
-        e = make_embed(C_INFO, "\n".join(lines)); e.title = "🔒 Role Persists"
-        await ctx.send(embed=e); return
-    if not member or not role_name:
-        await ctx.send(embed=err("Usage: `.rolepersist add @user RoleName`")); return
-    role = discord.utils.find(lambda r: r.name.lower() == role_name.lower(), ctx.guild.roles)
-    if not role: await ctx.send(embed=err(f"Role `{role_name}` not found.")); return
-    if action == "add":
-        await bot.db.db["role_persist"].update_one(
-            {"guild_id": ctx.guild.id, "user_id": member.id, "role_id": role.id},
-            {"$set": {"guild_id": ctx.guild.id, "user_id": member.id, "role_id": role.id}}, upsert=True)
-        await ctx.send(embed=ok(f"✅ **{role.name}** will persist for {member.mention} on rejoin."))
-    else:
-        await bot.db.db["role_persist"].delete_one({"guild_id": ctx.guild.id, "user_id": member.id, "role_id": role.id})
-        await ctx.send(embed=ok(f"✅ Persist removed for {member.mention} / **{role.name}**."))
 
 
 # ─── Mod Stats / Warnings alias ──────────────────────────────────────────────
@@ -8781,23 +8469,6 @@ async def cmd_modstats(ctx: commands.Context, target: discord.Member = None):
         e.title = "📊 Mod Stats — All Staff"
     await ctx.send(embed=e)
 
-@bot.command(name="warnings", aliases=["warnlist"])
-async def cmd_warnings(ctx: commands.Context, member: discord.Member = None):
-    if not ctx.guild: return
-    config = await get_config(ctx.guild.id)
-    if not await _require_mod(ctx, config, "trial"): return
-    if not member: await ctx.send(embed=err("Usage: `.warnings @user`")); return
-    warns = await bot.db.get_user_cases(ctx.guild.id, member.id, 50)
-    warn_cases = [c for c in warns if c.get("action") in ("warn","warning")]
-    if not warn_cases: await ctx.send(embed=make_embed(C_SUCCESS, f"**{member.display_name}** has no warnings. ✅")); return
-    lines = []
-    for i, c in enumerate(warn_cases, 1):
-        created = c.get("created_at"); ts = f"<t:{int(created.timestamp())}:d>" if created else "?"
-        lines.append(f"**#{i}** {ts} — {(c.get('reason') or '?')[:80]}")
-    e = make_embed(C_WARNING, "\n".join(lines))
-    e.title = f"⚠️ Warnings — {member.display_name} ({len(warn_cases)} total)"
-    e.set_thumbnail(url=member.display_avatar.url)
-    await ctx.send(embed=e)
 
 
 # ─── Ticket Extras ────────────────────────────────────────────────────────────
@@ -8859,17 +8530,6 @@ async def cmd_priority(ctx: commands.Context):
 
 # ─── Utility ─────────────────────────────────────────────────────────────────
 
-@bot.command(name="shorten", aliases=["short", "url"])
-async def cmd_shorten(ctx: commands.Context, url: str = None):
-    if not url: await ctx.send(embed=err("Usage: `.shorten <url>`")); return
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get("https://is.gd/create.php", params={"format": "simple", "url": url})
-            r.raise_for_status(); short = r.text.strip()
-        e = make_embed(C_SUCCESS, f"**Original:** {url[:80]}{'…' if len(url)>80 else ''}\n**Short:** {short}")
-        e.title = "🔗 URL Shortened"
-        await ctx.send(embed=e)
-    except Exception as exc: await ctx.send(embed=err(f"Failed: `{exc}`"))
 
 
 class EmbedBuilderModal(discord.ui.Modal, title="Create Embed"):
@@ -8917,37 +8577,8 @@ async def cmd_say(ctx: commands.Context, channel: discord.TextChannel = None, *,
     _log_mod_action(ctx.guild, config, "💬 Bot Say",
         f"**By:** {ctx.author.mention}\n**Channel:** {ch.mention}\n**Content:** {text[:500]}", C_INFO)
 
-@bot.command(name="botdm", aliases=["senddm"], hidden=True)
-async def cmd_botdm(ctx: commands.Context, user: discord.User = None, *, message: str = None):
-    if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
-    if not user or not message: await ctx.send(embed=err("Usage: `.botdm @user <message>`"), delete_after=8); return
-    try:
-        e = make_embed(C_PRIMARY, message); e.title = "📩 Message from LXTE's AI"
-        await user.send(embed=e)
-        await ctx.send(embed=ok(f"✅ DM sent to **{user}**."))
-    except discord.Forbidden:
-        await ctx.send(embed=err(f"Can't DM **{user}** — DMs closed or they blocked the bot."))
 
 
-# ─── Invite Management ────────────────────────────────────────────────────────
-
-@bot.command(name="inviteinfo", aliases=["ii"])
-async def cmd_inviteinfo(ctx: commands.Context, code: str = None):
-    if not code: await ctx.send(embed=err("Usage: `.inviteinfo <code>`")); return
-    code = code.replace("https://discord.gg/", "").replace("discord.gg/", "").strip()
-    try:
-        invite = await bot.fetch_invite(code, with_counts=True)
-        e = make_embed(C_INFO); e.title = f"🔗 Invite — {code}"
-        e.add_field(name="Server",   value=invite.guild.name if invite.guild else "?",               inline=True)
-        e.add_field(name="Channel",  value=f"#{invite.channel.name}" if invite.channel else "?",     inline=True)
-        e.add_field(name="Members",  value=f"{invite.approximate_member_count:,}" if invite.approximate_member_count else "?", inline=True)
-        e.add_field(name="Online",   value=f"{invite.approximate_presence_count:,}" if invite.approximate_presence_count else "?", inline=True)
-        e.add_field(name="Inviter",  value=str(invite.inviter) if invite.inviter else "?",            inline=True)
-        e.add_field(name="Expires",  value=f"<t:{int(invite.expires_at.timestamp())}:R>" if invite.expires_at else "Never", inline=True)
-        if invite.guild and invite.guild.icon: e.set_thumbnail(url=invite.guild.icon.url)
-        await ctx.send(embed=e)
-    except discord.NotFound: await ctx.send(embed=err(f"Invite `{code}` not found or expired."))
-    except Exception as exc: await ctx.send(embed=err(f"Failed: `{exc}`"))
 
 @bot.command(name="resetinvites", aliases=["rinv"])
 async def cmd_resetinvites(ctx: commands.Context, member: discord.Member = None):
@@ -8989,70 +8620,9 @@ async def cmd_restart(ctx: commands.Context):
     await bot.close()
     _os.execv(sys.executable, [sys.executable] + sys.argv)
 
-@bot.command(name="guilds", aliases=["servers"], hidden=True)
-async def cmd_guilds(ctx: commands.Context):
-    if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
-    lines = [f"**{g.name}** — {g.member_count:,} members (`{g.id}`)"
-             for g in sorted(bot.guilds, key=lambda g: -(g.member_count or 0))]
-    e = make_embed(C_INFO, "\n".join(lines[:30])); e.title = f"🌐 Guilds ({len(bot.guilds)})"
-    await ctx.send(embed=e)
-
-@bot.command(name="blacklistserver", aliases=["bls"], hidden=True)
-async def cmd_blacklistserver(ctx: commands.Context, guild_id: int = None, *, reason: str = "No reason."):
-    if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
-    if not guild_id: await ctx.send(embed=err("Usage: `.blacklistserver <guild_id> [reason]`"), delete_after=8); return
-    await bot.db.db["blacklisted_guilds"].update_one(
-        {"guild_id": guild_id},
-        {"$set": {"guild_id": guild_id, "reason": reason, "at": datetime.now(timezone.utc)}}, upsert=True)
-    g = bot.get_guild(guild_id)
-    if g:
-        try:
-            sys_ch = g.system_channel or next((c for c in g.text_channels if c.permissions_for(g.me).send_messages), None)
-            if sys_ch: await sys_ch.send(embed=make_embed(C_ERROR, f"This server has been blacklisted. Reason: {reason}"))
-        except Exception: pass
-        await g.leave()
-    await ctx.send(embed=ok(f"✅ Guild `{guild_id}` blacklisted and left."))
-
-@bot.command(name="broadcast", aliases=["bc"], hidden=True)
-async def cmd_broadcast(ctx: commands.Context, *, message: str = None):
-    if ctx.author.id != bot.owner_id_int: await ctx.message.delete(); return
-    if not message: await ctx.send(embed=err("Usage: `.broadcast <message>`"), delete_after=8); return
-    sent, failed = 0, 0
-    for g in bot.guilds:
-        try:
-            cfg = await get_config(g.id)
-            lc_id = cfg.get("bot_log_channel_id") or cfg.get("log_channel_id")
-            ch = g.get_channel(lc_id) if lc_id else g.system_channel
-            if not ch: ch = next((c for c in g.text_channels if c.permissions_for(g.me).send_messages), None)
-            if ch:
-                e = make_embed(C_PRIMARY, message); e.title = "📢 Broadcast"
-                await ch.send(embed=e); sent += 1
-            else: failed += 1
-        except Exception: failed += 1
-    await ctx.send(embed=ok(f"✅ Sent to **{sent}** guilds. Failed: **{failed}**."))
-
-# ─── Slash: /level ────────────────────────────────────────────────────────────
-
-@bot.tree.command(name="level", description="View your rank card")
-async def slash_level(interaction: discord.Interaction, user: discord.User = None):
-    target = user or interaction.user
-    if not interaction.guild: await interaction.response.send_message("Server only.", ephemeral=True); return
-    await interaction.response.defer()
-    data   = await bot.db.get_level_data(target.id, interaction.guild.id)
-    member = interaction.guild.get_member(target.id)
-    if member:
-        buf = await generate_rank_card(member, data)
-        if buf:
-            await interaction.followup.send(file=discord.File(fp=buf, filename="rank.png")); return
-    await interaction.followup.send(embed=err("Rank card unavailable — Pillow not installed on this host."), ephemeral=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  NEW COMMANDS — tempban, report, cleanup, unbanall, serveraudit, ticket rating
-# ═══════════════════════════════════════════════════════════════════════════════
 
-
-# ─── Temp-Ban ─────────────────────────────────────────────────────────────────
 
 @bot.command(name="tempban", aliases=["tb"])
 async def cmd_tempban(ctx: commands.Context, member: discord.Member = None,
@@ -9311,60 +8881,6 @@ async def cmd_cleanup(ctx: commands.Context, target: discord.Member = None, amou
 
 # ─── Unban All ────────────────────────────────────────────────────────────────
 
-@bot.command(name="unbanall", aliases=["massunban"], hidden=True)
-async def cmd_unbanall(ctx: commands.Context):
-    """Mass-unban all banned users. Owner only. Requires reaction confirmation."""
-    if not ctx.guild: return
-    if ctx.author.id != bot.owner_id_int:
-        await ctx.message.delete(); return
-
-    try:
-        bans = [entry async for entry in ctx.guild.bans()]
-    except discord.Forbidden:
-        await ctx.send(embed=err("I don't have permission to view the ban list.")); return
-
-    if not bans:
-        await ctx.send(embed=make_embed(C_INFO, "No users are currently banned.")); return
-
-    conf_msg = await ctx.send(embed=make_embed(C_WARNING,
-        f"⚠️ This will unban **{len(bans)} users**.\n"
-        f"React ✅ to confirm or ❌ to cancel.\n"
-        f"*This cannot be undone.*"))
-    await conf_msg.add_reaction("✅")
-    await conf_msg.add_reaction("❌")
-
-    def check(r, u):
-        return u == ctx.author and str(r.emoji) in ("✅", "❌") and r.message.id == conf_msg.id
-
-    try:
-        reaction, _ = await bot.wait_for("reaction_add", timeout=30, check=check)
-    except asyncio.TimeoutError:
-        await conf_msg.edit(embed=make_embed(C_WARNING, "Unban all cancelled — timed out.")); return
-
-    if str(reaction.emoji) == "❌":
-        await conf_msg.edit(embed=make_embed(C_WARNING, "Unban all cancelled.")); return
-
-    progress = await ctx.send(embed=make_embed(C_INFO, f"⏳ Unbanning {len(bans)} users…"))
-    unbanned, failed = 0, 0
-    for entry in bans:
-        try:
-            await ctx.guild.unban(entry.user, reason=f"Mass unban by {ctx.author}")
-            unbanned += 1
-        except Exception:
-            failed += 1
-        if unbanned % 10 == 0:
-            try:
-                await progress.edit(embed=make_embed(C_INFO,
-                    f"⏳ Progress: {unbanned}/{len(bans)} unbanned…"))
-            except Exception: pass
-
-    e = ok(f"✅ Unbanned **{unbanned}** users. Failed: **{failed}**.")
-    e.title = "🔓 Mass Unban Complete"
-    await progress.edit(embed=e)
-
-    config = await get_config(ctx.guild.id)
-    _log_mod_action(ctx.guild, config, "🔓 Mass Unban",
-        f"**Unbanned:** {unbanned} | **Failed:** {failed}\n**By:** {ctx.author.mention}", C_SUCCESS)
 
 
 # ─── Server Audit ─────────────────────────────────────────────────────────────
