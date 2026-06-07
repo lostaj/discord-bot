@@ -1906,7 +1906,7 @@ async def auto_web_search(question: str) -> str:
 # Keep history well under the model's context window.
 # System prompt + context ≈ 5–18k chars; leave only 6k for history.
 # This is the single biggest fix for "all API keys exhausted" errors.
-_HISTORY_CHAR_BUDGET = 8_000   # raised from 6k — allows ~4 more turns before trimming
+_HISTORY_CHAR_BUDGET = 4_000   # kept tight to avoid 413 Payload Too Large
 
 def _trim_history(history: list[dict], budget: int = _HISTORY_CHAR_BUDGET) -> list[dict]:
     """
@@ -2270,7 +2270,7 @@ _CTX_TRIGGERS: dict[str, re.Pattern] = {
 # compound-beta context window is 128k tokens ≈ ~480k chars total.
 # System prompt ~4k + history ~8k + question ~1k = ~13k overhead.
 # Raise to 32k to use more of compound-beta's larger window.
-_CTX_CHAR_BUDGET = 32_000
+_CTX_CHAR_BUDGET = 12_000
 
 
 async def _build_server_sections(
@@ -4040,7 +4040,7 @@ FAKE_PERM_LABELS = {
     "moderate_members":  ".tempmute (.mute)  .unmute",
     "manage_messages":   ".purge  .warn  .warnings  .clearwarns",
     "manage_nicknames":  ".nick",
-    "manage_roles":      ".role add/remove  .rolepersist",
+    "manage_roles":      ".role add/remove",
     "invite_bypass":     "Post invite links without automod deletion",
 }
 
@@ -6504,7 +6504,6 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "**⚠️ Warn System**\n"
             "`.warn @user <reason>` — issue a warning  *(3 warns = 60 min auto-timeout)*\n"
             "`.warns @user` — view a user's warning history  *(also* `.warnlist`*)*\n"
-            "`.warnings @user` — alias for warns list\n"
             "`.clearwarns @user` — clear all warns *(Mod+)*\n\n"
             "**🔨 Bans & Kicks**\n"
             "`.kick @user [reason]` — kick a member *(Mod+)*\n"
@@ -6512,8 +6511,7 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.softban @user [reason]` — ban+unban to wipe recent messages *(Mod+)*\n"
             "`.massban <id1> <id2> …` — ban multiple users at once *(Senior+)*\n"
             "`.tempban @user <duration> [reason]` — timed ban, auto-unbans  *(also* `.tb`*) (Mod+)*\n"
-            "`.unban <user_id> [reason]` — unban a user *(Mod+)*\n"
-            "`.unbanall` — mass-unban everyone *(owner only, reaction confirm)*\n\n"
+            "`.unban <user_id> [reason]` — unban a user *(Mod+)*\n\n"
             "**🔇 Mutes**\n"
             "`.tempmute @user <duration> [reason]` — timeout with auto-lift  *(also* `.mute` */* `.tm`*)*\n"
             "`.unmute @user` — remove timeout early *(Mod+)*\n\n"
@@ -6624,10 +6622,9 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.msgcheck [@user]` — message count, rank, top channels  *(also* `.msgstats`*)*\n"
             "`.stats` — your personal AI question count  *(also* `.usage` */* `.me`*)*\n"
             "`.invites [@user]` — invite count and breakdown\n"
-            "`.inviteinfo <code>` — info about a specific invite  *(also* `.ii`*)*\n\n"
+            "\n"
             "**🛠️ Admin**\n"
-            "`.msgsync [limit]` — backfill message history for tracking  *(also* `.syncmessages`*)*\n"
-            "`.admin snapshot` — manual daily snapshot"
+            "`.msgsync [limit]` — backfill message history for tracking  *(also* `.syncmessages`*)*"
         )
         e.title = "📊 Analytics & Stats"
         e.set_footer(text=footer, icon_url=avatar)
@@ -6647,15 +6644,13 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "**📨 Invites**\n"
             "`.invites [@user]` — see how many people a user has invited\n"
             "`.invitelb` — server-wide invite leaderboard\n"
-            "`.inviteinfo <code>` — details about a specific invite link  *(also* `.ii`*)*\n"
             "`.resetinvites @user` — reset a user's invite count *(admin)*\n"
             "`.resetallinvites` — reset all invite data *(admin, confirmation required)*\n\n"
             "**🔧 Utility**\n"
             "`.ping` — check bot latency and uptime\n"
             "`.about` — bot info and feature list  *(also* `.info`*)*\n"
             "`.say <message>` — make the bot say something *(mod+)*\n"
-            "`.embed <title | body>` — post a custom embed *(mod+)*\n"
-            "`.shorten <url>` — shorten a URL"
+            "`.embed <title | body>` — post a custom embed *(mod+)*"
         )
         e.title = "💬 Social & Info"
         e.set_footer(text=footer, icon_url=avatar)
@@ -6667,10 +6662,6 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "**Manage Roles**\n"
             "`.role @user add <RoleName>` — give a role to a member *(Senior Mod+)*\n"
             "`.role @user remove <RoleName>` — remove a role from a member *(Senior Mod+)*\n\n"
-            "**Role Persist**\n"
-            "`.rolepersist add @user <RoleName>` — re-apply role if user leaves & rejoins *(Senior+)*\n"
-            "`.rolepersist remove @user <RoleName>` — stop persisting a role *(Senior+)*\n"
-            "`.rolepersist list` — view all persisted roles in this server\n\n"
             "**Role Menus**\n"
             "Configured via `.setup` → **🎭 Role Menus**\n"
             "Creates button-based self-assign menus in any channel.\n\n"
@@ -6694,7 +6685,7 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "**🔵 Senior Moderator**\n"
             "Warn · kick · ban · unban · mute up to 28d · unmute\n"
             "Purge up to 500 · slowmode (set & remove) · clear warns\n"
-            "Manage roles via `.role` and `.rolepersist`\n\n"
+            "Manage roles via `.role`\n\n"
             "**🟢 Moderator**\n"
             "Identical to Senior Mod.\n\n"
             "**🟡 Trial Moderator**\n"
@@ -6720,10 +6711,6 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.setup` — full interactive server config panel  *(also* `.config`*)*\n"
             "Covers: log channels, welcome, automod, staff roles, tickets, role menus,\n"
             "reaction roles, autoroles, AI settings, fake perms, giveaway channel.\n\n"
-            "**📦 Backup & Restore**\n"
-            "`.admin backup` — export full server config to JSON\n"
-            "`.admin restore` — import config from attached JSON\n"
-            "`.admin snapshot` — manually trigger daily analytics snapshot\n\n"
             "**🔧 User Management**\n"
             "`.admin clearuser <user_id>` — wipe a user's AI conversation history\n"
             "`.admin resetxp <user_id>` — reset a user's XP and level to zero\n\n"
@@ -6734,11 +6721,6 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "`.admin synccount` — force member count channel update\n"
             "`.admin unlockraid` — manually lift anti-raid lockdown\n\n"
             "**🌐 Owner-only**\n"
-            "`.guilds` — list every server the bot is in\n"
-            "`.broadcast <message>` — send a message to all servers\n"
-            "`.botdm @user <message>` — DM a user as the bot  *(also* `.senddm`*)*\n"
-            "`.blacklistserver <guild_id>` — blacklist & leave a server\n"
-            "`.setavatar` / `.setbanner` / `.setname` / `.setnick` — change bot appearance\n"
             "`.restart` — restart the bot process\n"
             "`.robloxnotify <#channel>` — set Roblox version update alert channel"
         )
@@ -6799,11 +6781,15 @@ class HelpView(discord.ui.View):
 
 
 @bot.command(name="help", aliases=["h"])
-async def cmd_help(ctx: commands.Context):
+async def cmd_help(ctx: commands.Context, category: str = "home"):
+    valid = {"home", "ai", "leveling", "mod", "cases", "tickets", "giveaways",
+             "analytics", "social", "roles", "staff", "admin"}
+    cat = category.lower().strip()
+    if cat not in valid:
+        cat = "home"
     view    = HelpView(ctx)
-    message = await ctx.send(embed=build_help_embed("home", ctx.bot.user), view=view)
+    message = await ctx.send(embed=build_help_embed(cat, ctx.bot.user), view=view)
     view._message = message
-
 
 @bot.command(name="ask", aliases=["ai", "q"])
 @commands.cooldown(rate=1, per=8, type=commands.BucketType.user)
