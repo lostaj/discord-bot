@@ -1118,9 +1118,9 @@ class Database:
             await self.cases.create_index([("guild_id",1),("target_id",1)], background=True)
             await self.tempmutes.create_index("unmute_at", background=True)
             await self.roblox_history.create_index("_id", background=True)
-            await db["join_log"].create_index([("guild_id", 1), ("joined_at", -1)], background=True)
-            await db["leave_log"].create_index([("guild_id", 1), ("left_at", -1)], background=True)
-            await db["join_log"].create_index("user_id", background=True)
+            await self.db["join_log"].create_index([("guild_id", 1), ("joined_at", -1)], background=True)
+            await self.db["leave_log"].create_index([("guild_id", 1), ("left_at", -1)], background=True)
+            await self.db["join_log"].create_index("user_id", background=True)
             await self.tempbans.create_index("unban_at", background=True)
             await self.tempbans.create_index([("guild_id",1),("user_id",1)], background=True)
             await self.reports.create_index([("guild_id",1),("created_at",-1)], background=True)
@@ -2210,7 +2210,7 @@ async def build_member_context(member: discord.Member, guild: discord.Guild) -> 
         lines.insert(-1, f"│  Messages last hour: {len(recent_msgs)}")
     # Invite breakdown
     try:
-        inv_doc = await bot.db.get_invite_doc(guild.id, member.id)
+        inv_doc = await bot.db.invites.find_one({"guild_id": guild.id, "inviter_id": member.id, "invite_code": "__total__"}) or {}
         if inv_doc:
             lines.insert(-1,
                 f"│  Invites: {inv_doc.get('total_invites',0)} total "
@@ -2540,7 +2540,7 @@ async def _build_server_sections(
     # ── Recent mod actions (always include for staff context)
     if "mod_log" in needed or "members_online" in needed:
         try:
-            recent_cases = await bot.db.db["mod_cases"].find(
+            recent_cases = await bot.db.db["cases"].find(
                 {"guild_id": guild.id},
                 sort=[("created_at", -1)],
                 limit=5,
@@ -2551,7 +2551,7 @@ async def _build_server_sections(
                     mod    = guild.get_member(case.get("mod_id", 0))
                     target = guild.get_member(case.get("user_id", 0))
                     mc_lines.append(
-                        f"  Case #{case.get('case_id','?')} [{case.get('action','?')}] "
+                        f"  Case #{case.get('case_number','?')} [{case.get('action','?')}] "
                         f"{target.display_name if target else case.get('user_id','?')} "
                         f"by {mod.display_name if mod else '?'} — {case.get('reason','no reason')[:60]}"
                     )
@@ -2562,7 +2562,7 @@ async def _build_server_sections(
     # ── Recent warns (useful for AI to reference)
     if "warnings" in needed or "mod_log" in needed:
         try:
-            recent_warns = await bot.db.db["warnings"].find(
+            recent_warns = await bot.db.db["warns"].find(
                 {"guild_id": guild.id},
                 sort=[("created_at", -1)],
                 limit=5,
@@ -2978,6 +2978,26 @@ class SingleRoleSelect(discord.ui.RoleSelect):
         await interaction.response.send_message(embed=ok(f"Set to {role.mention}"), ephemeral=True)
         if hasattr(self.parent_view, "refresh"):
             await self.parent_view.refresh(interaction)
+
+
+_STAFF_ROLE_SLOTS = [
+    ("staff_owner_role_id",             "👑 Manager",
+     "Full access to all bot commands. Cannot be abuse-stripped."),
+    ("staff_community_manager_role_id", "👑 Community Manager",
+     "Full access — same as Manager. Assign to trusted community leads."),
+    ("staff_partnership_manager_role_id","🤝 Partnership Manager",
+     "Above Senior Mod. Can post invite links. No moderation commands by default."),
+    ("staff_senior_mod_role_id",        "🔵 Senior Moderator",
+     "Warn, kick, ban, mute (up to 28d), purge (up to 500), unban, unmute, clear warns."),
+    ("staff_mod_role_id",               "🟢 Moderator",
+     "Same as Senior Mod: warn, kick, ban, mute, purge, unban, unmute."),
+    ("staff_trial_mod_role_id",         "🟡 Trial Moderator",
+     "Warn, mute (max 1h), purge (max 30 msgs). Cannot kick or ban."),
+    ("staff_all_role_id",               "⚪ All Staff (no mod perms)",
+     "Cosmetic staff role. Bypasses spam filter. No moderation commands."),
+    ("staff_inv_bypass_role_id",        "🔗 Invite Link Bypass",
+     "Allows posting invite links without automod deletion."),
+]
 
 
 def setup_embed(config: dict, guild: discord.Guild) -> discord.Embed:
@@ -3837,25 +3857,6 @@ class RemoveLevelRoleModal(discord.ui.Modal, title="Remove Level Role"):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  STAFF ROLES SETUP VIEW  (v25)
 # ═══════════════════════════════════════════════════════════════════════════════
-
-_STAFF_ROLE_SLOTS = [
-    ("staff_owner_role_id",             "👑 Manager",
-     "Full access to all bot commands. Cannot be abuse-stripped."),
-    ("staff_community_manager_role_id", "👑 Community Manager",
-     "Full access — same as Manager. Assign to trusted community leads."),
-    ("staff_partnership_manager_role_id","🤝 Partnership Manager",
-     "Above Senior Mod. Can post invite links. No moderation commands by default."),
-    ("staff_senior_mod_role_id",        "🔵 Senior Moderator",
-     "Warn, kick, ban, mute (up to 28d), purge (up to 500), unban, unmute, clear warns."),
-    ("staff_mod_role_id",               "🟢 Moderator",
-     "Same as Senior Mod: warn, kick, ban, mute, purge, unban, unmute."),
-    ("staff_trial_mod_role_id",         "🟡 Trial Moderator",
-     "Warn, mute (max 1h), purge (max 30 msgs). Cannot kick or ban."),
-    ("staff_all_role_id",               "⚪ All Staff (no mod perms)",
-     "Cosmetic staff role. Bypasses spam filter. No moderation commands."),
-    ("staff_inv_bypass_role_id",        "🔗 Invite Link Bypass",
-     "Allows posting invite links without automod deletion."),
-]
 
 def _staff_roles_embed(config: dict, guild: discord.Guild) -> discord.Embed:
     e = make_embed(C_PRIMARY)
@@ -7166,7 +7167,7 @@ async def cmd_afk(ctx: commands.Context, *, reason: str = "AFK"):
 async def cmd_invites(ctx: commands.Context, target: discord.Member = None):
     if not ctx.guild: return
     target = target or ctx.author
-    doc     = await bot.db.get_invite_doc(ctx.guild.id, target.id)
+    doc     = await bot.db.invites.find_one({"guild_id": ctx.guild.id, "inviter_id": target.id, "invite_code": "__total__"}) or {}
     total   = doc.get("total_invites", 0)
     regular = doc.get("regular", 0)
     left    = doc.get("left", 0)
@@ -8762,7 +8763,7 @@ async def cmd_modstats(ctx: commands.Context, target: discord.Member = None):
     config = await get_config(ctx.guild.id)
     if not await _require_mod(ctx, config, "mod"): return
     if target:
-        cases = await bot.db.db["mod_cases"].find({"guild_id": ctx.guild.id, "mod_id": target.id}).to_list(500)
+        cases = await bot.db.db["cases"].find({"guild_id": ctx.guild.id, "mod_id": target.id}).to_list(500)
         counts: dict = {}
         for c in cases: counts[c.get("action","?")] = counts.get(c.get("action","?"),0)+1
         lines = [f"**{k.title()}:** {v}" for k, v in sorted(counts.items(), key=lambda x:-x[1])]
@@ -8771,7 +8772,7 @@ async def cmd_modstats(ctx: commands.Context, target: discord.Member = None):
         e.set_thumbnail(url=target.display_avatar.url)
     else:
         pipeline = [{"$match":{"guild_id":ctx.guild.id}},{"$group":{"_id":"$mod_id","count":{"$sum":1}}},{"$sort":{"count":-1}},{"$limit":15}]
-        results = await bot.db.db["mod_cases"].aggregate(pipeline).to_list(15)
+        results = await bot.db.db["cases"].aggregate(pipeline).to_list(15)
         lines = []
         for r in results:
             m = ctx.guild.get_member(r["_id"]); name = m.display_name if m else f"`{r['_id']}`"
