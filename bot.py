@@ -120,12 +120,13 @@ def _get_raid_lock(gid: int) -> asyncio.Lock:
     return _raid_locks[gid]
 
 # ─── Anti-Spam ────────────────────────────────────────────────────────────────
-SPAM_WINDOW_SECS   = 6      # seconds to watch for rapid messages (was 5)
-SPAM_MSG_THRESH    = 6      # messages in window = spam (was 5)
-SPAM_DUP_THRESH    = 5      # same message repeated N times = dup spam (was 3 — too strict)
-SPAM_DUP_MIN_LEN   = 8      # ignore dup check for messages shorter than this (catches "?", "lol", "ok")
-_spam_tracker: dict[int, list[float]]  = collections.defaultdict(list)   # uid -> timestamps
-_dup_tracker:  dict[int, list[str]]    = collections.defaultdict(list)    # uid -> recent normalised hashes
+SPAM_WINDOW_SECS   = 5      # seconds to watch for rapid messages
+SPAM_MSG_THRESH    = 3      # messages in window = spam — raid hardening (3 msgs in 5s)
+SPAM_DUP_THRESH    = 2      # same message repeated N times = dup spam
+SPAM_DUP_MIN_LEN   = 8      # ignore dup check for messages shorter than this
+_spam_tracker:    dict[int, list[float]] = collections.defaultdict(list)   # uid -> timestamps
+_dup_tracker:     dict[int, list[str]]  = collections.defaultdict(list)    # uid -> recent normalised hashes
+_mention_tracker: dict[int, list[float]] = collections.defaultdict(list)   # uid -> timestamps of messages that contained any ping
 
 # ─── Staff spam bypass thresholds ────────────────────────────────────────────
 # Staff don't get muted for normal spam — bot just tells them to slow down.
@@ -173,7 +174,10 @@ SLOWMODE_LIFT_SECS     = 60         # seconds before slowmode is lifted
 _slowmode_active: dict[int, float] = {}   # channel_id -> monotonic timestamp set
 
 # ─── Anti-Mass-Mention ────────────────────────────────────────────────────────
-MASS_MENTION_THRESH = 5
+MASS_MENTION_THRESH       = 4     # unique users per message before trigger
+MENTION_RAW_THRESH        = 3     # raw pings including dupes — @aj @aj @pan = 3, caught instantly
+MENTION_CROSSMSG_THRESH   = 3     # messages-containing-any-ping within window before mute
+MENTION_CROSSMSG_WINDOW   = 8     # seconds window for cross-message ping tracking
 
 # ─── Staff Abuse Tracking ─────────────────────────────────────────────────────
 # Tracks per-staff action counts within a rolling window.
@@ -3361,23 +3365,105 @@ async def _automod_spam(message: discord.Message, config: dict) -> bool:
         _dup_tracker[uid].clear()
         try: await message.delete()
         except Exception: pass
-        try: await message.channel.send(embed=err(f"{message.author.mention} stop copy-pasting the same message."), delete_after=6)
+        if member:
+            try: await member.timeout(timedelta(minutes=5), reason="Anti-spam: duplicate messages")
+            except Exception: pass
+        try: await message.channel.send(embed=err(f"{message.author.mention} stop sending the same message — muted for 5 minutes."), delete_after=6)
         except Exception: pass
+        _log_automod(message.guild, config, f"🔁 **Dup Spam** — {message.author.mention} repeated the same message {SPAM_DUP_THRESH}+ times", C_ERROR)
         return True
     return False
 
 
 async def _automod_mentions(message: discord.Message, config: dict) -> bool:
-    """Mass-mention detection. Returns True if actioned."""
+    """
+    Comprehensive mention / ping abuse detection. Catches all of:
+      1. @everyone / @here with no perm            → delete + 1hr mute, no threshold
+      2. Any user mentioned more than once          → delete + 30 min mute  (@aj @aj = instant)
+      3. Raw total pings >= MENTION_RAW_THRESH      → delete + 30 min mute  (@aj @aj @pan = 3 raw)
+      4. Unique users >= MASS_MENTION_THRESH        → delete + 30 min mute  (4+ different people)
+      5. Role pings counted toward total            → same triggers as above
+      6. Cross-message ping spam                    → delete + 30 min mute  (3 ping-containing msgs in 8s)
+    Returns True if actioned.
+    """
     if not config.get("anti_mass_mention_enabled", True): return False
-    unique_mentions = len({u.id for u in message.mentions if not u.bot})
-    if unique_mentions >= MASS_MENTION_THRESH:
+
+    member = message.guild.get_member(message.author.id) if message.guild else None
+    uid    = message.author.id
+
+    async def _punish(mute_mins: int, log_reason: str, reply: str):
+        """Delete message, timeout member, send warning, log to automod channel."""
         try: await message.delete()
         except Exception: pass
-        try: await message.channel.send(embed=err(f"{message.author.mention} don't mass-mention users."), delete_after=6)
+        muted = False
+        if member and not member.guild_permissions.administrator:
+            try:
+                await member.timeout(timedelta(minutes=mute_mins), reason=log_reason)
+                muted = True
+            except Exception: pass
+        mute_str = f" — **muted {mute_mins} min**" if muted else ""
+        try:
+            await message.channel.send(
+                embed=err(f"{message.author.mention} {reply}{mute_str}."),
+                delete_after=8,
+            )
         except Exception: pass
-        _log_automod(message.guild, config, f"📢 **Mass Mention** — {message.author.mention} pinged {unique_mentions} users", C_WARNING)
+        _log_automod(
+            message.guild, config,
+            f"📢 **{log_reason}** — {message.author.mention} (`{uid}`) in {message.channel.mention}",
+            C_ERROR,
+        )
+        # Clear their mention tracker so cross-msg counter resets
+        _mention_tracker[uid].clear()
+
+    # ── 1. @everyone / @here — zero tolerance ────────────────────────────────
+    if message.mention_everyone:
+        if not (member and member.guild_permissions.mention_everyone):
+            await _punish(60, "@everyone/@here Abuse", "@everyone / @here pings are not allowed — muted for 1 hour")
+            return True
+
+    # ── Build raw + unique mention counts ─────────────────────────────────────
+    raw_user_list   = [u for u in message.mentions if not u.bot]       # includes duplicates
+    raw_total_users = len(raw_user_list)
+    unique_user_ids = {u.id for u in raw_user_list}
+    unique_users    = len(unique_user_ids)
+    role_pings      = len(message.role_mentions)
+    raw_total       = raw_total_users + role_pings
+
+    # Nothing to check if no pings at all
+    if raw_total == 0:
+        return False
+
+    # ── 2. Same user mentioned more than once in a single message ─────────────
+    # e.g. "@aj @aj LEAVE" — unique = 1, raw = 2 → caught
+    for uid_check in unique_user_ids:
+        if sum(1 for u in raw_user_list if u.id == uid_check) > 1:
+            await _punish(30, f"Repeated Ping Abuse (@user multiple times in one message)",
+                          "pinging the same person multiple times in one message is not allowed")
+            return True
+
+    # ── 3. Raw total pings ≥ threshold (unique or not) ───────────────────────
+    if raw_total >= MENTION_RAW_THRESH:
+        await _punish(30, f"Mass Mention — {raw_total} raw pings ({unique_users} unique users, {role_pings} roles)",
+                      f"mass pinging is not allowed ({raw_total} pings in one message)")
         return True
+
+    # ── 4. Unique users ≥ threshold ───────────────────────────────────────────
+    if unique_users >= MASS_MENTION_THRESH:
+        await _punish(30, f"Mass Mention — {unique_users} unique users pinged",
+                      f"pinging {unique_users} people at once is not allowed")
+        return True
+
+    # ── 5 & 6. Cross-message ping spam ───────────────────────────────────────
+    # Track every message that contains any ping at all
+    now = time.monotonic()
+    _mention_tracker[uid] = [t for t in _mention_tracker[uid] if now - t < MENTION_CROSSMSG_WINDOW]
+    _mention_tracker[uid].append(now)
+    if len(_mention_tracker[uid]) >= MENTION_CROSSMSG_THRESH:
+        await _punish(30, f"Cross-Message Ping Spam ({MENTION_CROSSMSG_THRESH} ping messages in {MENTION_CROSSMSG_WINDOW}s)",
+                      "stop pinging people in every message")
+        return True
+
     return False
 
 
@@ -3423,11 +3509,11 @@ async def run_automod(message: discord.Message, config: dict, owner_id: int = 0)
         await _automod_phishing(message, config)  # malicious links still block staff
         return False
 
-    # ── Regular member: full suite
+    # ── Regular member: full suite — mentions first so a single @everyone is caught instantly
     return (
         await _automod_phishing(message, config) or
-        await _automod_spam(message, config) or
         await _automod_mentions(message, config) or
+        await _automod_spam(message, config) or
         await _automod_caps(message, config) or
         await _automod_emoji(message, config)
     )
@@ -4426,12 +4512,14 @@ class LXTEBot(commands.Bot):
             cutoff = time.monotonic() - 3600
             for d in (_xp_cooldowns,):
                 for k in [k for k, v in d.items() if v < cutoff]: del d[k]
-            # Prune stale user entries from spam/dup trackers — prevents unbounded growth
+            # Prune stale user entries from spam/dup/mention trackers — prevents unbounded growth
             now_m = time.monotonic()
             for uid in [k for k, v in list(_spam_tracker.items()) if not v or now_m - max(v) > SPAM_WINDOW_SECS * 10]:
                 del _spam_tracker[uid]
             for uid in [k for k in list(_dup_tracker) if not _dup_tracker[k]]:
                 del _dup_tracker[uid]
+            for uid in [k for k, v in list(_mention_tracker.items()) if not v or now_m - max(v) > MENTION_CROSSMSG_WINDOW * 10]:
+                del _mention_tracker[uid]
             # Reset ghost-ping strike counters (soft reset — strikes decay after 1h quiet)
         except Exception as exc:
             logger.warning("cleanup_task: %s", exc)
