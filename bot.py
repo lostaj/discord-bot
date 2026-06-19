@@ -106,19 +106,6 @@ STAFF_APP_QUESTIONS = [
 # channel_id -> {"user_id": int, "question_index": int, "answers": list[str]}
 _staff_app_sessions: dict[int, dict] = {}
 
-# ─── Anti-Raid ────────────────────────────────────────────────────────────────
-RAID_JOIN_WINDOW  = 10    # tightened: 10s window catches faster raid waves
-RAID_JOIN_THRESH  = 6     # tightened: 6 joins in 10s triggers lockdown (was 10)
-RAID_LOCK_MINUTES = 20    # extended: 20 min lockdown (was 10)
-_join_timestamps: dict[int, list[float]] = collections.defaultdict(list)
-_raid_active:     dict[int, bool]        = {}
-_raid_locks:      dict[int, asyncio.Lock] = {}  # per-guild lock prevents concurrent raid checks
-
-def _get_raid_lock(gid: int) -> asyncio.Lock:
-    if gid not in _raid_locks:
-        _raid_locks[gid] = asyncio.Lock()
-    return _raid_locks[gid]
-
 # ─── Anti-Spam ────────────────────────────────────────────────────────────────
 SPAM_WINDOW_SECS   = 5      # seconds to watch for rapid messages
 SPAM_MSG_THRESH    = 3      # messages in window = spam — raid hardening (3 msgs in 5s)
@@ -143,27 +130,6 @@ def _normalise_msg(text: str) -> str:
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"(.)\1{2,}", r"\1\1", text)  # aaaaaa → aa
     return text
-
-# ─── Anti-Nuke ────────────────────────────────────────────────────────────────
-NUKE_WINDOW_SECS        = 8    # tightened window (was 10)
-NUKE_CHANNEL_DEL_THRESH = 2    # 2 channel deletes = nuke (was 3)
-NUKE_ROLE_DEL_THRESH    = 2    # 2 role deletes = nuke (was 3)
-NUKE_BAN_THRESH         = 4    # 4 bans in window = nuke (was 7)
-NUKE_KICK_THRESH        = 3    # 3 kicks in window (was 5)
-NUKE_CHANNEL_CREATE_THRESH = 3  # 3 creates in window (was 5)
-NUKE_ROLE_GRANT_THRESH  = 2    # 2 dangerous role grants (was 3)
-_nuke_chan_del:    dict[int, list[float]] = collections.defaultdict(list)
-_nuke_role_del:    dict[int, list[float]] = collections.defaultdict(list)
-_nuke_ban:         dict[int, list[float]] = collections.defaultdict(list)
-_nuke_kick:        dict[int, list[float]] = collections.defaultdict(list)
-_nuke_chan_create: dict[int, list[float]] = collections.defaultdict(list)
-_nuke_role_grant:  dict[int, list[float]] = collections.defaultdict(list)
-_nuke_active:      dict[int, bool]        = {}  # separate from _raid_active so they don't block each other
-
-# ─── Anti-Raid (v18) ─────────────────────────────────────────────────────────
-# Track executors seen in the current nuke window so we can act on them
-_nuke_executors:  dict[int, dict[int, list[str]]] = collections.defaultdict(lambda: collections.defaultdict(list))
-# guild_id -> {executor_id -> [action, ...]}
 
 # ─── Warn System (v23) ────────────────────────────────────────────────────────
 WARN_TIMEOUT_THRESHOLD = 3          # warns before auto-timeout
@@ -1629,11 +1595,9 @@ class AutomodSetupView(discord.ui.View):
             f"Automod: {'✅' if config.get('automod_enabled', True) else '❌'}\n"
             f"No Invites: {'✅' if config.get('automod_no_invites', True) else '❌'}\n"
             f"No Links: {'✅' if config.get('automod_no_links', True) else '❌'}\n"
-            f"Anti-Raid: {'✅' if config.get('antiraid_enabled', True) else '❌'}\n"
             f"Anti-Spam: {'✅' if config.get('antispam_enabled', True) else '❌'}\n"
             f"Anti-Caps: {'✅' if config.get('anti_caps_enabled', False) else '❌'}\n"
             f"Anti-Emoji: {'✅' if config.get('anti_emoji_spam_enabled', False) else '❌'}\n"
-            f"Anti-Nuke: {'✅' if config.get('antinuke_enabled', True) else '❌'}\n"
             f"Ghost Ping: {'✅' if config.get('anti_ghost_ping_enabled', True) else '❌'}\n"
             f"Mass Mention: {'✅' if config.get('anti_mass_mention_enabled', True) else '❌'}"
         )
@@ -1647,10 +1611,6 @@ class AutomodSetupView(discord.ui.View):
     @discord.ui.button(label="Toggle No Links",     style=discord.ButtonStyle.secondary, row=0)
     async def t3(self, i, b): await self._toggle(i, "automod_no_links")
 
-    @discord.ui.button(label="Toggle Anti-Raid",    style=discord.ButtonStyle.secondary, row=1)
-    async def t4(self, i, b): await self._toggle(i, "antiraid_enabled")
-
-
     @discord.ui.button(label="Toggle Anti-Spam",    style=discord.ButtonStyle.secondary, row=1)
     async def t6(self, i, b): await self._toggle(i, "antispam_enabled")
 
@@ -1659,9 +1619,6 @@ class AutomodSetupView(discord.ui.View):
 
     @discord.ui.button(label="Toggle Anti-Emoji",   style=discord.ButtonStyle.secondary, row=2)
     async def t8(self, i, b): await self._toggle(i, "anti_emoji_spam_enabled", default=False)
-
-    @discord.ui.button(label="Toggle Anti-Nuke",    style=discord.ButtonStyle.secondary, row=2)
-    async def t9(self, i, b): await self._toggle(i, "antinuke_enabled")
 
     @discord.ui.button(label="Toggle Ghost Ping",   style=discord.ButtonStyle.secondary, row=3)
     async def t10(self, i, b): await self._toggle(i, "anti_ghost_ping_enabled")
@@ -3545,258 +3502,6 @@ def _log_mod_action(guild: discord.Guild, config: dict, title: str, description:
     asyncio.create_task(_send())
 
 
-async def handle_antiraid(member: discord.Member, config: dict):
-    if not config.get("antiraid_enabled", True): return
-    if _is_owner(member): return  # owner invisible to anti-raid
-    gid = member.guild.id
-
-    # Use a per-guild lock so concurrent on_member_join events can't both slip
-    # past the _raid_active check and trigger a double lockdown
-    async with _get_raid_lock(gid):
-        if _raid_active.get(gid): return
-
-        now = time.monotonic()
-        _join_timestamps[gid] = [t for t in _join_timestamps[gid] if now - t < RAID_JOIN_WINDOW]
-        _join_timestamps[gid].append(now)
-        if len(_join_timestamps[gid]) < RAID_JOIN_THRESH: return
-
-        # Verify: scan recent messages for mass-spam before locking.
-        # Avoids false positives when a popular stream/post sends a join surge.
-        recent_joiner_ids = {
-            m.id for m in member.guild.members
-            if m.joined_at and (datetime.now(timezone.utc) - m.joined_at).total_seconds() < 90
-            and not m.bot
-        }
-        spam_count = 0
-        for ch in member.guild.text_channels[:8]:
-            try:
-                async for msg in ch.history(limit=80, after=datetime.now(timezone.utc) - timedelta(seconds=90)):
-                    if msg.author.id in recent_joiner_ids:
-                        spam_count += 1
-            except Exception: pass
-        if spam_count < 4:
-            logger.info("Raid threshold hit for %s but spam check failed (%d msgs) — not locking", gid, spam_count)
-            return
-
-        # Confirmed raid — set flag inside the lock so no other task can double-fire
-        _raid_active[gid] = True
-
-    logger.warning("RAID CONFIRMED %s (%d joins, %d spam msgs)", gid, len(_join_timestamps[gid]), spam_count)
-    guild = member.guild
-
-    # Snapshot which channels already had send_messages=False for @everyone
-    # so _unlock_server doesn't accidentally open them afterwards
-    _pre_raid_locked: set[int] = set()
-    for ch in guild.text_channels:
-        ow = ch.overwrites_for(guild.default_role)
-        if ow.send_messages is False:
-            _pre_raid_locked.add(ch.id)
-
-    for ch in guild.text_channels:
-        if ch.id in _pre_raid_locked: continue  # already locked, leave alone
-        try:
-            ow = ch.overwrites_for(guild.default_role); ow.send_messages = False
-            await ch.set_permissions(guild.default_role, overwrite=ow, reason="Anti-raid")
-        except Exception: pass
-
-    # Timeout recent joiners 30 min
-    for m in guild.members:
-        if m.id in recent_joiner_ids and not m.guild_permissions.administrator:
-            try: await m.timeout(timedelta(minutes=30), reason="Anti-raid: auto-mute")
-            except Exception: pass
-
-    log_ch = get_log_channel(guild, config, "mod")
-    if log_ch:
-        e = make_embed(C_ERROR,
-            f"Detected **{len(_join_timestamps[gid])} joins** in **{RAID_JOIN_WINDOW}s** "
-            f"with **{spam_count} spam messages**.\n"
-            f"All channels locked + {len(recent_joiner_ids)} recent joiners muted 30 min.\n"
-            f"Use `.admin unlockraid` to unlock.")
-        e.title = "🚨 RAID CONFIRMED"
-        try: await log_ch.send(embed=e)
-        except Exception: pass
-
-    await asyncio.sleep(RAID_LOCK_MINUTES * 60)
-    await _unlock_server(guild, skip_ids=_pre_raid_locked)
-    _raid_active[gid] = False
-    _join_timestamps[gid].clear()
-
-async def _unlock_server(guild: discord.Guild, skip_ids: set[int] = None):
-    """Re-open channels locked by anti-raid. skip_ids = channels that were already locked before raid."""
-    skip_ids = skip_ids or set()
-    for ch in guild.text_channels:
-        if ch.id in skip_ids: continue  # was already locked pre-raid, leave it
-        try:
-            ow = ch.overwrites_for(guild.default_role)
-            if ow.send_messages is False:
-                ow.send_messages = None
-                await ch.set_permissions(guild.default_role, overwrite=ow, reason="Anti-raid unlock")
-        except Exception: pass
-
-
-# ─── Anti-Nuke helpers (v18) ──────────────────────────────────────────────────
-
-def _nuke_window_check(tracker: dict, gid: int, thresh: int, window: float = NUKE_WINDOW_SECS) -> bool:
-    """Append now to tracker[gid], prune old entries, return True if threshold exceeded.
-    FIXED: pure check only — callers own side-effects so concurrent events can't double-fire."""
-    now = time.monotonic()
-    tracker[gid] = [t for t in tracker[gid] if now - t < window]
-    tracker[gid].append(now)
-    return len(tracker[gid]) >= thresh
-
-
-def _record_nuke_executor(gid: int, executor_id: Optional[int], action: str):
-    """Track who performed a nuke-like action so we can act on them later."""
-    if executor_id:
-        _nuke_executors[gid][executor_id].append(action)
-
-
-# ─── Dangerous permission flags that indicate a role-grant nuke ───────────────
-_DANGEROUS_PERMS = (
-    "administrator", "ban_members", "kick_members",
-    "manage_guild", "manage_roles", "manage_channels",
-    "mention_everyone",
-)
-
-
-async def _punish_nuker(guild: discord.Guild, executor_id: Optional[int], config: dict, reason: str):
-    """
-    Strip only dangerous/staff roles from the executor — roles that have elevated
-    permissions (admin, ban, kick, manage_*, etc.). Safe roles with no elevated
-    perms (member role, level roles, colour roles, etc.) are left untouched.
-    Also kicks any suspicious bots and deletes nuke webhooks.
-    NEVER bans or kicks real members.
-    """
-    if not executor_id: return
-    if _is_owner(executor_id): return  # bot owner untouchable
-    executor = guild.get_member(executor_id)
-    if not executor or executor.id == guild.owner_id or executor.id == guild.me.id: return
-
-    # Only strip roles that actually carry elevated/dangerous permissions
-    _STRIP_PERMS = (
-        "administrator", "ban_members", "kick_members", "manage_guild",
-        "manage_roles", "manage_channels", "manage_messages", "manage_webhooks",
-        "mention_everyone", "moderate_members", "manage_nicknames",
-        "mute_members", "deafen_members", "move_members",
-    )
-    roles_to_remove = [
-        r for r in executor.roles
-        if r != guild.default_role
-        and r < guild.me.top_role
-        and any(getattr(r.permissions, p, False) for p in _STRIP_PERMS)
-    ]
-    if roles_to_remove:
-        try:
-            await executor.remove_roles(*roles_to_remove, reason=f"Anti-nuke: {reason}")
-            logger.warning("Stripped %d dangerous roles from executor %s (%s)", len(roles_to_remove), executor, guild.name)
-        except Exception as exc:
-            logger.warning("Could not strip roles from %s: %s", executor, exc)
-
-    # Mute executor for 60 minutes instead of kicking/banning
-    try:
-        await executor.timeout(timedelta(hours=1), reason=f"Anti-nuke: {reason}")
-    except Exception as exc:
-        logger.warning("Could not timeout executor %s: %s", executor, exc)
-
-    # Kick any bots added in the last 5 minutes that aren't the bot itself
-    for member in guild.members:
-        if not member.bot or member.id == guild.me.id: continue
-        if member.joined_at and (datetime.now(timezone.utc) - member.joined_at).total_seconds() < 300:
-            try:
-                await member.kick(reason="Anti-nuke: suspicious bot added during nuke window")
-                logger.warning("Kicked suspicious bot %s from %s", member, guild.name)
-            except Exception: pass
-
-    # Delete webhooks created in the last 5 minutes
-    try:
-        for wh in await guild.webhooks():
-            if wh.created_at and (datetime.now(timezone.utc) - (wh.created_at if wh.created_at.tzinfo else wh.created_at.replace(tzinfo=timezone.utc))).total_seconds() < 300:
-                try:
-                    await wh.delete(reason="Anti-nuke: suspicious webhook created during nuke window")
-                    logger.warning("Deleted suspicious webhook %s from %s", wh.name, guild.name)
-                except Exception: pass
-    except Exception: pass
-
-
-async def _handle_nuke_event(guild: discord.Guild, config: dict, description: str, executor_id: Optional[int] = None):
-    """Called when a nuke-like pattern is detected. Logs, punishes executor, and locks server."""
-    # Guard against stacking — use _nuke_active, separate from _raid_active
-    if _nuke_active.get(guild.id): return
-    _nuke_active[guild.id] = True
-
-    lc = get_log_channel(guild, config, "mod")
-
-    executor_str = f"<@{executor_id}>" if executor_id else "unknown"
-    e = make_embed(C_ERROR,
-        description +
-        f"\n**Executor:** {executor_str}"
-        "\n\n**Actions taken:** roles stripped, executor muted 1h, suspicious bots kicked, webhooks deleted."
-        "\n**Server:** locked. Use `.admin unlockraid` to unlock."
-    )
-    e.title = "💣 ANTI-NUKE — THREAT DETECTED"
-    if lc:
-        try: await lc.send(embed=e)
-        except Exception: pass
-
-    await _punish_nuker(guild, executor_id, config, description[:80])
-
-    # Snapshot pre-nuke locked channels so we restore correctly
-    _pre_nuke_locked: set[int] = set()
-    for ch in guild.text_channels:
-        ow = ch.overwrites_for(guild.default_role)
-        if ow.send_messages is False:
-            _pre_nuke_locked.add(ch.id)
-
-    for ch in guild.text_channels:
-        if ch.id in _pre_nuke_locked: continue
-        try:
-            ow = ch.overwrites_for(guild.default_role); ow.send_messages = False
-            await ch.set_permissions(guild.default_role, overwrite=ow, reason="Anti-nuke lockdown")
-        except Exception: pass
-
-    await asyncio.sleep(RAID_LOCK_MINUTES * 60)
-    await _unlock_server(guild, skip_ids=_pre_nuke_locked)
-    _nuke_active[guild.id] = False
-    _nuke_executors[guild.id].clear()
-
-
-async def handle_antinuke_channel_delete(guild: discord.Guild, config: dict, executor_id: Optional[int] = None):
-    if not config.get("antinuke_enabled", True): return
-    _record_nuke_executor(guild.id, executor_id, "channel_delete")
-    if _nuke_window_check(_nuke_chan_del, guild.id, NUKE_CHANNEL_DEL_THRESH):
-        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_CHANNEL_DEL_THRESH}+ channels deleted** in {NUKE_WINDOW_SECS}s — possible nuke bot.", executor_id))
-
-async def handle_antinuke_channel_create(guild: discord.Guild, config: dict, executor_id: Optional[int] = None):
-    if not config.get("antinuke_enabled", True): return
-    _record_nuke_executor(guild.id, executor_id, "channel_create")
-    if _nuke_window_check(_nuke_chan_create, guild.id, NUKE_CHANNEL_CREATE_THRESH):
-        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_CHANNEL_CREATE_THRESH}+ channels created** in {NUKE_WINDOW_SECS}s — possible nuke bot.", executor_id))
-
-async def handle_antinuke_role_delete(guild: discord.Guild, config: dict, executor_id: Optional[int] = None):
-    if not config.get("antinuke_enabled", True): return
-    _record_nuke_executor(guild.id, executor_id, "role_delete")
-    if _nuke_window_check(_nuke_role_del, guild.id, NUKE_ROLE_DEL_THRESH):
-        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_ROLE_DEL_THRESH}+ roles deleted** in {NUKE_WINDOW_SECS}s — possible nuke bot.", executor_id))
-
-async def handle_antinuke_ban(guild: discord.Guild, config: dict, user: discord.User, executor_id: Optional[int] = None):
-    if not config.get("antinuke_enabled", True): return
-    _record_nuke_executor(guild.id, executor_id, "ban")
-    if _nuke_window_check(_nuke_ban, guild.id, NUKE_BAN_THRESH):
-        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_BAN_THRESH}+ bans** in {NUKE_WINDOW_SECS}s — possible mass ban. Last: {user}", executor_id))
-
-async def handle_antinuke_kick(guild: discord.Guild, config: dict, executor_id: Optional[int] = None):
-    if not config.get("antinuke_enabled", True): return
-    _record_nuke_executor(guild.id, executor_id, "kick")
-    if _nuke_window_check(_nuke_kick, guild.id, NUKE_KICK_THRESH):
-        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_KICK_THRESH}+ kicks** in {NUKE_WINDOW_SECS}s — possible mass kick.", executor_id))
-
-async def handle_antinuke_role_grant(guild: discord.Guild, config: dict, executor_id: Optional[int], role_name: str):
-    """v18: detect mass dangerous-permission role grants (e.g. giving @everyone admin)."""
-    if not config.get("antinuke_enabled", True): return
-    _record_nuke_executor(guild.id, executor_id, "role_grant")
-    if _nuke_window_check(_nuke_role_grant, guild.id, NUKE_ROLE_GRANT_THRESH):
-        asyncio.create_task(_handle_nuke_event(guild, config, f"**{NUKE_ROLE_GRANT_THRESH}+ dangerous role grants** in {NUKE_WINDOW_SECS}s (last: `{role_name}`). Possible perm escalation.", executor_id))
-
 _invite_cache: dict[int, dict[str, int]] = {}
 
 async def cache_invites(guild: discord.Guild):
@@ -4141,44 +3846,6 @@ class LXTEBot(commands.Bot):
             try: await mod_lc.send(embed=e)
             except Exception: pass
 
-        # ══ ANTI-NUKE checks ═══════════════════════════════════════════════════
-        if action == discord.AuditLogAction.channel_delete:
-            await handle_antinuke_channel_delete(guild, config, executor_id)
-
-        elif action == discord.AuditLogAction.channel_create:
-            await handle_antinuke_channel_create(guild, config, executor_id)
-
-        elif action == discord.AuditLogAction.role_delete:
-            await handle_antinuke_role_delete(guild, config, executor_id)
-
-        elif action == discord.AuditLogAction.ban:
-            await handle_antinuke_ban(guild, config, target, executor_id)
-
-        elif action == discord.AuditLogAction.kick:
-            await handle_antinuke_kick(guild, config, executor_id)
-
-        elif action in (discord.AuditLogAction.role_update, discord.AuditLogAction.member_role_update):
-            try:
-                changes  = entry.changes
-                role_name = getattr(target, "name", "unknown") if target else "unknown"
-
-                if action == discord.AuditLogAction.role_update:
-                    # Someone edited a role to give it dangerous permissions
-                    after_perms = getattr(getattr(changes, "after", None), "permissions", None)
-                    if after_perms and any(getattr(after_perms, perm, False) for perm in _DANGEROUS_PERMS):
-                        await handle_antinuke_role_grant(guild, config, executor_id, role_name)
-
-                elif action == discord.AuditLogAction.member_role_update:
-                    # Someone bulk-assigned roles to a member — check if any granted role is dangerous
-                    after_roles = getattr(getattr(changes, "after", None), "roles", []) or []
-                    before_roles = getattr(getattr(changes, "before", None), "roles", []) or []
-                    added_roles  = [r for r in after_roles if r not in before_roles]
-                    for r in added_roles:
-                        if any(getattr(r.permissions, perm, False) for perm in _DANGEROUS_PERMS):
-                            await handle_antinuke_role_grant(guild, config, executor_id, r.name)
-                            break
-            except Exception: pass
-
         # ══ MOD LOGS ═══════════════════════════════════════════════════════════
 
         if action == discord.AuditLogAction.ban:
@@ -4297,9 +3964,6 @@ class LXTEBot(commands.Bot):
         if member.bot: return
         await update_member_count(member.guild)
         config = await get_config(member.guild.id)
-        # NOTE: kick detection is now handled by on_audit_log_entry_create (v18)
-        # on_member_remove fires for both leaves and kicks — we can't tell which
-        # without the audit log, so we don't call handle_antinuke_kick here anymore.
         # Decrement inviter's count when a member leaves
         try:
             inv_ref = await bot.db.db["invite_refs"].find_one({"guild_id": member.guild.id, "user_id": member.id})
@@ -4341,7 +4005,6 @@ class LXTEBot(commands.Bot):
     async def on_member_join(self, member: discord.Member):
         if member.bot: return
         config = await get_config(member.guild.id)
-        asyncio.create_task(handle_antiraid(member, config))
 
         # ── Re-apply persisted roles on rejoin ──────────────────────────────
         try:
@@ -4389,12 +4052,11 @@ class LXTEBot(commands.Bot):
                 _join_log[member.guild.id] = _join_log[member.guild.id][-_JOIN_LOG_MAX:]
         except Exception as exc:
             logger.warning("join_log persist error: %s", exc)
-        if not _raid_active.get(member.guild.id, False):
-            for entry in config.get("autoroles", []):
-                role = member.guild.get_role(entry.get("role_id"))
-                if role:
-                    try: await member.add_roles(role, reason="Auto-role")
-                    except Exception as e: logger.warning("AutoRole: %s", e)
+        for entry in config.get("autoroles", []):
+            role = member.guild.get_role(entry.get("role_id"))
+            if role:
+                try: await member.add_roles(role, reason="Auto-role")
+                except Exception as e: logger.warning("AutoRole: %s", e)
         await send_welcome(member, config)
         await update_member_count(member.guild)
         # Log join to entry log channel
@@ -5027,8 +4689,7 @@ def build_help_embed(category: str, user=None) -> discord.Embed:
             "**📡 System**\n"
             "`.admin status` — RAM, latency, uptime, guild count\n"
             "`.admin health` — ping all external services (DB)\n"
-            "`.admin synccount` — force member count channel update\n"
-            "`.admin unlockraid` — manually lift anti-raid lockdown\n\n"
+            "`.admin synccount` — force member count channel update\n\n"
             "**🌐 Owner-only**\n"
             "`.restart` — restart the bot process\n"
             "`.robloxnotify <#channel> [role]` — set Roblox update alert channel"
@@ -5875,18 +5536,10 @@ async def cmd_admin(ctx: commands.Context, action: str = "status", *args):
             f"Pillow  : {'✅' if PILLOW_AVAILABLE else '❌'}"
         )))
 
-    elif action == "unlockraid":
-        for guild in bot.guilds:
-            await _unlock_server(guild)
-            _raid_active[guild.id] = False
-            _nuke_active[guild.id] = False
-            _join_timestamps[guild.id].clear()
-        await ctx.send(embed=ok("All servers unlocked."))
-
     else:
         await ctx.send(embed=make_embed(C_INFO,
             "`status` `health` `synccount`\n"
-            "`resetxp <id>` `unlockraid`"
+            "`resetxp <id>`"
         ))
 
 
@@ -6305,39 +5958,6 @@ async def cmd_role(ctx: commands.Context, action: str = None, member: discord.Me
 
 
 # ─── Mod Stats / Warnings alias ──────────────────────────────────────────────
-
-class EmbedBuilderModal(discord.ui.Modal, title="Create Embed"):
-    embed_title   = discord.ui.TextInput(label="Title", max_length=100, required=False)
-    embed_desc    = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph, max_length=2000)
-    embed_color   = discord.ui.TextInput(label="Color hex (e.g. 5865F2)", max_length=8, required=False, default="5865F2")
-    embed_footer  = discord.ui.TextInput(label="Footer (optional)", max_length=100, required=False)
-    embed_channel = discord.ui.TextInput(label="Channel ID (blank = here)", max_length=20, required=False)
-    async def on_submit(self, i: discord.Interaction):
-        try: color = int(self.embed_color.value.lstrip("#") or "5865F2", 16)
-        except ValueError: color = C_PRIMARY
-        e = discord.Embed(description=self.embed_desc.value, color=color)
-        if self.embed_title.value:  e.title = self.embed_title.value
-        if self.embed_footer.value: e.set_footer(text=self.embed_footer.value)
-        try:
-            ch_id = int(self.embed_channel.value.strip()) if self.embed_channel.value.strip() else 0
-            ch = i.guild.get_channel(ch_id) or i.channel
-            await ch.send(embed=e)
-            await i.response.send_message(embed=ok("✅ Embed sent."), ephemeral=True)
-        except Exception as exc:
-            await i.response.send_message(embed=err(f"Failed: `{exc}`"), ephemeral=True)
-
-
-class EmbedTrigger(discord.ui.View):
-    def __init__(self): super().__init__(timeout=60)
-    @discord.ui.button(label="📝 Open Builder", style=discord.ButtonStyle.primary)
-    async def open_modal(self, i: discord.Interaction, b): await i.response.send_modal(EmbedBuilderModal())
-
-
-@bot.command(name="embed", aliases=["embedbuilder"])
-@commands.has_permissions(manage_messages=True)
-async def cmd_embed(ctx: commands.Context):
-    """Open the embed builder. Requires Manage Messages. Usage: .embed"""
-    await ctx.send("Click to open the embed builder:", view=EmbedTrigger(), delete_after=60)
 
 @bot.command(name="resetinvites", aliases=["rinv"])
 async def cmd_resetinvites(ctx: commands.Context, member: discord.Member = None):
