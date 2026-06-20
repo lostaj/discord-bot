@@ -45,7 +45,6 @@ VOICE_XP_INTERVAL = 60
 VOICE_XP_PER_TICK = 5
 STREAK_BONUS_XP   = 5
 BOOST_XP_REWARD   = 200
-DAILY_XP_AMOUNT   = 50
 
 ACHIEVEMENTS = [
     {"id": "first_message",   "name": "First Words",     "emoji": "🌱", "desc": "Send your first message"},
@@ -814,6 +813,11 @@ async def apply_level_roles(member, db: Database, new_level: int) -> Optional[st
 
 PREFIX = os.getenv("PREFIX", ".")
 
+# ── Stats channel formatting ─────────────────────────────────────────────────
+MEMBERS_CHANNEL_FORMAT = "︰🌺・Members: {count}"
+BOOSTS_CHANNEL_FORMAT  = "︰🌺・Boosts: {count}"
+STATS_UPDATE_COOLDOWN  = 600  # Discord only allows ~2 channel renames per 10 min
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members         = True
@@ -831,6 +835,8 @@ class AjsCrib(commands.Bot):
         )
         self.db: Optional[Database] = None
         self._xp_cooldowns: dict[tuple[int, int], float] = {}
+        self._stats_last_update: dict[int, float] = {}  # channel_id -> monotonic time
+        self.invite_cache: dict[int, dict[str, int]] = {}  # guild_id -> {code: uses}
 
     async def setup_hook(self):
         mongo_uri = os.getenv("MONGO_URI")
@@ -845,10 +851,15 @@ class AjsCrib(commands.Bot):
         await self.db.ensure_indexes()
         logger.info("Connected to MongoDB.")
 
+        # persistent ticket button views (survive restarts)
+        self.add_view(TicketPanelView())
+        self.add_view(TicketCloseView())
+
         # background loops
         self.tempmute_loop.start()
         self.tempban_loop.start()
         self.giveaway_loop.start()
+        self.stats_loop.start()
 
     async def close(self):
         if self.db:
@@ -914,8 +925,211 @@ class AjsCrib(commands.Bot):
         except Exception as e:
             logger.error("giveaway_loop error: %s", e)
 
+    @tasks.loop(minutes=10)
+    async def stats_loop(self):
+        """Periodic safety-net refresh of all configured stats channels."""
+        for guild in self.guilds:
+            try:
+                await self.refresh_stats_channels(guild, force=True)
+            except Exception as e:
+                logger.error("stats_loop error for guild %s: %s", guild.id, e)
+
+    async def refresh_stats_channels(self, guild: discord.Guild, force: bool = False):
+        """Update the members/boosts stats channels for a guild, respecting Discord's rename rate limit."""
+        if not self.db:
+            return
+        config = await get_config(guild.id, self.db)
+        now = time.monotonic()
+
+        members_chan_id = config.get("members_stats_channel")
+        if members_chan_id:
+            channel = guild.get_channel(members_chan_id)
+            if channel:
+                last = self._stats_last_update.get(channel.id, 0)
+                if force or now - last >= STATS_UPDATE_COOLDOWN:
+                    new_name = MEMBERS_CHANNEL_FORMAT.format(count=guild.member_count)
+                    if channel.name != new_name:
+                        try:
+                            await channel.edit(name=new_name)
+                            self._stats_last_update[channel.id] = now
+                        except discord.HTTPException as e:
+                            logger.warning("Failed to update members stats channel: %s", e)
+
+        boosts_chan_id = config.get("boosts_stats_channel")
+        if boosts_chan_id:
+            channel = guild.get_channel(boosts_chan_id)
+            if channel:
+                last = self._stats_last_update.get(channel.id, 0)
+                if force or now - last >= STATS_UPDATE_COOLDOWN:
+                    new_name = BOOSTS_CHANNEL_FORMAT.format(count=guild.premium_subscription_count)
+                    if channel.name != new_name:
+                        try:
+                            await channel.edit(name=new_name)
+                            self._stats_last_update[channel.id] = now
+                        except discord.HTTPException as e:
+                            logger.warning("Failed to update boosts stats channel: %s", e)
+
 
 bot = AjsCrib()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TICKETS — persistent button views
+# ═══════════════════════════════════════════════════════════════════════════════
+
+TICKET_OPEN_CUSTOM_ID  = "ajscrib:open_ticket"
+TICKET_CLOSE_CUSTOM_ID = "ajscrib:close_ticket"
+
+
+class TicketCloseView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Close Ticket", emoji="🔒", style=discord.ButtonStyle.red, custom_id=TICKET_CLOSE_CUSTOM_ID)
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.channel
+        await bot.db.close_ticket(channel.id)
+        await interaction.response.send_message("🔒 Closing this ticket in 5 seconds...")
+        await asyncio.sleep(5)
+        try:
+            await channel.delete(reason=f"Ticket closed by {interaction.user}")
+        except discord.HTTPException:
+            pass
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Open Ticket", emoji="🎫", style=discord.ButtonStyle.green, custom_id=TICKET_OPEN_CUSTOM_ID)
+    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        config = await get_config(guild.id, bot.db)
+
+        existing = await bot.db.count_open_tickets(guild.id, interaction.user.id)
+        if existing > 0:
+            await interaction.response.send_message("⚠️ You already have an open ticket.", ephemeral=True)
+            return
+
+        category_id = config.get("ticket_category_id")
+        category = guild.get_channel(category_id) if category_id else None
+        support_role_id = config.get("ticket_support_role_id")
+        support_role = guild.get_role(support_role_id) if support_role_id else None
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+        }
+        if support_role:
+            overwrites[support_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+
+        channel_name = f"ticket-{interaction.user.name}".lower()[:90]
+        channel = await guild.create_text_channel(
+            channel_name,
+            category=category,
+            overwrites=overwrites,
+            reason=f"Ticket opened by {interaction.user}",
+        )
+        ticket_id = int(time.time())
+        await bot.db.save_ticket(guild.id, channel.id, interaction.user.id, ticket_id)
+
+        embed = discord.Embed(
+            title="🎫 Support Ticket",
+            description=f"{interaction.user.mention} thanks for reaching out — support will be with you shortly.",
+            color=discord.Color.blurple(),
+        )
+        await channel.send(
+            content=support_role.mention if support_role else None,
+            embed=embed,
+            view=TicketCloseView(),
+        )
+        await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  INVITE TRACKING HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _refresh_invite_cache(guild: discord.Guild):
+    try:
+        invites = await guild.invites()
+        bot.invite_cache[guild.id] = {inv.code: inv.uses for inv in invites}
+    except discord.Forbidden:
+        bot.invite_cache[guild.id] = {}
+
+
+async def _detect_used_invite(guild: discord.Guild) -> Optional[discord.Invite]:
+    """Compare current invites against the cache to figure out which invite was just used."""
+    try:
+        current = await guild.invites()
+    except discord.Forbidden:
+        return None
+    old_map = bot.invite_cache.get(guild.id, {})
+    used = None
+    for inv in current:
+        if inv.uses > old_map.get(inv.code, 0):
+            used = inv
+            break
+    bot.invite_cache[guild.id] = {inv.code: inv.uses for inv in current}
+    return used
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SETUP WIZARD HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _wizard_wait(ctx: commands.Context, prompt: str, timeout: int = 90) -> Optional[discord.Message]:
+    await ctx.send(prompt)
+    try:
+        return await bot.wait_for(
+            "message",
+            timeout=timeout,
+            check=lambda m: m.author.id == ctx.author.id and m.channel.id == ctx.channel.id,
+        )
+    except asyncio.TimeoutError:
+        await ctx.send("⌛ Timed out — skipping this step.")
+        return None
+
+
+async def _wizard_channel(ctx: commands.Context, prompt: str):
+    msg = await _wizard_wait(ctx, prompt)
+    if msg is None or msg.content.strip().lower() == "skip":
+        return None
+    if msg.channel_mentions:
+        return msg.channel_mentions[0]
+    try:
+        cid = int(msg.content.strip().strip("<#>"))
+        return ctx.guild.get_channel(cid)
+    except ValueError:
+        return None
+
+
+async def _wizard_role(ctx: commands.Context, prompt: str) -> Optional[discord.Role]:
+    msg = await _wizard_wait(ctx, prompt)
+    if msg is None or msg.content.strip().lower() == "skip":
+        return None
+    if msg.role_mentions:
+        return msg.role_mentions[0]
+    name = msg.content.strip()
+    try:
+        rid = int(name.strip("<@&>"))
+        role = ctx.guild.get_role(rid)
+        if role:
+            return role
+    except ValueError:
+        pass
+    return discord.utils.find(lambda r: r.name.lower() == name.lower(), ctx.guild.roles)
+
+
+async def _wizard_text(ctx: commands.Context, prompt: str) -> Optional[str]:
+    msg = await _wizard_wait(ctx, prompt)
+    if msg is None:
+        return None
+    content = msg.content.strip()
+    if content.lower() in ("skip", "default"):
+        return None
+    return content
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -927,7 +1141,24 @@ async def on_ready():
     await bot.change_presence(
         activity=discord.Activity(type=discord.ActivityType.watching, name="aj's crib")
     )
+    for guild in bot.guilds:
+        await _refresh_invite_cache(guild)
     logger.info("aj's crib is online as %s (id: %s) — prefix '%s'", bot.user, bot.user.id, PREFIX)
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    await _refresh_invite_cache(guild)
+
+
+@bot.event
+async def on_invite_create(invite: discord.Invite):
+    bot.invite_cache.setdefault(invite.guild.id, {})[invite.code] = invite.uses
+
+
+@bot.event
+async def on_invite_delete(invite: discord.Invite):
+    bot.invite_cache.get(invite.guild.id, {}).pop(invite.code, None)
 
 
 @bot.event
@@ -949,8 +1180,15 @@ async def on_message(message: discord.Message):
             text = f"🎉 {message.author.mention} leveled up to **level {result['level']}**!"
             if reward:
                 text += f" Earned role **{reward}**."
+            config = await get_config(message.guild.id, bot.db)
+            target_channel = message.channel
+            levelup_channel_id = config.get("levelup_channel")
+            if levelup_channel_id:
+                chan = message.guild.get_channel(levelup_channel_id)
+                if chan:
+                    target_channel = chan
             try:
-                await message.channel.send(text)
+                await target_channel.send(text)
             except discord.HTTPException:
                 pass
 
@@ -967,11 +1205,31 @@ async def on_message(message: discord.Message):
 
 
 @bot.event
+async def on_member_join(member: discord.Member):
+    try:
+        await bot.refresh_stats_channels(member.guild)
+    except Exception as e:
+        logger.error("Stats refresh on join failed: %s", e)
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    try:
+        await bot.refresh_stats_channels(member.guild)
+    except Exception as e:
+        logger.error("Stats refresh on remove failed: %s", e)
+
+
+@bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
     if before.premium_since is None and after.premium_since is not None:
         count = await bot.db.record_boost(after.guild.id, after.id)
         result = await bot.db.add_xp(after.id, after.guild.id, BOOST_XP_REWARD)
         logger.info("%s boosted %s (boost #%d), awarded %d XP", after, after.guild, count, BOOST_XP_REWARD)
+        try:
+            await bot.refresh_stats_channels(after.guild)
+        except Exception as e:
+            logger.error("Stats refresh on boost failed: %s", e)
 
 
 @bot.event
@@ -1012,7 +1270,7 @@ async def help_cmd(ctx: commands.Context):
     )
     embed.add_field(
         name="Leveling",
-        value=f"`{PREFIX}rank [@user]` `{PREFIX}leaderboard` `{PREFIX}daily`",
+        value=f"`{PREFIX}rank [@user]` `{PREFIX}leaderboard`",
         inline=False,
     )
     embed.add_field(
@@ -1023,6 +1281,11 @@ async def help_cmd(ctx: commands.Context):
             f"`{PREFIX}tempmute @user 10m reason` `{PREFIX}tempban @user 1d reason`\n"
             f"`{PREFIX}case <number>` `{PREFIX}cases @user`"
         ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Setup",
+        value=f"`{PREFIX}quicksetup` — one-command setup for live Members/Boosts tracker channels",
         inline=False,
     )
     embed.add_field(name="Utility", value=f"`{PREFIX}ping` `{PREFIX}config`", inline=False)
@@ -1065,12 +1328,6 @@ async def leaderboard_cmd(ctx: commands.Context):
         lines.append(f"**#{i}** {name} — Level {level} ({row.get('total_xp', 0)} XP)")
     embed = discord.Embed(title="🏆 Leaderboard", description="\n".join(lines), color=discord.Color.gold())
     await ctx.send(embed=embed)
-
-
-@bot.command(name="daily")
-async def daily_cmd(ctx: commands.Context):
-    result = await bot.db.add_xp(ctx.author.id, ctx.guild.id, DAILY_XP_AMOUNT)
-    await ctx.send(f"✅ {ctx.author.mention} claimed your daily **{DAILY_XP_AMOUNT} XP**! Now level {result['level']}.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1199,7 +1456,74 @@ async def tempban_cmd(ctx: commands.Context, member: discord.Member, duration: s
 #  COMMANDS — config
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@bot.command(name="config")
+@bot.command(name="quicksetup", aliases=["setup"])
+@commands.has_permissions(administrator=True)
+async def quicksetup_cmd(ctx: commands.Context):
+    """One-command setup: creates live Members/Boosts counter channels and saves config."""
+    guild = ctx.guild
+    msg = await ctx.send("✨ Setting up **aj's crib**... this'll take a moment.")
+
+    # Find or create the stats category
+    category = discord.utils.find(lambda c: c.name == "📊 Server Stats", guild.categories)
+    if category is None:
+        category = await guild.create_category("📊 Server Stats", reason="aj's crib quicksetup")
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(connect=False, view_channel=True),
+        guild.me: discord.PermissionOverwrite(connect=True, view_channel=True, manage_channels=True),
+    }
+
+    config = await bot.db.get_config(guild.id)
+    created = []
+
+    # Members counter channel
+    members_chan_id = config.get("members_stats_channel")
+    members_chan = guild.get_channel(members_chan_id) if members_chan_id else None
+    if members_chan is None:
+        members_chan = await guild.create_voice_channel(
+            MEMBERS_CHANNEL_FORMAT.format(count=guild.member_count),
+            category=category,
+            overwrites=overwrites,
+            reason="aj's crib quicksetup — members counter",
+        )
+        await bot.db.update_config(guild.id, "members_stats_channel", members_chan.id)
+        created.append("Members counter")
+    else:
+        await members_chan.edit(name=MEMBERS_CHANNEL_FORMAT.format(count=guild.member_count))
+
+    # Boosts counter channel
+    boosts_chan_id = config.get("boosts_stats_channel")
+    boosts_chan = guild.get_channel(boosts_chan_id) if boosts_chan_id else None
+    if boosts_chan is None:
+        boosts_chan = await guild.create_voice_channel(
+            BOOSTS_CHANNEL_FORMAT.format(count=guild.premium_subscription_count),
+            category=category,
+            overwrites=overwrites,
+            reason="aj's crib quicksetup — boosts counter",
+        )
+        await bot.db.update_config(guild.id, "boosts_stats_channel", boosts_chan.id)
+        created.append("Boosts counter")
+    else:
+        await boosts_chan.edit(name=BOOSTS_CHANNEL_FORMAT.format(count=guild.premium_subscription_count))
+
+    bot._stats_last_update[members_chan.id] = time.monotonic()
+    bot._stats_last_update[boosts_chan.id] = time.monotonic()
+
+    embed = discord.Embed(
+        title="✅ aj's crib is set up!",
+        color=discord.Color.green(),
+        description=(
+            f"📁 Category: **{category.name}**\n"
+            f"👥 Members tracker: {members_chan.mention}\n"
+            f"🚀 Boosts tracker: {boosts_chan.mention}\n\n"
+            "Both update automatically as members join/leave and the server gets boosted "
+            "(Discord limits renames, so they refresh instantly when possible and at least every 10 minutes)."
+        ),
+    )
+    await msg.edit(content=None, embed=embed)
+
+
+
 @commands.has_permissions(administrator=True)
 async def config_cmd(ctx: commands.Context, key: str = None, value: str = None):
     if key is None:
