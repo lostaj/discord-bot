@@ -28,6 +28,9 @@ from typing import Optional
 import discord
 from discord.ext import commands, tasks
 from motor.motor_asyncio import AsyncIOMotorClient
+from dotenv import load_dotenv
+
+load_dotenv()  # reads a .env file in the working directory into os.environ, if present
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  LOGGING
