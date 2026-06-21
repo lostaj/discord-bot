@@ -202,6 +202,7 @@ class Database:
         self.tempbans       = db["tempbans"]
         self.reports        = db["reports"]
         self.ticket_ratings = db["ticket_ratings"]
+        self.counters       = db["counters"]  # atomic per-guild sequence numbers (case#, report#, ...)
 
     @property
     def db(self):
@@ -247,6 +248,7 @@ class Database:
             await self.warns.create_index([("guild_id", 1), ("user_id", 1)], background=True)
             await self.warns.create_index("created_at", background=True)
             await self.cases.create_index([("guild_id", 1), ("case_number", 1)], unique=True, background=True)
+            await self.counters.create_index([("guild_id", 1), ("name", 1)], unique=True, background=True)
             await self.cases.create_index([("guild_id", 1), ("target_id", 1)], background=True)
             await self.tempmutes.create_index("unmute_at", background=True)
             await self.roblox_history.create_index("_id", background=True)
@@ -265,6 +267,44 @@ class Database:
 
     async def close(self):
         self._client.close()
+
+    # ── Atomic Counters ───────────────────────────────────────────────────────
+
+    async def next_counter(self, gid: int, name: str) -> int:
+        """Atomically returns the next sequence number for `name` in this guild
+        (e.g. 'case_number', 'report_number'). Uses a single atomic $inc via
+        find_one_and_update, so concurrent calls can never hand out the same
+        number twice — unlike a read-then-increment pattern, which races under
+        concurrent staff actions and can throw a duplicate-key error."""
+        doc = await self.counters.find_one_and_update(
+            {"guild_id": gid, "name": name},
+            {"$inc": {"value": 1}},
+            upsert=True,
+            return_document=True,
+        )
+        return doc["value"]
+
+    async def seed_counters_from_existing(self):
+        """One-time migration, safe to call on every startup: makes sure each
+        guild's atomic counters start above any case/report numbers that
+        already exist from before counters existed, so old data and new
+        atomic numbering never collide. No-ops once a counter is already
+        ahead of the existing max, so this is cheap to run repeatedly."""
+        for coll, field, name in ((self.cases, "case_number", "case_number"),
+                                   (self.reports, "report_number", "report_number")):
+            pipeline = [{"$group": {"_id": "$guild_id", "max": {"$max": f"${field}"}}}]
+            async for row in coll.aggregate(pipeline):
+                gid, max_val = row["_id"], row["max"] or 0
+                await self.counters.update_one(
+                    {"guild_id": gid, "name": name, "value": {"$lt": max_val}},
+                    {"$set": {"value": max_val}},
+                    upsert=False,
+                )
+                await self.counters.update_one(
+                    {"guild_id": gid, "name": name},
+                    {"$setOnInsert": {"guild_id": gid, "name": name, "value": max_val}},
+                    upsert=True,
+                )
 
     # ── Config ────────────────────────────────────────────────────────────────
 
@@ -448,6 +488,20 @@ class Database:
             upsert=True,
         )
 
+    async def record_member_inviter(self, gid: int, member_id: int, inviter_id: int, code: str):
+        """Remembers who invited a specific member, so the count can be
+        decremented accurately if/when they leave. Keyed separately from the
+        per-code and per-inviter-total docs above."""
+        await self.invites.update_one(
+            {"guild_id": gid, "invite_code": f"__member_{member_id}"},
+            {"$set": {"inviter_id": inviter_id, "code": code}},
+            upsert=True,
+        )
+
+    async def get_inviter_of_member(self, gid: int, member_id: int) -> Optional[int]:
+        doc = await self.invites.find_one({"guild_id": gid, "invite_code": f"__member_{member_id}"})
+        return doc.get("inviter_id") if doc else None
+
     async def add_bonus_invite(self, gid: int, inviter_id: int, amount: int = 1):
         await self.invites.update_one(
             {"guild_id": gid, "inviter_id": inviter_id, "invite_code": "__total__"},
@@ -502,7 +556,7 @@ class Database:
         await self.tickets.update_one(
             {"guild_id": gid, "channel_id": channel_id},
             {"$set": {
-                "user_id": uid, "ticket_id": ticket_id, "priority": priority,
+                "guild_id": gid, "user_id": uid, "ticket_id": ticket_id, "priority": priority,
                 "claimed_by": None, "opened_at": datetime.now(timezone.utc),
                 "last_activity_at": datetime.now(timezone.utc), "closed": False,
             }},
@@ -670,8 +724,7 @@ class Database:
 
     async def add_case(self, gid: int, action: str, mod_id: int, target_id: int,
                        reason: str, extra: dict = None) -> int:
-        last = await self.cases.find_one({"guild_id": gid}, sort=[("case_number", -1)])
-        num  = (last.get("case_number", 0) + 1) if last else 1
+        num  = await self.next_counter(gid, "case_number")
         doc  = {
             "guild_id": gid, "case_number": num, "action": action,
             "mod_id": mod_id, "target_id": target_id, "reason": reason,
@@ -798,6 +851,29 @@ class Database:
         db = self._client["lxte_assistant"]
         await db["snapshots"].insert_one(snapshot)
 
+    # ── Anti-nuke containment snapshots (survive bot restarts) ──────────────────
+    # The in-memory `_contained_members` dict is fast but vanishes on restart,
+    # which used to mean `.release` could find nothing to restore if the bot
+    # redeployed while someone was contained. These mirror every containment
+    # to the DB so it's always recoverable, even after a restart.
+
+    async def save_containment(self, gid: int, uid: int, role_ids: list[int], reason: str):
+        await self.db["containments"].update_one(
+            {"guild_id": gid, "user_id": uid},
+            {"$set": {"guild_id": gid, "user_id": uid, "role_ids": role_ids,
+                      "reason": reason, "created_at": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+
+    async def get_containment(self, gid: int, uid: int) -> Optional[dict]:
+        return await self.db["containments"].find_one({"guild_id": gid, "user_id": uid})
+
+    async def delete_containment(self, gid: int, uid: int):
+        await self.db["containments"].delete_one({"guild_id": gid, "user_id": uid})
+
+    async def get_all_containments(self, gid: int) -> list[dict]:
+        return await self.db["containments"].find({"guild_id": gid}).to_list(length=200)
+
     # ── Reaction Roles ────────────────────────────────────────────────────────
 
     async def save_reaction_role(self, gid: int, msg_id: int, data: dict):
@@ -857,9 +933,8 @@ class Database:
     # ── Reports ───────────────────────────────────────────────────────────────
 
     async def add_report(self, gid: int, reporter_id: int, target_id: int, reason: str) -> str:
-        now  = datetime.now(timezone.utc)
-        last = await self.reports.find_one({"guild_id": gid}, sort=[("report_number", -1)])
-        num  = (last.get("report_number", 0) if last else 0) + 1
+        now = datetime.now(timezone.utc)
+        num = await self.next_counter(gid, "report_number")
         await self.reports.insert_one({
             "guild_id": gid, "report_number": num,
             "reporter_id": reporter_id, "target_id": target_id,
@@ -1015,10 +1090,23 @@ EMOJI_RE = re.compile(
 
 ZALGO_THRESHOLD     = 5     # combining marks in one message before it's "zalgo" (was 8)
 MENTION_THRESHOLD   = 3     # unique user + role mentions before it's "mention spam" (was 4)
-FLOOD_WINDOW_SEC    = 3.0   # burst window — tightened from 4.0s for faster flood detection
-FLOOD_MAX_MESSAGES  = 4     # messages allowed in that window (was 6)
-DUPLICATE_WINDOW_SEC = 20.0 # window for repeated/near-identical content (was 15.0 — wider net)
-DUPLICATE_MAX_COUNT  = 2    # identical messages allowed in that window — strict (unchanged)
+FLOOD_WINDOW_SEC    = 6.0   # burst window — widened so fast (but legitimate) typers aren't caught
+FLOOD_MAX_MESSAGES  = 10    # messages allowed in that window — raw speed alone is a weak spam signal
+DUPLICATE_WINDOW_SEC  = 20.0  # window for repeated/near-identical content
+DUPLICATE_MAX_COUNT   = 5    # repeats of a normal/longer message allowed before it's flagged as spam
+DUPLICATE_SHORT_COUNT = 8    # repeats allowed for short/common messages ("hi", "lol", "ok"...) —
+                              # short chat-filler is extremely common between real humans, so it
+                              # gets a much higher bar before automod treats it as spam
+DUPLICATE_SHORT_MAX_LEN = 6  # a normalized message at/under this length is "short" for the above
+COMMON_SHORT_PHRASES = {
+    # common short replies/greetings that should basically never count as spam,
+    # no matter how many times they're repeated back and forth in a chatty channel
+    "hi", "hey", "hello", "yo", "sup", "lol", "lmao", "lmfao", "rofl",
+    "ok", "okay", "k", "kk", "yes", "no", "yep", "yup", "nope", "nah",
+    "gg", "gz", "gn", "gm", "ty", "thx", "thanks", "np", "bye", "cya",
+    "haha", "hahaha", "xd", ":)", ":(", "<3", "this", "same",
+    "true", "facts", "real", "fr", "ratio", "based", "💀", "😭", "🔥",
+}
 CAPS_MIN_LENGTH      = 8    # messages shorter than this are never flagged for caps (was 10)
 CAPS_RATIO_THRESHOLD = 0.6  # 60%+ uppercase letters trips it (was 0.7 — stricter)
 EMOJI_MAX_COUNT      = 5    # emoji (unicode or custom) allowed in one message (was 8 — fewer emojis)
@@ -1039,7 +1127,7 @@ SCAM_DOMAINS = {
     "discord-app.net", "discordapp.net", "discod.gg",
 }
 
-_msg_history: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=12))
+_msg_history: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=20))
 
 
 def _normalize(content: str) -> str:
@@ -1048,7 +1136,10 @@ def _normalize(content: str) -> str:
 
 def _is_flooding(key: tuple[int, int], content: str) -> bool:
     """Smart spam check: weighs duplicate content much more heavily than raw speed,
-    so a fast typer sending varied messages is never flagged."""
+    so a fast typer sending varied messages is never flagged. Short, extremely
+    common chat replies ("hi", "lol", "ok"...) get a much higher repeat
+    allowance — two people saying "Hi" back and forth a few times is normal
+    conversation, not spam."""
     now  = time.monotonic()
     norm = _normalize(content)
     hist = _msg_history[key]
@@ -1056,7 +1147,11 @@ def _is_flooding(key: tuple[int, int], content: str) -> bool:
 
     if norm:
         dup_count = sum(1 for t, c in hist if now - t <= DUPLICATE_WINDOW_SEC and c == norm)
-        if dup_count >= DUPLICATE_MAX_COUNT:
+        if norm in COMMON_SHORT_PHRASES or len(norm) <= DUPLICATE_SHORT_MAX_LEN:
+            limit = DUPLICATE_SHORT_COUNT
+        else:
+            limit = DUPLICATE_MAX_COUNT
+        if dup_count >= limit:
             return True
 
     flood_count = sum(1 for t, _ in hist if now - t <= FLOOD_WINDOW_SEC)
@@ -1132,18 +1227,17 @@ async def run_automod(message: discord.Message, config: dict, allow_invites: boo
 
 def _escalation_for_warns(warns: int) -> Optional[int]:
     """Returns a timeout duration in seconds for the given active automod-warn
-    count, capped at 1 hour, or None if it shouldn't trigger a mute yet. Never
-    bans or kicks — automod is mute-only, by design. Every automod rule warns
-    and deletes first, every time — this ladder is what eventually escalates
-    repeat offenders to a timeout, regardless of which rule(s) they tripped.
-    Tightened (was 3/5/8) so repeat offenders get muted sooner."""
-    if warns >= 6:
-        return 3600
-    if warns >= 4:
-        return 900
-    if warns >= 2:
-        return 300
-    return None
+    count, or None if it shouldn't trigger a mute yet. Never bans or kicks —
+    automod is mute-only, by design. Every automod rule warns and deletes
+    first, every time — this ladder is what eventually escalates repeat
+    offenders to a timeout, regardless of which rule(s) they tripped.
+    Starts at 5 minutes on the 3rd active warn, then climbs gently for every
+    extra warn beyond that (3=5m, 4=10m, 5=15m, 6=20m, ... capped at 1h)."""
+    if warns < 3:
+        return None
+    tier = warns - 3  # 0 at warns==3, 1 at warns==4, etc.
+    seconds = 300 + (tier * 300)  # +5m per extra warn past the 3rd
+    return min(seconds, 3600)
 
 
 def _format_duration(seconds: int) -> str:
@@ -1182,16 +1276,22 @@ async def handle_automod_violation(message: discord.Message, config: dict, reaso
             await member.timeout(timedelta(minutes=30), reason=f"Staff automod abuse: {reason}")
         except discord.Forbidden:
             pass
-        log_chan_id = config.get("automod_log_channel")
+        log_chan_id = config.get("automod_log_channel") or config.get("modlog_channel")
         if log_chan_id:
             chan = message.guild.get_channel(log_chan_id)
             if chan:
+                embed = discord.Embed(
+                    title="🚨 Staff Abuse Detected",
+                    description=f"{member.mention} tripped automod while holding staff role(s).",
+                    color=discord.Color.dark_red(),
+                )
+                embed.add_field(name="Trigger", value=reason, inline=False)
+                embed.add_field(name="Role(s) stripped", value=", ".join(stripped) or "unknown", inline=True)
+                embed.add_field(name="Action", value="🔇 Muted 30m", inline=True)
+                embed.set_footer(text=f"{member} • {member.id}")
+                embed.timestamp = datetime.now(timezone.utc)
                 try:
-                    await chan.send(
-                        f"🚨 **Staff abuse detected** — {member.mention} tripped automod (**{reason}**) "
-                        f"while holding staff role(s): {', '.join(stripped) or 'unknown'}. "
-                        f"Role(s) stripped and muted 30m."
-                    )
+                    await chan.send(embed=embed)
                 except discord.HTTPException:
                     pass
         try:
@@ -1210,27 +1310,34 @@ async def handle_automod_violation(message: discord.Message, config: dict, reaso
     active = await bot.db.get_active_automod_warns(message.guild.id, message.author.id)
     mute_seconds = _escalation_for_warns(active)
 
-    log_line = (
-        f"🛡️ Deleted a message from {message.author.mention} in {message.channel.mention} "
-        f"— **{reason}**. (automod warns in last 24h: {active})"
-    )
-
+    action_value = None
     if mute_seconds:
         try:
             await message.author.timeout(
                 timedelta(seconds=mute_seconds),
                 reason=f"Automod escalation: {reason} ({active} warns in 24h)",
             )
-            log_line += f" → 🔇 muted for **{_format_duration(mute_seconds)}**."
+            action_value = f"🔇 Muted for **{_format_duration(mute_seconds)}**"
         except discord.Forbidden:
-            log_line += " (⚠️ couldn't mute — missing permissions)"
+            action_value = "⚠️ Tried to mute — missing permissions"
 
-    log_chan_id = config.get("automod_log_channel")
+    log_chan_id = config.get("automod_log_channel") or config.get("modlog_channel")
     if log_chan_id:
         chan = message.guild.get_channel(log_chan_id)
         if chan:
+            embed = discord.Embed(
+                title="🛡️ Automod",
+                description=f"Deleted a message from {message.author.mention} in {message.channel.mention}",
+                color=discord.Color.dark_orange() if mute_seconds else discord.Color.gold(),
+            )
+            embed.add_field(name="Reason", value=reason, inline=False)
+            embed.add_field(name="Warns (24h)", value=str(active), inline=True)
+            if action_value:
+                embed.add_field(name="Action", value=action_value, inline=True)
+            embed.set_footer(text=f"{message.author} • {message.author.id}")
+            embed.timestamp = datetime.now(timezone.utc)
             try:
-                await chan.send(log_line)
+                await chan.send(embed=embed)
             except discord.HTTPException:
                 pass
 
@@ -1315,6 +1422,37 @@ def staff_tier_check(min_tier: int):
     return commands.check(predicate)
 
 
+async def validate_mod_target(ctx: commands.Context, target: discord.Member) -> bool:
+    """Shared guard for punitive mod commands (warn/mute/kick/ban/tempban/softban).
+    Blocks: targeting yourself, targeting the bot, targeting the server owner,
+    and targeting another staff member at an equal or higher tier than you
+    (real Discord `administrator` always bypasses this, same as staff_tier_check).
+    Sends a clear reason and returns False if the action should be blocked —
+    callers should `return` immediately when this returns False. Without this,
+    any Trial Mod could `.ban` a Senior Mod or the bot itself with no pushback."""
+    if ctx.author.guild_permissions.administrator:
+        return True
+    if target.id == ctx.author.id:
+        await ctx.send("⛔ You can't target yourself with this command.")
+        return False
+    if target.id == bot.user.id:
+        await ctx.send("⛔ You can't target the bot.")
+        return False
+    if ctx.guild.owner_id and target.id == ctx.guild.owner_id:
+        await ctx.send("⛔ You can't target the server owner.")
+        return False
+    config = await get_config(ctx.guild.id, bot.db)
+    actor_tier = await get_staff_tier(ctx.author, config)
+    target_tier = await get_staff_tier(target, config)
+    if target_tier > TIER_NONE and target_tier >= actor_tier and not target.guild_permissions.administrator:
+        await ctx.send("⛔ You can't take moderation action on a staff member at your tier or above.")
+        return False
+    if target.guild_permissions.administrator:
+        await ctx.send("⛔ You can't take moderation action on an administrator.")
+        return False
+    return True
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ANTI-NUKE — server-wide raid/nuke protection (audit-log based)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1378,12 +1516,19 @@ async def antinuke_contain(member: discord.Member, reason: str) -> list[str]:
     """Instantly strips ALL roles from this one member (snapshotting them
     first for exact restore later) and times them out. Nothing server-wide is
     touched — every other member, role, and channel is completely unaffected.
-    Safe to call even if they're already contained (no-op)."""
+    Safe to call even if they're already contained (no-op). The snapshot is
+    written to the database (not just kept in memory), so a bot restart while
+    someone is contained can never lose the ability to restore them."""
     key = (member.guild.id, member.id)
     if key in _contained_members:
         return []
+    existing = await bot.db.get_containment(member.guild.id, member.id)
+    if existing:
+        return []  # already contained (e.g. from before a restart) — don't re-snapshot stripped roles
     role_ids = [r.id for r in member.roles if not r.is_default()]
-    _contained_members[key] = {"role_ids": role_ids, "reason": reason}
+    snapshot = {"role_ids": role_ids, "reason": reason}
+    _contained_members[key] = snapshot
+    await bot.db.save_containment(member.guild.id, member.id, role_ids, reason)
     removed_names = [r.name for r in member.roles if not r.is_default()]
     try:
         if role_ids:
@@ -1396,11 +1541,16 @@ async def antinuke_contain(member: discord.Member, reason: str) -> list[str]:
 
 
 async def antinuke_release(guild: discord.Guild, user_id: int) -> int:
-    """Restores exactly the roles a contained member had before containment."""
+    """Restores exactly the roles a contained member had before containment.
+    Checks the database first (not just the in-memory cache), so this still
+    works correctly even if the bot restarted since the member was contained."""
     key = (guild.id, user_id)
     snapshot = _contained_members.pop(key, None)
-    if not snapshot:
-        return 0
+    if snapshot is None:
+        doc = await bot.db.get_containment(guild.id, user_id)
+        if not doc:
+            return 0
+        snapshot = {"role_ids": doc["role_ids"], "reason": doc.get("reason", "")}
     member = guild.get_member(user_id)
     if not member:
         return 0
@@ -1413,6 +1563,7 @@ async def antinuke_release(guild: discord.Guild, user_id: int) -> int:
         await member.timeout(None, reason="Anti-nuke containment lifted")
     except discord.Forbidden:
         pass
+    await bot.db.delete_containment(guild.id, user_id)
     return restored
 
 
@@ -1429,7 +1580,7 @@ async def antinuke_punish(guild: discord.Guild, executor: discord.abc.User, reas
     if member:
         stripped = await antinuke_contain(member, reason)
 
-    alert_id = config.get("log_alerts_channel")
+    alert_id = config.get("log_alerts_channel") or config.get("modlog_channel")
     chan = guild.get_channel(alert_id) if alert_id else None
     if chan:
         embed = discord.Embed(
@@ -1634,6 +1785,7 @@ class AjsCrib(commands.Bot):
             logger.error("Could not reach MongoDB with the given MONGO_URI.")
             raise SystemExit(1)
         await self.db.ensure_indexes()
+        await self.db.seed_counters_from_existing()
         logger.info("Connected to MongoDB.")
 
         # persistent ticket button views (survive restarts)
@@ -2344,9 +2496,8 @@ def _automod_status_embed(config: dict) -> discord.Embed:
     log_id = config.get("automod_log_channel")
     lines.append(f"\n📋 Log channel: {f'<#{log_id}>' if log_id else '*not set*'}")
     lines.append(
-        "\n**Escalation (mutes only, never kicks/bans):**\n"
-        "Strike 1 → delete + warn only · Strikes 2-3 → 5m mute · Strikes 4-5 → 15m mute · Strikes 6+ → 1h mute\n"
-        "*Strikes decay automatically — only automod warns in the last 24h count toward escalation.*"
+        "\n**Escalation:** strike 3 → 5m mute, +5m each strike after (max 1h). "
+        "Never kicks or bans. Strikes decay after 24h."
     )
     return discord.Embed(title="🛡️ Automod Settings", color=discord.Color.red(), description="\n".join(lines))
 
@@ -2481,7 +2632,9 @@ class LogsSetupSelect(discord.ui.Select):
             discord.SelectOption(label="Server Logs", value="log_server_channel", emoji="🏠",
                                   description="Channel/role create, delete, update"),
             discord.SelectOption(label="Entry/Exit Logs", value="log_entryexit_channel", emoji="🚪",
-                                  description="Member joins & leaves"),
+                                  description="Member joins (raid screening included)"),
+            discord.SelectOption(label="Invite Tracker", value="invite_log_channel", emoji="📨",
+                                  description="Who invited each new member (set text via .setinvitelog)"),
             discord.SelectOption(label="Bot Logs", value="log_bot_channel", emoji="🤖",
                                   description="Command errors & bot status"),
             discord.SelectOption(label="Ticket Transcripts", value="transcript_channel", emoji="🧾",
@@ -2516,7 +2669,7 @@ class SetupHubSelect(discord.ui.Select):
                                   description="Toggle spam/invite/mention/zalgo filters"),
             discord.SelectOption(label="Tickets", value="tickets", emoji="🎫",
                                   description="Ticket category & support role"),
-            discord.SelectOption(label="Staff Roles (fake perms)", value="staffroles", emoji="🪪",
+            discord.SelectOption(label="Staff Roles", value="staffroles", emoji="🪪",
                                   description="Trial Mod / Mod / Senior Mod / Partnership Manager"),
             discord.SelectOption(label="Logs", value="logs", emoji="📚",
                                   description="Mod, message, automod, server, entry/exit, bot, transcripts"),
@@ -2546,14 +2699,14 @@ class SetupHubSelect(discord.ui.Select):
             )
         elif value == "staffroles":
             embed = discord.Embed(
-                title="🪪 Staff Roles (fake perms)", color=discord.Color.blurple(),
+                title="🪪 Staff Roles", color=discord.Color.blurple(),
                 description=(
-                    "These roles unlock bot commands — they don't need *any* real Discord "
-                    "permissions, so staff can never act outside the bot's logging/limits.\n\n"
+                    "Pick a Discord role for each tier — no special Discord permissions needed, "
+                    "the bot handles access on its own.\n\n"
                     "🟢 **Trial Mod** — `.warn` `.mute` `.purge` `.strikes` `.case`\n"
                     "🔵 **Moderator** — + `.kick` `.ban` `.tempban`\n"
                     "🟣 **Senior Moderator** — + `.clearwarns` `.config` & staff management\n"
-                    "🤝 **Partnership Manager** — may post invite links without tripping anti-invite"
+                    "🤝 **Partnership Manager** — can post invite links"
                 ),
             )
             await interaction.response.send_message(embed=embed, view=StaffRolesView(), ephemeral=True)
@@ -2791,14 +2944,20 @@ async def on_member_join(member: discord.Member):
                 pass
         await _dm_raid_flag(member, action, raid_reason)
 
-        alert_id = config.get("log_alerts_channel")
+        alert_id = config.get("log_alerts_channel") or config.get("modlog_channel")
         chan = member.guild.get_channel(alert_id) if alert_id else None
         if chan:
+            raid_embed = discord.Embed(
+                title="🚨 Anti-Raid Flagged a Join",
+                description=f"{member.mention} (`{member.id}`)",
+                color=discord.Color.red(),
+            )
+            raid_embed.add_field(name="Reason", value=raid_reason, inline=False)
+            raid_embed.add_field(name="Action taken", value=f"`{action}`", inline=True)
+            raid_embed.set_footer(text="Only this account was affected")
+            raid_embed.timestamp = datetime.now(timezone.utc)
             try:
-                await chan.send(
-                    f"🚨 **Anti-raid flagged a join** — {member.mention} (`{member.id}`): {raid_reason}. "
-                    f"Action taken: **{action}**. This only affects this one account."
-                )
+                await chan.send(embed=raid_embed)
             except discord.HTTPException:
                 pass
 
@@ -2808,11 +2967,14 @@ async def on_member_join(member: discord.Member):
             locked_count = await serverwide_lockdown(member.guild, f"auto-triggered: {raid_reason}")
             if chan and locked_count:
                 try:
-                    await chan.send(
-                        f"🔒🚨 **AUTO-LOCKDOWN TRIGGERED** — join-rate burst crossed the severe threshold. "
-                        f"Locked **{locked_count}** text channel(s) server-wide. "
-                        f"Run `{PREFIX}serverunlock` once the raid is handled."
-                    )
+                    await chan.send(embed=discord.Embed(
+                        title="🔒🚨 Auto-Lockdown Triggered",
+                        description=(
+                            f"Join-rate burst crossed the severe threshold — locked **{locked_count}** "
+                            f"text channel(s) server-wide.\nRun `{PREFIX}serverunlock` once the raid is handled."
+                        ),
+                        color=discord.Color.dark_red(),
+                    ))
                 except discord.HTTPException:
                     pass
 
@@ -2826,6 +2988,28 @@ async def on_member_join(member: discord.Member):
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.timestamp = datetime.now(timezone.utc)
     await _send_log(member.guild, config, "log_entryexit_channel", embed=embed)
+
+    # ── Invite tracking — who invited them, stats update, optional announce ──
+    used_invite = await _detect_used_invite(member.guild)
+    inviter = used_invite.inviter if used_invite and used_invite.inviter else None
+    invite_total = None
+    if inviter:
+        is_fake = age_days < 7
+        await bot.db.save_invite(member.guild.id, used_invite.code, inviter.id, used_invite.uses)
+        await bot.db.increment_invite_count(member.guild.id, inviter.id, fake=is_fake)
+        await bot.db.record_member_inviter(member.guild.id, member.id, inviter.id, used_invite.code)
+        invite_total = await bot.db.get_invite_count(member.guild.id, inviter.id)
+
+    invite_tpl = config.get("invite_template")
+    if invite_tpl:
+        chan_id = config.get("invite_log_channel")
+        chan = member.guild.get_channel(chan_id) if chan_id else None
+        if chan:
+            try:
+                invite_embed = _build_invite_embed(invite_tpl, member, member.guild, inviter, invite_total)
+                await chan.send(embed=invite_embed)
+            except discord.HTTPException:
+                pass
 
     # Welcome message — now sent as an embed (avatar + account age) instead
     # of plain text, but the template variables still work the same way.
@@ -2851,32 +3035,20 @@ async def on_member_remove(member: discord.Member):
     config = await get_config(member.guild.id, bot.db)
 
     # Was this a kick? Check the audit log so we don't mislabel voluntary leaves.
+    # Kicks are still fully logged via post_modlog below — only the generic
+    # "member left" announcement is gone, per the no-leave-tracker request.
     entry = await _antinuke_find_executor(member.guild, discord.AuditLogAction.kick, member.id, within_seconds=6)
     if entry:
         await post_modlog(member.guild, "👋 Kick (external)", entry.user,
                            member, entry.reason or "No reason provided", color=discord.Color.orange())
         await antinuke_check(member.guild, "antinuke_bans", "kick", discord.AuditLogAction.kick,
                               member.id, "mass kicking members")
-        embed = discord.Embed(title="👋 Member Kicked", color=discord.Color.orange(),
-                               description=f"{member.mention} (`{member.id}`) was kicked.")
-    else:
-        embed = discord.Embed(title="📤 Member Left", color=discord.Color.red(),
-                               description=f"{member.mention} (`{member.id}`) left the server.")
-    embed.timestamp = datetime.now(timezone.utc)
-    await _send_log(member.guild, config, "log_entryexit_channel", embed=embed)
 
-    # Leave message — now sent as an embed (avatar + account age) instead of
-    # plain text, but the template variables still work the same way.
-    leave_tpl = config.get("leave_template")
-    if leave_tpl:
-        chan_id = config.get("leave_channel") or config.get("log_entryexit_channel")
-        chan = member.guild.get_channel(chan_id) if chan_id else None
-        if chan:
-            try:
-                leave_embed = _build_welcome_leave_embed(leave_tpl, member, member.guild, kind="leave")
-                await chan.send(embed=leave_embed)
-            except discord.HTTPException:
-                pass
+    # Quietly keep invite stats accurate in the background — no announcement,
+    # by design (the invite tracker channel only covers joins).
+    inviter_id = await bot.db.get_inviter_of_member(member.guild.id, member.id)
+    if inviter_id:
+        await bot.db.decrement_invite_count(member.guild.id, inviter_id)
 
 
 @bot.event
@@ -3047,65 +3219,57 @@ async def help_cmd(ctx: commands.Context, category: str = None):
             "emoji": "⭐",
             "title": "Leveling",
             "value": (
-                f"`{PREFIX}rank [@user]` — your rank card + XP progress\n"
-                f"`{PREFIX}leaderboard` — top 10 XP earners\n"
-                f"`{PREFIX}top [xp|voice|messages|invites]` — unified leaderboard with category buttons\n"
-                f"`{PREFIX}achievements [@user]` — unlocked badges\n"
-                f"Voice XP: earn XP passively in voice channels (every 60s, must be unmuted + not alone)\n"
-                f"Daily streaks: message every day for bonus XP"
+                f"`{PREFIX}rank [@user]` — your level + XP\n"
+                f"`{PREFIX}leaderboard` — top 10\n"
+                f"`{PREFIX}top [xp|voice|messages|invites]` — pick a leaderboard\n"
+                f"`{PREFIX}achievements [@user]` — badges\n"
+                f"XP from chatting, voice time, and daily streaks"
             ),
         },
         "mod": {
             "emoji": "🔨",
             "title": "Moderation",
             "value": (
-                f"`{PREFIX}warn @user [reason]` · `{PREFIX}warnings @user` · `{PREFIX}clearwarns @user`\n"
-                f"`{PREFIX}kick @user [reason]` · `{PREFIX}ban @user [reason]`\n"
-                f"`{PREFIX}mute @user 10m [reason]` · `{PREFIX}unmute @user`\n"
-                f"`{PREFIX}tempban @user 1d [reason]`\n"
-                f"`{PREFIX}case <#>` · `{PREFIX}cases @user`\n"
+                f"`{PREFIX}warn` `{PREFIX}warnings` `{PREFIX}clearwarns` @user\n"
+                f"`{PREFIX}kick` `{PREFIX}ban` `{PREFIX}tempban @user 1d`\n"
+                f"`{PREFIX}mute @user 10m` `{PREFIX}unmute`\n"
+                f"`{PREFIX}case <#>` `{PREFIX}cases @user`\n"
                 f"`{PREFIX}purge <1-100>`\n"
-                f"`{PREFIX}lockdown [#ch]` · `{PREFIX}unlock [#ch]` *(Senior+, single channel)*\n"
-                f"`{PREFIX}release <user_id>` *(Senior+, undo anti-nuke)*"
+                f"`{PREFIX}lockdown [#ch]` `{PREFIX}unlock [#ch]` *(Senior+)*\n"
+                f"`{PREFIX}release <user_id>` — undo anti-nuke *(Senior+)*"
             ),
         },
         "automod": {
             "emoji": "🛡️",
             "title": "Automod",
             "value": (
-                f"Catches: spam/flood · invite links · all URLs · mass-mentions · zalgo · caps spam · emoji spam · scam domains\n"
-                f"Action: **every rule** deletes + warns first, no exceptions — escalates to an "
-                f"auto-mute only after repeat warns (never an instant mute, never a kick/ban)\n"
-                f"Strike thresholds (tightened): 2+ → 5m · 4+ → 15m · 6+ → 1h (decay after 24h)\n"
-                f"`{PREFIX}strikes @user` · `{PREFIX}clearstrikes @user`\n"
-                f"Configure via `{PREFIX}quicksetup` → Automod"
+                f"Auto-deletes spam, invites, links, mass mentions, zalgo, caps, scam domains\n"
+                f"Always warns first — mutes only after repeat warns (5m → +5m each time, max 1h)\n"
+                f"`{PREFIX}strikes` `{PREFIX}clearstrikes` @user\n"
+                f"Configure: `{PREFIX}quicksetup`"
             ),
         },
         "raid": {
             "emoji": "🚨",
             "title": "Anti-Raid / Anti-Nuke",
             "value": (
-                f"Per-join screening: account age gate + join-burst detection, action configurable "
-                f"(timeout/kick/log-only), with a best-effort DM explaining the flag\n"
-                f"`{PREFIX}raidage [hours]` — view/set minimum account age to join *(Senior+)*\n"
-                f"A SEVERE join burst auto-triggers a full server-wide lockdown (toggle via config "
-                f"`raidcheck_autolockdown`)\n"
-                f"`{PREFIX}serverlockdown` / `{PREFIX}serverunlock` — manual server-wide lockdown *(Senior+)*\n"
-                f"`{PREFIX}lockdown [#ch]` / `{PREFIX}unlock [#ch]` — single-channel lock *(Senior+)*\n"
-                f"Anti-nuke (mass channel/role delete, ban/kick sprees, webhook spam, admin-perm grants) "
-                f"instantly contains the culprit — strips roles, mutes, DMs them, and alerts the owner. "
-                f"Only the server owner is exempt; staff and admins are NOT."
+                f"**Joins:** screens account age + join speed, then timeout/kick/log *(configurable)*\n"
+                f"`{PREFIX}raidage [hours]` — min account age *(Senior+)*\n"
+                f"**Lockdown:** `{PREFIX}serverlockdown` / `{PREFIX}serverunlock` *(Senior+)*\n"
+                f"`{PREFIX}lockdown [#ch]` / `{PREFIX}unlock [#ch]` — one channel *(Senior+)*\n"
+                f"**Nuke protection:** mass deletes, ban/kick sprees, webhook spam, admin grants → "
+                f"instantly strips + mutes the culprit, alerts owner. Nobody is exempt but the owner."
             ),
         },
         "tickets": {
             "emoji": "🎫",
             "title": "Tickets",
             "value": (
-                f"Members open tickets via the panel button — one open ticket per person\n"
-                f"Staff: **Claim** button (or `{PREFIX}claim`), priority dropdown (or `{PREFIX}priority low|medium|high|urgent`)\n"
-                f"`{PREFIX}tickets` — list every open ticket with priority + claim status\n"
-                f"`{PREFIX}ticketstats` — totals, avg rating, top closers *(Mod+)*\n"
-                f"Auto-close: warns at 24h of inactivity, closes (with transcript) at 48h"
+                f"Members open one via the panel button\n"
+                f"Staff: **Claim** button or `{PREFIX}claim` · priority via dropdown or `{PREFIX}priority low|medium|high|urgent`\n"
+                f"`{PREFIX}tickets` — list open\n"
+                f"`{PREFIX}ticketstats` *(Mod+)*\n"
+                f"Auto-closes after 48h idle (warns at 24h)"
             ),
         },
         "giveaways": {
@@ -3113,48 +3277,41 @@ async def help_cmd(ctx: commands.Context, category: str = None):
             "title": "Giveaways",
             "value": (
                 f"`{PREFIX}gstart <duration> <winners> <prize>` — react 🎉 to enter\n"
-                f"`{PREFIX}gend <message_id>` — end early\n"
-                f"`{PREFIX}greroll <message_id> [count]` — reroll (or use the Reroll button on the ended embed)\n"
-                f"`{PREFIX}gbonus @role <amount>` — bonus entries for a role, stacks across roles *(Mod+)*\n"
-                f"`{PREFIX}gblacklist add|remove @user/@role` — block from entering *(Mod+)*"
+                f"`{PREFIX}gend <message_id>`\n"
+                f"`{PREFIX}greroll <message_id> [count]`\n"
+                f"`{PREFIX}gbonus @role <amount>` *(Mod+)*\n"
+                f"`{PREFIX}gblacklist add|remove @user/@role` *(Mod+)*"
             ),
         },
         "staff": {
             "emoji": "🪪",
             "title": "Staff Tools",
             "value": (
-                f"`{PREFIX}staffactivity` — action counts per staff member (mod-log audit trail)\n"
-                f"`{PREFIX}staffactivity @user` — breakdown for one staffer\n"
-                f"`{PREFIX}staffinactive [days]` — on-demand report: flags staff with 0 actions in X days "
-                f"(default 7), including staff who've never logged a single action *(Senior+)*\n"
-                f"`{PREFIX}staffalert [days|on|off]` — background hourly check that proactively DMs staff "
-                f"once they cross the inactivity threshold *(Senior+)*\n"
-                f"All mod commands are cooldown-gated to prevent spam\n"
-                f"Anyone who trips staff-abuse detection or anti-nuke gets DM'd automatically\n"
-                f"Staff tiers: 🟢 Trial · 🔵 Mod · 🟣 Senior — configure via `{PREFIX}quicksetup`"
+                f"`{PREFIX}staffactivity [@user]` — action counts\n"
+                f"`{PREFIX}staffinactive [days]` — who's gone quiet *(Senior+)*\n"
+                f"`{PREFIX}staffalert [days|on|off]` — auto-DM inactive staff *(Senior+)*\n"
+                f"Tiers: 🟢 Trial · 🔵 Mod · 🟣 Senior — set via `{PREFIX}quicksetup`"
             ),
         },
         "analytics": {
             "emoji": "📊",
             "title": "Analytics",
             "value": (
-                f"`{PREFIX}analytics growth [days]` — daily member count + day-over-day change\n"
-                f"`{PREFIX}analytics activity [days]` — messages per day across the server\n"
-                f"`{PREFIX}analytics joins [days]` — join/leave trends\n"
-                f"Snapshots taken every hour — up to 90 days of history"
+                f"`{PREFIX}analytics growth [days]`\n"
+                f"`{PREFIX}analytics activity [days]`\n"
+                f"`{PREFIX}analytics joins [days]`\n"
+                f"Up to 90 days of history"
             ),
         },
         "setup": {
             "emoji": "⚙️",
             "title": "Setup & Config",
             "value": (
-                f"`{PREFIX}quicksetup` — one-command setup: counter channels + full config hub\n"
-                f"`{PREFIX}setwelcome <template>` — set join embed (`{{user}}` `{{server}}` `{{count}}`)\n"
-                f"`{PREFIX}setleave <template>` — set leave embed\n"
-                f"`{PREFIX}testwelcome` / `{PREFIX}testleave` — preview templates (now shown as embeds "
-                f"with avatar + account age)\n"
-                f"`{PREFIX}config [key] [value]` — raw config viewer/editor *(Admin)*\n"
-                f"`{PREFIX}ping` — latency check"
+                f"`{PREFIX}quicksetup` — counter channels + config hub\n"
+                f"`{PREFIX}setwelcome` / `{PREFIX}setinvitelog <template>` — `{{user}} {{server}} {{count}}`\n"
+                f"`{PREFIX}testwelcome` / `{PREFIX}testinvitelog` — preview\n"
+                f"`{PREFIX}config [key] [value]` *(Admin)*\n"
+                f"`{PREFIX}ping`"
             ),
         },
     }
@@ -3232,6 +3389,27 @@ async def rank_cmd(ctx: commands.Context, member: discord.Member = None):
     embed.add_field(name="Streak", value=f"{data.get('streak', 0)} days", inline=True)
     embed.add_field(name="Voice Time", value=f"{voice_minutes // 60}h {voice_minutes % 60}m", inline=True)
     embed.add_field(name="Progress", value=f"`{bar}` {xp_in}/{xp_need} XP", inline=False)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="achievements", aliases=["badges"])
+async def achievements_cmd(ctx: commands.Context, member: discord.Member = None):
+    """Show a member's unlocked vs locked achievement badges. This command was
+    referenced in .help but never actually wired up — fixed."""
+    member = member or ctx.author
+    data = await bot.db.get_level_data(member.id, ctx.guild.id)
+    unlocked = set((data or {}).get("badges", []))
+    lines = []
+    for a in ACHIEVEMENTS:
+        mark = "✅" if a["id"] in unlocked else "🔒"
+        lines.append(f"{mark} {a['emoji']} **{a['name']}** — {a['desc']}")
+    embed = discord.Embed(
+        title=f"🏅 {member.display_name}'s Achievements",
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text=f"{len(unlocked)}/{len(ACHIEVEMENTS)} unlocked")
     embed.set_thumbnail(url=member.display_avatar.url)
     await ctx.send(embed=embed)
 
@@ -3505,6 +3683,8 @@ async def staffalert_cmd(ctx: commands.Context, setting: str = None):
 @staff_tier_check(TIER_TRIAL)
 @commands.cooldown(3, 10, commands.BucketType.user)
 async def warn_cmd(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
+    if not await validate_mod_target(ctx, member):
+        return
     count = await bot.db.add_warn(ctx.guild.id, member.id, ctx.author.id, reason, source="manual")
     case_num = await bot.db.add_case(ctx.guild.id, "warn", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "warn", member.id)
@@ -3570,7 +3750,13 @@ async def cases_cmd(ctx: commands.Context, member: discord.Member):
 @commands.bot_has_permissions(kick_members=True)
 @commands.cooldown(2, 10, commands.BucketType.user)
 async def kick_cmd(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
-    await member.kick(reason=reason)
+    if not await validate_mod_target(ctx, member):
+        return
+    try:
+        await member.kick(reason=reason)
+    except discord.Forbidden:
+        await ctx.send("⛔ I can't kick that member — their role may be above mine.")
+        return
     case_num = await bot.db.add_case(ctx.guild.id, "kick", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "kick", member.id)
     await ctx.send(f"👋 Kicked {member.mention}. Reason: {reason}")
@@ -3582,7 +3768,13 @@ async def kick_cmd(ctx: commands.Context, member: discord.Member, *, reason: str
 @commands.bot_has_permissions(ban_members=True)
 @commands.cooldown(2, 10, commands.BucketType.user)
 async def ban_cmd(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
-    await member.ban(reason=reason)
+    if not await validate_mod_target(ctx, member):
+        return
+    try:
+        await member.ban(reason=reason)
+    except discord.Forbidden:
+        await ctx.send("⛔ I can't ban that member — their role may be above mine.")
+        return
     case_num = await bot.db.add_case(ctx.guild.id, "ban", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "ban", member.id)
     await ctx.send(f"🔨 Banned {member.mention}. Reason: {reason}")
@@ -3590,15 +3782,25 @@ async def ban_cmd(ctx: commands.Context, member: discord.Member, *, reason: str 
 
 
 def _parse_duration(s: str) -> Optional[timedelta]:
+    """Parses things like 10m, 1h, 1d, 1w into a timedelta. Returns None for
+    anything invalid — including zero, negative, or absurdly large amounts,
+    all of which used to slip through: a negative duration (e.g. "-5m") used
+    to silently produce a negative timedelta, which for `.tempban` meant
+    unban_at landed in the past and the tempban loop undid the ban on its very
+    next tick; an extreme amount (e.g. "999999999999d") used to crash with an
+    uncaught OverflowError instead of a clean "invalid duration" reply."""
     units = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
     try:
         unit = s[-1].lower()
         amount = int(s[:-1])
-        if unit not in units:
+        if unit not in units or amount <= 0:
             return None
-        return timedelta(**{units[unit]: amount})
-    except (ValueError, IndexError):
+        delta = timedelta(**{units[unit]: amount})
+    except (ValueError, IndexError, OverflowError):
         return None
+    if delta > timedelta(days=365 * 5):  # 5 years — generous, but bounded
+        return None
+    return delta
 
 
 @bot.command(name="purge")
@@ -3620,9 +3822,14 @@ async def purge_cmd(ctx: commands.Context, amount: int):
 @commands.bot_has_permissions(moderate_members=True)
 @commands.cooldown(3, 15, commands.BucketType.user)
 async def mute_cmd(ctx: commands.Context, member: discord.Member, duration: str = "10m", *, reason: str = "No reason provided"):
+    if not await validate_mod_target(ctx, member):
+        return
     delta = _parse_duration(duration)
     if not delta:
         await ctx.send("⚠️ Invalid duration. Use formats like `10m`, `1h`, `1d`.")
+        return
+    if delta > timedelta(days=28):
+        await ctx.send("⚠️ Discord's timeout max is 28 days. Use `.tempban` for a longer removal instead.")
         return
     unmute_at = datetime.now(timezone.utc) + delta
     try:
@@ -3657,12 +3864,18 @@ async def unmute_cmd(ctx: commands.Context, member: discord.Member, *, reason: s
 @commands.bot_has_permissions(ban_members=True)
 @commands.cooldown(2, 15, commands.BucketType.user)
 async def tempban_cmd(ctx: commands.Context, member: discord.Member, duration: str, *, reason: str = "No reason provided"):
+    if not await validate_mod_target(ctx, member):
+        return
     delta = _parse_duration(duration)
     if not delta:
         await ctx.send("⚠️ Invalid duration. Use formats like `1h`, `1d`, `1w`.")
         return
     unban_at = datetime.now(timezone.utc) + delta
-    await member.ban(reason=reason)
+    try:
+        await member.ban(reason=reason)
+    except discord.Forbidden:
+        await ctx.send("⛔ I can't ban that member — their role may be above mine.")
+        return
     await bot.db.add_tempban(ctx.guild.id, member.id, ctx.author.id, reason, unban_at)
     case_num = await bot.db.add_case(ctx.guild.id, "tempban", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "tempban", member.id)
@@ -3684,6 +3897,91 @@ async def clearstrikes_cmd(ctx: commands.Context, member: discord.Member):
     """Reset a member's automod strikes back to zero (manual warns are untouched)."""
     n = await bot.db.clear_strikes(ctx.guild.id, member.id)
     await ctx.send(f"🧹 Cleared **{n}** automod strike(s) for {member.mention}.")
+
+
+AUTOMOD_RULES = {
+    "scamlinks":   "automod_scamlinks",
+    "antiinvite":  "automod_antiinvite",
+    "antilink":    "automod_antilink",
+    "mentionspam": "automod_mentionspam",
+    "zalgo":       "automod_zalgo",
+    "capsspam":    "automod_capsspam",
+    "emojispam":   "automod_emojispam",
+    "antispam":    "automod_antispam",
+}
+
+
+@bot.command(name="automod")
+@staff_tier_check(TIER_SENIOR)
+async def automod_cmd(ctx: commands.Context, rule: str = None, setting: str = None):
+    """.automod — view every rule's on/off state.
+    .automod <rule> <on|off> — toggle one rule.
+    Rules: scamlinks, antiinvite, antilink, mentionspam, zalgo, capsspam, emojispam, antispam."""
+    config = await get_config(ctx.guild.id, bot.db)
+    if rule is None:
+        lines = [f"{'🟢' if config.get(key, True) else '🔴'} `{name}` — "
+                 f"{'ON' if config.get(key, True) else 'OFF'}" for name, key in AUTOMOD_RULES.items()]
+        embed = discord.Embed(title="🛡️ Automod Rules", description="\n".join(lines), color=discord.Color.blurple())
+        embed.set_footer(text=f"{PREFIX}automod <rule> <on|off> to toggle one")
+        await ctx.send(embed=embed)
+        return
+    rule = rule.lower()
+    if rule not in AUTOMOD_RULES:
+        await ctx.send(f"⚠️ Unknown rule `{rule}`. Options: {', '.join(AUTOMOD_RULES)}")
+        return
+    if not setting or setting.lower() not in ("on", "off"):
+        await ctx.send(f"⚠️ Usage: `{PREFIX}automod {rule} <on|off>`")
+        return
+    enabled = setting.lower() == "on"
+    await bot.db.update_config(ctx.guild.id, AUTOMOD_RULES[rule], enabled)
+    await ctx.send(f"✅ `{rule}` automod is now **{'ON 🟢' if enabled else 'OFF 🔴'}**.")
+
+
+@bot.command(name="raidmode")
+@staff_tier_check(TIER_SENIOR)
+async def raidmode_cmd(ctx: commands.Context, setting: str = None, action: str = None):
+    """.raidmode — view current anti-raid settings.
+    .raidmode on|off — enable/disable join-rate raid screening entirely.
+    .raidmode action <timeout|kick|log_only> — what happens to a flagged joiner.
+    .raidmode lockdown <on|off> — auto-lockdown the whole server on a severe join burst."""
+    config = await get_config(ctx.guild.id, bot.db)
+    if setting is None:
+        enabled = config.get("raidcheck_enabled", True)
+        cur_action = config.get("raidcheck_action", "timeout")
+        autolock = config.get("raidcheck_autolockdown", True)
+        min_age = config.get("raidcheck_minage_hours", MIN_ACCOUNT_AGE_HOURS_DEFAULT)
+        await ctx.send(embed=discord.Embed(
+            title="🚨 Anti-Raid Settings",
+            description=(
+                f"Status: {'🟢 ON' if enabled else '🔴 OFF'}\n"
+                f"Action on flagged join: `{cur_action}`\n"
+                f"Auto-lockdown on severe burst: {'🟢 ON' if autolock else '🔴 OFF'}\n"
+                f"Minimum account age: `{min_age}h`"
+            ),
+            color=discord.Color.blurple(),
+        ))
+        return
+    setting = setting.lower()
+    if setting in ("on", "off"):
+        await bot.db.update_config(ctx.guild.id, "raidcheck_enabled", setting == "on")
+        await ctx.send(f"✅ Anti-raid screening is now **{'ON' if setting == 'on' else 'OFF'}**.")
+        return
+    if setting == "action":
+        if action not in ("timeout", "kick", "log_only"):
+            await ctx.send(f"⚠️ Usage: `{PREFIX}raidmode action <timeout|kick|log_only>`")
+            return
+        await bot.db.update_config(ctx.guild.id, "raidcheck_action", action)
+        await ctx.send(f"✅ Flagged joins will now trigger: **{action}**.")
+        return
+    if setting == "lockdown":
+        if not action or action.lower() not in ("on", "off"):
+            await ctx.send(f"⚠️ Usage: `{PREFIX}raidmode lockdown <on|off>`")
+            return
+        await bot.db.update_config(ctx.guild.id, "raidcheck_autolockdown", action.lower() == "on")
+        await ctx.send(f"✅ Auto-lockdown on severe raid bursts is now **{action.upper()}**.")
+        return
+    await ctx.send(f"⚠️ Usage: `{PREFIX}raidmode [on|off]`, `{PREFIX}raidmode action <type>`, "
+                    f"or `{PREFIX}raidmode lockdown <on|off>`.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3750,10 +4048,8 @@ async def quicksetup_cmd(ctx: commands.Context):
             f"📁 Category: **{category.name}**\n"
             f"👥 Members tracker: {members_chan.mention}\n"
             f"🚀 Boosts tracker: {boosts_chan.mention}\n\n"
-            "Both update automatically as members join/leave and the server gets boosted "
-            "(Discord limits renames, so they refresh instantly when possible and at least every 10 minutes).\n\n"
-            "**Everything else is configurable below** — level roles, automod, tickets, mod-log, and more. "
-            "Just pick a category from the dropdown."
+            "Both update on their own as people join, leave, or boost.\n\n"
+            "**Want more?** Pick a category below — level roles, automod, tickets, logs, and more."
         ),
     )
     await msg.edit(content=None, embed=embed, view=SetupHubView())
@@ -3771,7 +4067,7 @@ async def lockdown_cmd(ctx: commands.Context, channel: discord.abc.GuildChannel 
     if not locked:
         await ctx.send(f"⚠️ {channel.mention} is already locked. Use `{PREFIX}unlock` to lift it.")
         return
-    await ctx.send(f"🔒 **{channel.mention} locked.** Original permissions snapshotted — `{PREFIX}unlock` restores them exactly.")
+    await ctx.send(f"🔒 **{channel.mention} locked.** Run `{PREFIX}unlock` to restore it.")
 
 
 @bot.command(name="unlock")
@@ -3784,7 +4080,7 @@ async def unlock_cmd(ctx: commands.Context, channel: discord.abc.GuildChannel = 
     if not restored:
         await ctx.send(f"⚠️ {channel.mention} isn't locked.")
         return
-    await ctx.send(f"🔓 **{channel.mention} unlocked.** Permissions restored exactly as they were before.")
+    await ctx.send(f"🔓 **{channel.mention} unlocked.**")
 
 
 @bot.command(name="serverlockdown", aliases=["lockdownall", "raidlock"])
@@ -3845,7 +4141,7 @@ async def release_cmd(ctx: commands.Context, user_id: int):
     anti-nuke caught a false positive."""
     restored = await antinuke_release(ctx.guild, user_id)
     if restored == 0:
-        await ctx.send("⚠️ No containment snapshot found for that user (or they're not in the server).")
+        await ctx.send("⚠️ Nothing to restore for that user — they may not be contained, or already left.")
         return
     await ctx.send(f"🔓 Released <@{user_id}> — restored **{restored}** role(s) and lifted timeout.")
 
@@ -3916,14 +4212,32 @@ async def setwelcome_cmd(ctx: commands.Context, *, template: str):
     await ctx.send(content="✅ Welcome template saved. Preview:", embed=preview)
 
 
-@bot.command(name="setleave")
+@bot.command(name="setinvitelog")
 @commands.has_permissions(administrator=True)
-async def setleave_cmd(ctx: commands.Context, *, template: str):
-    """Set the leave message. Variables: {user} {user.id} {server} {count} {mention}.
-    Now sent as an embed with avatar + account age, not plain text."""
-    await bot.db.update_config(ctx.guild.id, "leave_template", template)
-    preview = _build_welcome_leave_embed(template, ctx.author, ctx.guild, kind="leave")
-    await ctx.send(content="✅ Leave template saved. Preview:", embed=preview)
+async def setinvitelog_cmd(ctx: commands.Context, *, template: str):
+    """Set the invite-tracker join message, posted whenever someone joins via
+    a tracked invite. Variables: {user} {user.id} {server} {count} {mention}
+    {inviter} {invites}. Point it at a channel with the setup wizard's
+    'Invite Tracker' log, or `.config invite_log_channel <channel_id>`."""
+    await bot.db.update_config(ctx.guild.id, "invite_template", template)
+    sample_total = await bot.db.get_invite_count(ctx.guild.id, ctx.author.id)
+    preview = _build_invite_embed(template, ctx.author, ctx.guild, ctx.author, sample_total)
+    await ctx.send(content="✅ Invite tracker template saved. Preview:", embed=preview)
+
+
+@bot.command(name="testinvitelog")
+@commands.has_permissions(administrator=True)
+async def testinvitelog_cmd(ctx: commands.Context):
+    config = await bot.db.get_config(ctx.guild.id)
+    tpl = config.get("invite_template")
+    if not tpl:
+        await ctx.send(f"No invite tracker template set. Use `{PREFIX}setinvitelog <message>`.")
+        return
+    chan_id = config.get("invite_log_channel")
+    chan = ctx.guild.get_channel(chan_id) if chan_id else ctx.channel
+    sample_total = await bot.db.get_invite_count(ctx.guild.id, ctx.author.id)
+    embed = _build_invite_embed(tpl, ctx.author, ctx.guild, ctx.author, sample_total)
+    await (chan or ctx.channel).send(embed=embed)
 
 
 @bot.command(name="testwelcome")
@@ -3937,20 +4251,6 @@ async def testwelcome_cmd(ctx: commands.Context):
     chan_id = config.get("welcome_channel") or config.get("log_entryexit_channel")
     chan = ctx.guild.get_channel(chan_id) if chan_id else ctx.channel
     embed = _build_welcome_leave_embed(tpl, ctx.author, ctx.guild, kind="welcome")
-    await (chan or ctx.channel).send(embed=embed)
-
-
-@bot.command(name="testleave")
-@commands.has_permissions(administrator=True)
-async def testleave_cmd(ctx: commands.Context):
-    config = await bot.db.get_config(ctx.guild.id)
-    tpl = config.get("leave_template")
-    if not tpl:
-        await ctx.send(f"No leave template set. Use `{PREFIX}setleave <message>`.")
-        return
-    chan_id = config.get("leave_channel") or config.get("log_entryexit_channel")
-    chan = ctx.guild.get_channel(chan_id) if chan_id else ctx.channel
-    embed = _build_welcome_leave_embed(tpl, ctx.author, ctx.guild, kind="leave")
     await (chan or ctx.channel).send(embed=embed)
 
 
@@ -3992,6 +4292,48 @@ def _build_welcome_leave_embed(template: str, member: discord.Member, guild: dis
     return embed
 
 
+def _build_invite_embed(template: str, member: discord.Member, guild: discord.Guild,
+                         inviter: Optional[discord.abc.User], invite_total: Optional[int]) -> discord.Embed:
+    """Builds the invite-tracker embed shown when a member joins via a tracked
+    invite. Supports the same {user} {user.id} {server} {count} {mention}
+    variables as welcome/leave, plus {inviter} and {invites} (the inviter's
+    new running total)."""
+    description = (
+        _render_template(template, member, guild)
+        .replace("{inviter}", inviter.mention if inviter else "an unknown/vanity invite")
+        .replace("{invites}", str(invite_total) if invite_total is not None else "?")
+    )
+    embed = discord.Embed(title="📨 Invite Tracker", description=description, color=discord.Color.blurple())
+    if inviter:
+        embed.add_field(name="Invited by", value=f"{inviter.mention} ({invite_total or 0} total)", inline=True)
+    else:
+        embed.add_field(name="Invited by", value="Unknown / vanity URL", inline=True)
+    embed.add_field(name="Member #", value=str(guild.member_count), inline=True)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text=f"{member} • {member.id}")
+    embed.timestamp = datetime.now(timezone.utc)
+    return embed
+
+
+def _coerce_config_value(value: str):
+    """Raw `.config` input always arrives as a string, but most config reads
+    expect a real bool or int (e.g. `config.get("automod_capsspam", True)`,
+    `guild.get_channel(config.get("modlog_channel"))`). Without this, setting
+    `.config automod_capsspam false` stored the literal string "false" —
+    which Python treats as truthy — so the toggle silently did nothing, and
+    `.config modlog_channel 123456` stored a string channel ID that
+    `get_channel()` can never match. This makes `.config` behave identically
+    to the dropdown UI for the same keys."""
+    low = value.strip().lower()
+    if low in ("true", "on", "yes", "enable", "enabled"):
+        return True
+    if low in ("false", "off", "no", "disable", "disabled"):
+        return False
+    if value.lstrip("-").isdigit():
+        return int(value)
+    return value
+
+
 @bot.command(name="config")
 @commands.has_permissions(administrator=True)
 async def config_cmd(ctx: commands.Context, key: str = None, value: str = None):
@@ -4007,8 +4349,9 @@ async def config_cmd(ctx: commands.Context, key: str = None, value: str = None):
         config = await bot.db.get_config(ctx.guild.id)
         await ctx.send(f"`{key}` = `{config.get(key, 'not set')}`")
         return
-    await bot.db.update_config(ctx.guild.id, key, value)
-    await ctx.send(f"✅ Set `{key}` = `{value}`")
+    parsed = _coerce_config_value(value)
+    await bot.db.update_config(ctx.guild.id, key, parsed)
+    await ctx.send(f"✅ Set `{key}` = `{parsed}` ({type(parsed).__name__})")
 
 
 
@@ -4086,12 +4429,19 @@ async def slowmode_cmd(ctx: commands.Context, channel: Optional[discord.TextChan
 async def softban_cmd(ctx: commands.Context, member: discord.Member, delete_days: int = 1, *, reason: str = "No reason provided"):
     """Ban then immediately unban — wipes their recent messages without a permanent ban.
     delete_days controls how many days of messages to prune (1-7, default 1)."""
+    if not await validate_mod_target(ctx, member):
+        return
     delete_days = max(1, min(delete_days, 7))
     try:
-        await member.ban(reason=f"Softban by {ctx.author}: {reason}", delete_message_days=delete_days)
+        # delete_message_seconds is the current discord.py API — delete_message_days
+        # is deprecated and not guaranteed to keep working across library versions.
+        await member.ban(reason=f"Softban by {ctx.author}: {reason}", delete_message_seconds=delete_days * 86400)
         await ctx.guild.unban(member, reason="Softban — lifting immediately")
     except discord.Forbidden:
-        await ctx.send("⛔ Missing permissions to ban that member.")
+        await ctx.send("⛔ I can't do that — their role may be above mine, or I'm missing ban permissions.")
+        return
+    except discord.HTTPException as e:
+        await ctx.send(f"⚠️ Softban failed: {e}")
         return
     case_num = await bot.db.add_case(ctx.guild.id, "softban", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "softban", member.id)
@@ -4273,10 +4623,15 @@ def _entries_for_member(member: discord.Member, config: dict) -> int:
 async def _weighted_pick(guild: discord.Guild, entrants: list[int], config: dict, k: int) -> list[int]:
     """Builds a weighted pool (each entrant appears `_entries_for_member` times)
     and samples without replacement. Falls back to flat random.sample if a
-    member has left the server (their entry just counts as 1, no bonus)."""
+    member has left the server (their entry just counts as 1, no bonus).
+    Re-checks the blacklist here (not just at reaction time) so a user/role
+    blacklisted *after* entering — or already blacklisted but still present
+    in an older entrants list — can never actually win."""
     pool: list[int] = []
     for uid in entrants:
         member = guild.get_member(uid)
+        if member and _is_giveaway_blacklisted(member, config):
+            continue
         weight = _entries_for_member(member, config) if member else 1
         pool.extend([uid] * weight)
     if not pool:
