@@ -14,10 +14,13 @@ Run with:  python bot.py
 """
 
 import os
+import re
 import math
 import time
+import random
 import asyncio
 import logging
+from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -193,6 +196,7 @@ class Database:
         self.tempbans       = db["tempbans"]
         self.reports        = db["reports"]
         self.ticket_ratings = db["ticket_ratings"]
+        self.automod_strikes = db["automod_strikes"]
 
     @property
     def db(self):
@@ -248,6 +252,7 @@ class Database:
             await self.tempbans.create_index([("guild_id", 1), ("user_id", 1)], background=True)
             await self.reports.create_index([("guild_id", 1), ("created_at", -1)], background=True)
             await self.ticket_ratings.create_index([("guild_id", 1), ("ticket_id", 1)], background=True)
+            await self.automod_strikes.create_index([("guild_id", 1), ("user_id", 1)], unique=True, background=True)
             logger.info("Indexes ready")
         except Exception as exc:
             logger.error("Index error: %s", exc)
@@ -726,6 +731,35 @@ class Database:
             upsert=True,
         )
 
+    # ── Automod Strikes ───────────────────────────────────────────────────────
+    # Strikes decay automatically — only strikes from the last 24h count toward
+    # escalation, so a user who behaves doesn't stay punished forever.
+
+    async def add_strike(self, gid: int, uid: int) -> int:
+        """Record a new automod violation and return the active (un-decayed) strike count."""
+        now    = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=24)
+        doc    = await self.automod_strikes.find_one({"guild_id": gid, "user_id": uid})
+        active = [t for t in (doc.get("strikes", []) if doc else []) if t > cutoff]
+        active.append(now)
+        await self.automod_strikes.update_one(
+            {"guild_id": gid, "user_id": uid},
+            {"$set": {"strikes": active}},
+            upsert=True,
+        )
+        return len(active)
+
+    async def get_active_strikes(self, gid: int, uid: int) -> int:
+        now    = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=24)
+        doc    = await self.automod_strikes.find_one({"guild_id": gid, "user_id": uid})
+        if not doc:
+            return 0
+        return len([t for t in doc.get("strikes", []) if t > cutoff])
+
+    async def clear_strikes(self, gid: int, uid: int):
+        await self.automod_strikes.delete_one({"guild_id": gid, "user_id": uid})
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ACHIEVEMENT CHECKER
@@ -805,6 +839,153 @@ async def apply_level_roles(member, db: Database, new_level: int) -> Optional[st
                     break
 
     return exact_reward
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AUTOMOD — smart spam / invite / mention / zalgo detection
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Design goals:
+#   - Never punish fast typers. Plain message-rate limits are the classic way
+#     automods nuke legitimate chatty users, so flood detection requires a HIGH
+#     burst rate (6+ messages in 4s) and weighs repeated/duplicate content far
+#     more heavily than distinct fast messages.
+#   - Action is delete-only on the first hit. Repeat offenders accumulate
+#     strikes that decay after 24h, and only strikes escalate to a timeout.
+#     There are no kicks or bans from automod — ever.
+
+AUTOMOD_DEFAULTS = {
+    "antispam":    True,
+    "antiinvite":  True,
+    "mentionspam": True,
+    "zalgo":       True,
+}
+
+INVITE_RE = re.compile(
+    r"(?:discord\.gg|discord(?:app)?\.com/invite)/[a-zA-Z0-9-]+", re.IGNORECASE
+)
+ZALGO_RE = re.compile(r"[\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff]")
+
+ZALGO_THRESHOLD     = 8     # combining marks in one message before it's "zalgo"
+MENTION_THRESHOLD   = 5     # unique user + role mentions before it's "mention spam"
+FLOOD_WINDOW_SEC    = 4.0   # burst window
+FLOOD_MAX_MESSAGES  = 6     # messages allowed in that window (generous — real typers won't hit this)
+DUPLICATE_WINDOW_SEC = 12.0 # window for repeated/near-identical content
+DUPLICATE_MAX_COUNT  = 3    # identical messages allowed in that window
+
+_msg_history: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=8))
+
+
+def _normalize(content: str) -> str:
+    return re.sub(r"\s+", " ", content.strip().lower())
+
+
+def _is_flooding(key: tuple[int, int], content: str) -> bool:
+    """Smart spam check: weighs duplicate content much more heavily than raw speed,
+    so a fast typer sending varied messages is never flagged."""
+    now  = time.monotonic()
+    norm = _normalize(content)
+    hist = _msg_history[key]
+    hist.append((now, norm))
+
+    if norm:
+        dup_count = sum(1 for t, c in hist if now - t <= DUPLICATE_WINDOW_SEC and c == norm)
+        if dup_count >= DUPLICATE_MAX_COUNT:
+            return True
+
+    flood_count = sum(1 for t, _ in hist if now - t <= FLOOD_WINDOW_SEC)
+    return flood_count >= FLOOD_MAX_MESSAGES
+
+
+def _has_invite(content: str) -> bool:
+    return bool(INVITE_RE.search(content))
+
+
+def _is_mention_spam(message: discord.Message) -> bool:
+    total = len(message.raw_mentions) + len(message.raw_role_mentions)
+    return total >= MENTION_THRESHOLD
+
+
+def _is_zalgo(content: str) -> bool:
+    return len(ZALGO_RE.findall(content)) >= ZALGO_THRESHOLD
+
+
+async def run_automod(message: discord.Message, config: dict) -> Optional[str]:
+    """Returns a human-readable violation reason, or None if the message is clean."""
+    content = message.content or ""
+
+    if config.get("automod_antiinvite", True) and _has_invite(content):
+        return "posting an unauthorized invite link"
+
+    if config.get("automod_mentionspam", True) and _is_mention_spam(message):
+        return "mass-mention spam"
+
+    if config.get("automod_zalgo", True) and _is_zalgo(content):
+        return "zalgo/unicode spam"
+
+    if config.get("automod_antispam", True):
+        key = (message.guild.id, message.author.id)
+        if _is_flooding(key, content):
+            return "message flooding/spam"
+
+    return None
+
+
+def _escalation_for_strikes(strikes: int) -> Optional[int]:
+    """Returns a timeout duration in seconds for the given strike count, capped at
+    1 hour, or None if this strike count shouldn't trigger a mute yet. Never bans
+    or kicks — automod is mute-only, by design."""
+    if strikes >= 8:
+        return 3600
+    if strikes >= 5:
+        return 900
+    if strikes >= 3:
+        return 300
+    return None
+
+
+def _format_duration(seconds: int) -> str:
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+async def handle_automod_violation(message: discord.Message, config: dict, reason: str):
+    """Deletes the offending message, records a strike, and escalates to a mute
+    (never a kick/ban) if the user's active strike count crosses a threshold."""
+    try:
+        await message.delete()
+    except discord.HTTPException:
+        pass
+
+    strikes = await bot.db.add_strike(message.guild.id, message.author.id)
+    mute_seconds = _escalation_for_strikes(strikes)
+
+    log_line = (
+        f"🛡️ Deleted a message from {message.author.mention} in {message.channel.mention} "
+        f"— **{reason}**. (active strikes: {strikes})"
+    )
+
+    if mute_seconds:
+        try:
+            await message.author.timeout(
+                timedelta(seconds=mute_seconds),
+                reason=f"Automod escalation: {reason} (strike {strikes})",
+            )
+            log_line += f" → 🔇 muted for **{_format_duration(mute_seconds)}**."
+        except discord.Forbidden:
+            log_line += " (⚠️ couldn't mute — missing permissions)"
+
+    log_chan_id = config.get("automod_log_channel")
+    if log_chan_id:
+        chan = message.guild.get_channel(log_chan_id)
+        if chan:
+            try:
+                await chan.send(log_line)
+            except discord.HTTPException:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -915,7 +1096,6 @@ class AjsCrib(commands.Bot):
                     continue
                 entrants = doc.get("entrants", [])
                 winners_n = doc.get("winners", 1)
-                import random
                 winners = random.sample(entrants, k=min(winners_n, len(entrants))) if entrants else []
                 if winners:
                     mention_str = ", ".join(f"<@{w}>" for w in winners)
@@ -1079,57 +1259,367 @@ async def _detect_used_invite(guild: discord.Guild) -> Optional[discord.Invite]:
 #  SETUP WIZARD HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def _wizard_wait(ctx: commands.Context, prompt: str, timeout: int = 90) -> Optional[discord.Message]:
-    await ctx.send(prompt)
-    try:
-        return await bot.wait_for(
-            "message",
-            timeout=timeout,
-            check=lambda m: m.author.id == ctx.author.id and m.channel.id == ctx.channel.id,
+# ═══════════════════════════════════════════════════════════════════════════════
+#  INTERACTIVE SETUP — dropdown-driven configuration (no typing required)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _admin_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("⛔ Admins only.", ephemeral=True)
+            return False
+        return True
+    return predicate
+
+
+class CloseButtonView(discord.ui.View):
+    """A simple 'done' button to dismiss a setup panel."""
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.button(label="Done", emoji="✅", style=discord.ButtonStyle.secondary)
+    async def done(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="✅ Saved.", embed=None, view=None)
+
+
+class ChannelPickSelect(discord.ui.ChannelSelect):
+    """Generic single-channel picker that writes straight to guild config."""
+    def __init__(self, config_key: str, label: str, channel_types=None):
+        super().__init__(
+            placeholder=f"Select a channel for {label}...",
+            channel_types=channel_types or [discord.ChannelType.text],
+            min_values=1, max_values=1,
         )
-    except asyncio.TimeoutError:
-        await ctx.send("⌛ Timed out — skipping this step.")
-        return None
+        self.config_key = config_key
+        self.label_text = label
+
+    async def callback(self, interaction: discord.Interaction):
+        channel = self.values[0]
+        await bot.db.update_config(interaction.guild.id, self.config_key, channel.id)
+        await interaction.response.edit_message(
+            content=f"✅ **{self.label_text}** set to <#{channel.id}>.", view=CloseButtonView(),
+        )
 
 
-async def _wizard_channel(ctx: commands.Context, prompt: str):
-    msg = await _wizard_wait(ctx, prompt)
-    if msg is None or msg.content.strip().lower() == "skip":
-        return None
-    if msg.channel_mentions:
-        return msg.channel_mentions[0]
-    try:
-        cid = int(msg.content.strip().strip("<#>"))
-        return ctx.guild.get_channel(cid)
-    except ValueError:
-        return None
+class ChannelPickView(discord.ui.View):
+    def __init__(self, config_key: str, label: str, channel_types=None):
+        super().__init__(timeout=180)
+        self.add_item(ChannelPickSelect(config_key, label, channel_types))
 
 
-async def _wizard_role(ctx: commands.Context, prompt: str) -> Optional[discord.Role]:
-    msg = await _wizard_wait(ctx, prompt)
-    if msg is None or msg.content.strip().lower() == "skip":
-        return None
-    if msg.role_mentions:
-        return msg.role_mentions[0]
-    name = msg.content.strip()
-    try:
-        rid = int(name.strip("<@&>"))
-        role = ctx.guild.get_role(rid)
-        if role:
-            return role
-    except ValueError:
-        pass
-    return discord.utils.find(lambda r: r.name.lower() == name.lower(), ctx.guild.roles)
+class RolePickSelect(discord.ui.RoleSelect):
+    """Generic role picker (single or multi) that writes straight to guild config."""
+    def __init__(self, config_key: str, label: str, max_values: int = 1):
+        super().__init__(
+            placeholder=f"Select role(s) for {label}...",
+            min_values=1, max_values=max_values,
+        )
+        self.config_key = config_key
+        self.label_text = label
+
+    async def callback(self, interaction: discord.Interaction):
+        roles = self.values
+        if self.max_values == 1:
+            await bot.db.update_config(interaction.guild.id, self.config_key, roles[0].id)
+            msg = f"✅ **{self.label_text}** set to {roles[0].mention}."
+        else:
+            await bot.db.update_config(interaction.guild.id, self.config_key, [r.id for r in roles])
+            msg = f"✅ **{self.label_text}** set to: " + ", ".join(r.mention for r in roles)
+        await interaction.response.edit_message(content=msg, view=CloseButtonView())
 
 
-async def _wizard_text(ctx: commands.Context, prompt: str) -> Optional[str]:
-    msg = await _wizard_wait(ctx, prompt)
-    if msg is None:
-        return None
-    content = msg.content.strip()
-    if content.lower() in ("skip", "default"):
-        return None
-    return content
+class RolePickView(discord.ui.View):
+    def __init__(self, config_key: str, label: str, max_values: int = 1):
+        super().__init__(timeout=180)
+        self.add_item(RolePickSelect(config_key, label, max_values))
+
+
+# ── Level Roles configuration ────────────────────────────────────────────────
+
+LEVEL_PRESETS = [1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100]
+
+
+async def _build_ladder_text(guild: discord.Guild) -> str:
+    config = await get_config(guild.id, bot.db)
+    rows = config.get("level_roles", [])
+    if not rows:
+        return "*No custom level roles configured yet — the built-in default ladder is being used.*"
+    lines = []
+    for entry in sorted(rows, key=lambda r: r["level"]):
+        role = guild.get_role(entry["role_id"])
+        lines.append(f"**Level {entry['level']}** → {role.mention if role else '*(deleted role)*'}")
+    return "\n".join(lines)
+
+
+class CustomLevelModal(discord.ui.Modal, title="Custom Level"):
+    level_input = discord.ui.TextInput(label="Level number", placeholder="e.g. 42", max_length=5)
+
+    def __init__(self, parent_view: "LevelRolesView"):
+        super().__init__()
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            n = int(self.level_input.value.strip())
+            if n <= 0:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message("⚠️ That's not a valid level number.", ephemeral=True)
+            return
+        self.parent_view.selected_level = n
+        await interaction.response.send_message(
+            f"Level set to **{n}**. Now pick the role(s) to award using the dropdown below.",
+            ephemeral=True,
+        )
+
+
+class LevelSelect(discord.ui.Select):
+    def __init__(self, parent_view: "LevelRolesView"):
+        options = [discord.SelectOption(label=f"Level {n}", value=str(n)) for n in LEVEL_PRESETS]
+        options.append(discord.SelectOption(label="Custom level…", value="custom", emoji="✏️"))
+        super().__init__(placeholder="1️⃣ Pick a level...", options=options)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "custom":
+            await interaction.response.send_modal(CustomLevelModal(self.parent_view))
+            return
+        self.parent_view.selected_level = int(self.values[0])
+        await interaction.response.send_message(
+            f"Level set to **{self.values[0]}**. Now pick role(s) to award using the second dropdown.",
+            ephemeral=True,
+        )
+
+
+class LevelRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, parent_view: "LevelRolesView"):
+        super().__init__(
+            placeholder="2️⃣ Pick role(s) to award (multi-select)...",
+            min_values=1, max_values=10,
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.parent_view.selected_level is None:
+            await interaction.response.send_message("⚠️ Pick a level first (first dropdown).", ephemeral=True)
+            return
+        level = self.parent_view.selected_level
+        config = await get_config(interaction.guild.id, bot.db)
+        rows = [r for r in config.get("level_roles", []) if r["level"] != level]
+        for role in self.values:
+            rows.append({"level": level, "role_id": role.id})
+        await bot.db.update_config(interaction.guild.id, "level_roles", rows)
+        mentions = ", ".join(r.mention for r in self.values)
+        ladder = await _build_ladder_text(interaction.guild)
+        embed = discord.Embed(
+            title="⭐ Level Roles", color=discord.Color.gold(),
+            description=f"✅ Level **{level}** now awards: {mentions}\n\n**Current ladder:**\n{ladder}",
+        )
+        await interaction.response.edit_message(embed=embed, view=self.parent_view)
+
+
+class RemoveLevelSelect(discord.ui.Select):
+    def __init__(self, rows: list):
+        options = [
+            discord.SelectOption(label=f"Level {r['level']}", value=str(r["level"]))
+            for r in sorted(rows, key=lambda r: r["level"])
+        ][:25]
+        super().__init__(placeholder="🗑️ Remove a configured level...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        level = int(self.values[0])
+        config = await get_config(interaction.guild.id, bot.db)
+        rows = [r for r in config.get("level_roles", []) if r["level"] != level]
+        await bot.db.update_config(interaction.guild.id, "level_roles", rows)
+        ladder = await _build_ladder_text(interaction.guild)
+        embed = discord.Embed(
+            title="⭐ Level Roles", color=discord.Color.gold(),
+            description=f"🗑️ Removed level **{level}**.\n\n**Current ladder:**\n{ladder}",
+        )
+        await interaction.response.edit_message(embed=embed, view=LevelRolesView())
+
+
+class LevelRolesView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.selected_level: Optional[int] = None
+        self.add_item(LevelSelect(self))
+        self.add_item(LevelRoleSelect(self))
+
+    @discord.ui.button(label="Manage / Remove a Level", emoji="🗑️", style=discord.ButtonStyle.secondary, row=2)
+    async def manage(self, interaction: discord.Interaction, button: discord.ui.Button):
+        config = await get_config(interaction.guild.id, bot.db)
+        rows = config.get("level_roles", [])
+        if not rows:
+            await interaction.response.send_message("No custom level roles configured yet.", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=180)
+        view.add_item(RemoveLevelSelect(rows))
+        await interaction.response.send_message("Pick a level to remove:", view=view, ephemeral=True)
+
+    @discord.ui.button(label="Done", emoji="✅", style=discord.ButtonStyle.success, row=2)
+    async def done(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(view=None)
+
+
+# ── Automod configuration ────────────────────────────────────────────────────
+
+AUTOMOD_FEATURES = [
+    ("antispam",    "Anti-Spam / Flood",        "🌊"),
+    ("antiinvite",  "Anti-Invite Links",        "🔗"),
+    ("mentionspam", "Mass Mention Spam",        "📣"),
+    ("zalgo",       "Zalgo / Unicode Spam",     "👹"),
+]
+
+
+def _automod_status_embed(config: dict) -> discord.Embed:
+    lines = []
+    for key, label, emoji in AUTOMOD_FEATURES:
+        on = config.get(f"automod_{key}", True)
+        lines.append(f"{emoji} **{label}** — {'🟢 ON' if on else '🔴 OFF'}")
+    log_id = config.get("automod_log_channel")
+    lines.append(f"\n📋 Log channel: {f'<#{log_id}>' if log_id else '*not set*'}")
+    lines.append(
+        "\n**Escalation (mutes only, never kicks/bans):**\n"
+        "Strike 1-2 → delete only · Strike 3-4 → 5m mute · Strike 5-7 → 15m mute · Strike 8+ → 1h mute\n"
+        "*Strikes decay automatically after 24h of good behavior.*"
+    )
+    return discord.Embed(title="🛡️ Automod Settings", color=discord.Color.red(), description="\n".join(lines))
+
+
+class AutomodToggleSelect(discord.ui.Select):
+    def __init__(self, config: dict):
+        options = [
+            discord.SelectOption(label=label, value=key, emoji=emoji, default=config.get(f"automod_{key}", True))
+            for key, label, emoji in AUTOMOD_FEATURES
+        ]
+        super().__init__(
+            placeholder="Toggle filters — selected = ON",
+            min_values=0, max_values=len(options), options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        chosen = set(self.values)
+        for key, _, _ in AUTOMOD_FEATURES:
+            await bot.db.update_config(interaction.guild.id, f"automod_{key}", key in chosen)
+        config = await get_config(interaction.guild.id, bot.db)
+        await interaction.response.edit_message(embed=_automod_status_embed(config), view=self.view)
+
+
+class AutomodLogSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(
+            placeholder="📋 Pick a log channel for automod actions...",
+            channel_types=[discord.ChannelType.text], min_values=1, max_values=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await bot.db.update_config(interaction.guild.id, "automod_log_channel", self.values[0].id)
+        config = await get_config(interaction.guild.id, bot.db)
+        await interaction.response.edit_message(embed=_automod_status_embed(config), view=self.view)
+
+
+class AutomodView(discord.ui.View):
+    def __init__(self, config: dict):
+        super().__init__(timeout=300)
+        self.add_item(AutomodToggleSelect(config))
+        self.add_item(AutomodLogSelect())
+
+    @discord.ui.button(label="Done", emoji="✅", style=discord.ButtonStyle.success, row=2)
+    async def done(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(view=None)
+
+
+# ── Tickets configuration ────────────────────────────────────────────────────
+
+class TicketsSetupView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.add_item(ChannelPickSelectInline("ticket_category_id", "Ticket Category", [discord.ChannelType.category]))
+        self.add_item(RolePickSelectInline("ticket_support_role_id", "Ticket Support Role"))
+
+    @discord.ui.button(label="Done", emoji="✅", style=discord.ButtonStyle.success, row=2)
+    async def done(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(view=None)
+
+
+class ChannelPickSelectInline(discord.ui.ChannelSelect):
+    """Like ChannelPickSelect, but stays attached to a shared multi-field view instead of closing it."""
+    def __init__(self, config_key: str, label: str, channel_types=None):
+        super().__init__(placeholder=f"Select {label}...", channel_types=channel_types, min_values=1, max_values=1)
+        self.config_key = config_key
+        self.label_text = label
+
+    async def callback(self, interaction: discord.Interaction):
+        await bot.db.update_config(interaction.guild.id, self.config_key, self.values[0].id)
+        await interaction.response.send_message(f"✅ **{self.label_text}** set to <#{self.values[0].id}>.", ephemeral=True)
+
+
+class RolePickSelectInline(discord.ui.RoleSelect):
+    def __init__(self, config_key: str, label: str):
+        super().__init__(placeholder=f"Select {label}...", min_values=1, max_values=1)
+        self.config_key = config_key
+        self.label_text = label
+
+    async def callback(self, interaction: discord.Interaction):
+        await bot.db.update_config(interaction.guild.id, self.config_key, self.values[0].id)
+        await interaction.response.send_message(f"✅ **{self.label_text}** set to {self.values[0].mention}.", ephemeral=True)
+
+
+# ── Main setup hub ────────────────────────────────────────────────────────────
+
+class SetupHubSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Level Roles", value="levelroles", emoji="⭐",
+                                  description="Pick roles awarded at each level (multi-select)"),
+            discord.SelectOption(label="Level-Up Announcements", value="levelup", emoji="🎉",
+                                  description="Channel where level-up messages are posted"),
+            discord.SelectOption(label="Automod", value="automod", emoji="🛡️",
+                                  description="Toggle spam/invite/mention/zalgo filters"),
+            discord.SelectOption(label="Tickets", value="tickets", emoji="🎫",
+                                  description="Ticket category & support role"),
+            discord.SelectOption(label="Mod Log", value="modlog", emoji="📋",
+                                  description="Channel for warns/kicks/bans"),
+            discord.SelectOption(label="Re-sync Stats Channels", value="stats", emoji="📊",
+                                  description="Refresh the Members/Boosts trackers now"),
+        ]
+        super().__init__(placeholder="⚙️ Choose something to configure...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+        if value == "levelroles":
+            ladder = await _build_ladder_text(interaction.guild)
+            embed = discord.Embed(title="⭐ Level Roles", color=discord.Color.gold(),
+                                   description=f"**Current ladder:**\n{ladder}")
+            await interaction.response.send_message(embed=embed, view=LevelRolesView(), ephemeral=True)
+        elif value == "levelup":
+            await interaction.response.send_message(
+                "Pick the channel for level-up announcements:",
+                view=ChannelPickView("levelup_channel", "Level-Up Announcements"), ephemeral=True,
+            )
+        elif value == "automod":
+            config = await get_config(interaction.guild.id, bot.db)
+            await interaction.response.send_message(embed=_automod_status_embed(config), view=AutomodView(config), ephemeral=True)
+        elif value == "tickets":
+            await interaction.response.send_message(
+                "Set up your ticket category and support role:", view=TicketsSetupView(), ephemeral=True,
+            )
+        elif value == "modlog":
+            await interaction.response.send_message(
+                "Pick the mod-log channel (warns/kicks/bans):",
+                view=ChannelPickView("modlog_channel", "Mod Log"), ephemeral=True,
+            )
+        elif value == "stats":
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            await bot.refresh_stats_channels(interaction.guild, force=True)
+            await interaction.followup.send("✅ Stats channels re-synced.", ephemeral=True)
+
+
+class SetupHubView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.add_item(SetupHubSelect())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1166,6 +1656,16 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
+    config = await get_config(message.guild.id, bot.db)
+
+    # ── Automod (skip for admins/mods so staff never get caught) ───────────────
+    perms = message.author.guild_permissions
+    if not (perms.administrator or perms.manage_messages):
+        reason = await run_automod(message, config)
+        if reason:
+            await handle_automod_violation(message, config, reason)
+            return  # deleted message — don't award XP or process it as a command
+
     key = (message.guild.id, message.author.id)
     now = time.monotonic()
     last = bot._xp_cooldowns.get(key, 0)
@@ -1180,7 +1680,6 @@ async def on_message(message: discord.Message):
             text = f"🎉 {message.author.mention} leveled up to **level {result['level']}**!"
             if reward:
                 text += f" Earned role **{reward}**."
-            config = await get_config(message.guild.id, bot.db)
             target_channel = message.channel
             levelup_channel_id = config.get("levelup_channel")
             if levelup_channel_id:
