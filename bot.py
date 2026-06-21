@@ -232,35 +232,35 @@ class Database:
 
     async def ensure_indexes(self):
         try:
-            await self.config.create_index("guild_id", unique=True, background=True)
-            await self.levels.create_index([("user_id", 1), ("guild_id", 1)], unique=True, background=True)
-            await self.levels.create_index([("guild_id", 1), ("total_xp", -1)], background=True)
-            await self.invites.create_index([("guild_id", 1), ("invite_code", 1)], background=True)
-            await self.role_menus.create_index([("guild_id", 1), ("menu_id", 1)], background=True)
-            await self.tickets.create_index([("guild_id", 1), ("channel_id", 1)], background=True)
-            await self.boosts.create_index([("guild_id", 1), ("user_id", 1)], unique=True, background=True)
-            await self.analytics.create_index([("guild_id", 1), ("date", 1)], unique=True, background=True)
-            await self.reaction_roles.create_index([("guild_id", 1), ("message_id", 1)], background=True)
-            await self.giveaways.create_index([("guild_id", 1), ("message_id", 1)], background=True)
-            await self.giveaways.create_index("ends_at", background=True)
-            await self.msg_tracking.create_index([("guild_id", 1), ("user_id", 1)], unique=True, background=True)
-            await self.msg_tracking.create_index([("guild_id", 1), ("total_messages", -1)], background=True)
-            await self.warns.create_index([("guild_id", 1), ("user_id", 1)], background=True)
-            await self.warns.create_index("created_at", background=True)
-            await self.cases.create_index([("guild_id", 1), ("case_number", 1)], unique=True, background=True)
-            await self.counters.create_index([("guild_id", 1), ("name", 1)], unique=True, background=True)
-            await self.cases.create_index([("guild_id", 1), ("target_id", 1)], background=True)
-            await self.tempmutes.create_index("unmute_at", background=True)
-            await self.roblox_history.create_index("_id", background=True)
-            await self.db["join_log"].create_index([("guild_id", 1), ("joined_at", -1)], background=True)
-            await self.db["leave_log"].create_index([("guild_id", 1), ("left_at", -1)], background=True)
-            await self.db["join_log"].create_index("user_id", background=True)
-            await self.tempbans.create_index("unban_at", background=True)
-            await self.tempbans.create_index([("guild_id", 1), ("user_id", 1)], background=True)
-            await self.reports.create_index([("guild_id", 1), ("created_at", -1)], background=True)
-            await self.ticket_ratings.create_index([("guild_id", 1), ("ticket_id", 1)], background=True)
-            await self.db["daily_msg_counts"].create_index([("guild_id", 1), ("date", 1)], unique=True, background=True)
-            await self.db["staff_activity"].create_index([("guild_id", 1), ("user_id", 1)], unique=True, background=True)
+            await self.config.create_index("guild_id", unique=True)
+            await self.levels.create_index([("user_id", 1), ("guild_id", 1)], unique=True)
+            await self.levels.create_index([("guild_id", 1), ("total_xp", -1)])
+            await self.invites.create_index([("guild_id", 1), ("invite_code", 1)])
+            await self.role_menus.create_index([("guild_id", 1), ("menu_id", 1)])
+            await self.tickets.create_index([("guild_id", 1), ("channel_id", 1)])
+            await self.boosts.create_index([("guild_id", 1), ("user_id", 1)], unique=True)
+            await self.analytics.create_index([("guild_id", 1), ("date", 1)], unique=True)
+            await self.reaction_roles.create_index([("guild_id", 1), ("message_id", 1)])
+            await self.giveaways.create_index([("guild_id", 1), ("message_id", 1)])
+            await self.giveaways.create_index("ends_at")
+            await self.msg_tracking.create_index([("guild_id", 1), ("user_id", 1)], unique=True)
+            await self.msg_tracking.create_index([("guild_id", 1), ("total_messages", -1)])
+            await self.warns.create_index([("guild_id", 1), ("user_id", 1)])
+            await self.warns.create_index("created_at")
+            await self.cases.create_index([("guild_id", 1), ("case_number", 1)], unique=True)
+            await self.counters.create_index([("guild_id", 1), ("name", 1)], unique=True)
+            await self.cases.create_index([("guild_id", 1), ("target_id", 1)])
+            await self.tempmutes.create_index("unmute_at")
+            await self.roblox_history.create_index("_id")
+            await self.db["join_log"].create_index([("guild_id", 1), ("joined_at", -1)])
+            await self.db["leave_log"].create_index([("guild_id", 1), ("left_at", -1)])
+            await self.db["join_log"].create_index("user_id")
+            await self.tempbans.create_index("unban_at")
+            await self.tempbans.create_index([("guild_id", 1), ("user_id", 1)])
+            await self.reports.create_index([("guild_id", 1), ("created_at", -1)])
+            await self.ticket_ratings.create_index([("guild_id", 1), ("ticket_id", 1)])
+            await self.db["daily_msg_counts"].create_index([("guild_id", 1), ("date", 1)], unique=True)
+            await self.db["staff_activity"].create_index([("guild_id", 1), ("user_id", 1)], unique=True)
             logger.info("Indexes ready")
         except Exception as exc:
             logger.error("Index error: %s", exc)
@@ -285,31 +285,29 @@ class Database:
         return doc["value"]
 
     async def seed_counters_from_existing(self):
-        """One-time migration, safe to call on every startup: makes sure each
-        guild's atomic counters start above any case/report numbers that
-        already exist from before counters existed, so old data and new
-        atomic numbering never collide. No-ops once a counter is already
-        ahead of the existing max, so this is cheap to run repeatedly."""
+        """One-time migration: seeds each guild's atomic counters above any
+        existing case/report numbers so new and old data never collide.
+        Safe to run on every startup — no-ops once counters are already ahead."""
         for coll, field, name in ((self.cases, "case_number", "case_number"),
                                    (self.reports, "report_number", "report_number")):
             pipeline = [{"$group": {"_id": "$guild_id", "max": {"$max": f"${field}"}}}]
             async for row in coll.aggregate(pipeline):
                 gid, max_val = row["_id"], row["max"] or 0
-                await self.counters.update_one(
-                    {"guild_id": gid, "name": name, "value": {"$lt": max_val}},
-                    {"$set": {"value": max_val}},
-                    upsert=False,
-                )
+                # Single atomic upsert: insert with max_val if missing, or bump
+                # to max_val only if the stored value is behind — no race window.
                 await self.counters.update_one(
                     {"guild_id": gid, "name": name},
-                    {"$setOnInsert": {"guild_id": gid, "name": name, "value": max_val}},
+                    [{"$set": {"guild_id": gid, "name": name,
+                               "value": {"$max": [{"$ifNull": ["$value", 0]}, max_val]}}}],
                     upsert=True,
                 )
 
     # ── Config ────────────────────────────────────────────────────────────────
 
     async def get_config(self, gid: int) -> dict:
-        return await self.config.find_one({"guild_id": gid}) or {}
+        return await self._retry(
+            lambda: self.config.find_one({"guild_id": gid})
+        ) or {}
 
     async def update_config(self, gid: int, key: str, value):
         await self.config.update_one(
@@ -323,7 +321,9 @@ class Database:
     # ── Levels / XP ───────────────────────────────────────────────────────────
 
     async def get_level_data(self, uid: int, gid: int) -> dict:
-        return await self.levels.find_one({"user_id": uid, "guild_id": gid}) or {}
+        return await self._retry(
+            lambda: self.levels.find_one({"user_id": uid, "guild_id": gid})
+        ) or {}
 
     async def add_xp(self, uid: int, gid: int, xp: int) -> dict:
         """
@@ -1417,7 +1417,7 @@ def staff_tier_check(min_tier: int):
         if tier >= min_tier:
             return True
         needed = TIER_NAMES.get(min_tier, "Staff")
-        await ctx.send(f"⛔ You need to be at least **{needed}** to use this command.")
+        await ctx.send(f"nah, you need to be **{needed}** to use that.")
         return False
     return commands.check(predicate)
 
@@ -1433,22 +1433,22 @@ async def validate_mod_target(ctx: commands.Context, target: discord.Member) -> 
     if ctx.author.guild_permissions.administrator:
         return True
     if target.id == ctx.author.id:
-        await ctx.send("⛔ You can't target yourself with this command.")
+        await ctx.send("you can't do that to yourself lol")
         return False
     if target.id == bot.user.id:
-        await ctx.send("⛔ You can't target the bot.")
+        await ctx.send("bro leave me out of it 💀")
         return False
     if ctx.guild.owner_id and target.id == ctx.guild.owner_id:
-        await ctx.send("⛔ You can't target the server owner.")
+        await ctx.send("can't touch the owner, not doing that")
         return False
     config = await get_config(ctx.guild.id, bot.db)
     actor_tier = await get_staff_tier(ctx.author, config)
     target_tier = await get_staff_tier(target, config)
     if target_tier > TIER_NONE and target_tier >= actor_tier and not target.guild_permissions.administrator:
-        await ctx.send("⛔ You can't take moderation action on a staff member at your tier or above.")
+        await ctx.send("can't take action on someone at your tier or above")
         return False
     if target.guild_permissions.administrator:
-        await ctx.send("⛔ You can't take moderation action on an administrator.")
+        await ctx.send("can't take action on an admin")
         return False
     return True
 
@@ -1914,8 +1914,7 @@ class AjsCrib(commands.Bot):
             if idle_hours >= TICKET_INACTIVITY_CLOSE_HOURS:
                 try:
                     await channel.send(
-                        f"⏳ **Auto-closing** — this ticket has had no activity for over "
-                        f"{TICKET_INACTIVITY_CLOSE_HOURS}h."
+                        f"⏳ auto-closing — no activity for over {TICKET_INACTIVITY_CLOSE_HOURS}h"
                     )
                 except discord.HTTPException:
                     pass
@@ -1928,8 +1927,7 @@ class AjsCrib(commands.Bot):
             if idle_hours >= TICKET_INACTIVITY_WARN_HOURS and not doc.get("inactivity_warned_at"):
                 try:
                     await channel.send(
-                        f"⏳ This ticket has been quiet for {int(idle_hours)}h. It will auto-close at "
-                        f"{TICKET_INACTIVITY_CLOSE_HOURS}h of inactivity unless someone replies."
+                        f"⏳ this ticket's been quiet for {int(idle_hours)}h — it'll close at {TICKET_INACTIVITY_CLOSE_HOURS}h if nobody replies"
                     )
                     await self.db.mark_ticket_warned_inactive(channel.id)
                 except discord.HTTPException:
@@ -1960,9 +1958,8 @@ class AjsCrib(commands.Bot):
                     idle_days = (datetime.now(timezone.utc) - last_at).days if last_at else days
                     try:
                         await member.send(
-                            f"🕵️ Heads up — you haven't logged a staff action in **{guild.name}** "
-                            f"for **{idle_days}d** (alert threshold: {days}d). This is just a nudge, "
-                            f"not a punishment — taking any mod action will reset this."
+                            f"hey — you haven't logged any staff actions in **{guild.name}** for **{idle_days}d** "
+                            f"(threshold: {days}d). just a heads up, not a punishment. any mod action resets this."
                         )
                     except discord.Forbidden:
                         pass
@@ -2006,9 +2003,9 @@ class AjsCrib(commands.Bot):
                 levelup_channel_id = config.get("levelup_channel")
                 chan = guild.get_channel(levelup_channel_id) if levelup_channel_id else None
                 if chan:
-                    text = f"🎉 {member.mention} leveled up to **level {result['level']}**! (via voice activity)"
+                    text = f"🎉 {member.mention} hit **level {result['level']}** from voice!"
                     if reward:
-                        text += f" Earned role **{reward}**."
+                        text += f" earned **{reward}** 🏅"
                     try:
                         await chan.send(text)
                     except discord.HTTPException:
@@ -2025,7 +2022,7 @@ class AjsCrib(commands.Bot):
                     continue
                 try:
                     await chan.send(
-                        f"{a['emoji']} {member.mention} unlocked achievement **{a['name']}** — {a['desc']}"
+                        f"{a['emoji']} {member.mention} unlocked **{a['name']}** — {a['desc']}"
                     )
                 except discord.HTTPException:
                     pass
@@ -2132,23 +2129,23 @@ class TicketCloseView(discord.ui.View):
         config = await get_config(interaction.guild.id, bot.db)
         tier = await get_staff_tier(interaction.user, config)
         if tier == TIER_NONE and not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("⛔ Only staff can claim tickets.", ephemeral=True)
+            await interaction.response.send_message("only staff can claim tickets", ephemeral=True)
             return
 
         doc = await bot.db.get_ticket(interaction.channel.id)
         if doc.get("claimed_by") == interaction.user.id:
             await bot.db.unclaim_ticket(interaction.channel.id)
-            await interaction.response.send_message(f"🙋 {interaction.user.mention} unclaimed this ticket.")
+            await interaction.response.send_message(f"{interaction.user.mention} unclaimed this ticket")
             return
 
         ok = await bot.db.claim_ticket(interaction.channel.id, interaction.user.id)
         if not ok:
             claimer_id = doc.get("claimed_by")
             await interaction.response.send_message(
-                f"⚠️ Already claimed by <@{claimer_id}>.", ephemeral=True
+                f"already claimed by <@{claimer_id}>", ephemeral=True
             )
             return
-        await interaction.response.send_message(f"🙋 {interaction.user.mention} claimed this ticket.")
+        await interaction.response.send_message(f"🙋 {interaction.user.mention} claimed this")
 
     @discord.ui.select(
         placeholder="Set priority…",
@@ -2164,7 +2161,7 @@ class TicketCloseView(discord.ui.View):
         config = await get_config(interaction.guild.id, bot.db)
         tier = await get_staff_tier(interaction.user, config)
         if tier == TIER_NONE and not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("⛔ Only staff can change priority.", ephemeral=True)
+            await interaction.response.send_message("only staff can change priority", ephemeral=True)
             return
         priority = select.values[0]
         await bot.db.set_ticket_priority(interaction.channel.id, priority)
@@ -2181,7 +2178,7 @@ class TicketCloseView(discord.ui.View):
     @discord.ui.button(label="Close Ticket", emoji="🔒", style=discord.ButtonStyle.red, custom_id=TICKET_CLOSE_CUSTOM_ID)
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         channel = interaction.channel
-        await interaction.response.send_message("🔒 Closing this ticket in 5 seconds...")
+        await interaction.response.send_message("🔒 closing in 5...")
         await _build_ticket_transcript_and_close(channel, interaction.user, interaction.guild)
 
 
@@ -2196,7 +2193,7 @@ class TicketPanelView(discord.ui.View):
 
         existing = await bot.db.count_open_tickets(guild.id, interaction.user.id)
         if existing > 0:
-            await interaction.response.send_message("⚠️ You already have an open ticket.", ephemeral=True)
+            await interaction.response.send_message("you already have an open ticket", ephemeral=True)
             return
 
         category_id = config.get("ticket_category_id")
@@ -2224,18 +2221,18 @@ class TicketPanelView(discord.ui.View):
         await bot.db.save_ticket(guild.id, channel.id, interaction.user.id, ticket_id, priority="medium")
 
         embed = discord.Embed(
-            title="🎫 Support Ticket",
-            description=f"{interaction.user.mention} thanks for reaching out — support will be with you shortly.",
+            title="🎫 Ticket Opened",
+            description=f"hey {interaction.user.mention}, someone will be with you shortly!",
             color=discord.Color.blurple(),
         )
         embed.add_field(name="Priority", value=_ticket_priority_label("medium"), inline=True)
-        embed.set_footer(text="Staff: use the buttons below to claim, reprioritize, or close.")
+        embed.set_footer(text="Staff: claim, set priority, or close below")
         await channel.send(
             content=support_role.mention if support_role else None,
             embed=embed,
             view=TicketCloseView(),
         )
-        await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+        await interaction.response.send_message(f"✅ opened {channel.mention}", ephemeral=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2797,9 +2794,9 @@ async def on_message(message: discord.Message):
 
         if result["leveled"]:
             reward = await apply_level_roles(message.author, bot.db, result["level"])
-            text = f"🎉 {message.author.mention} leveled up to **level {result['level']}**!"
+            text = f"🎉 {message.author.mention} just hit **level {result['level']}**!"
             if reward:
-                text += f" Earned role **{reward}**."
+                text += f" you got **{reward}** 🏅"
             target_channel = message.channel
             levelup_channel_id = config.get("levelup_channel")
             if levelup_channel_id:
@@ -2815,7 +2812,7 @@ async def on_message(message: discord.Message):
         for a in newly:
             try:
                 await message.channel.send(
-                    f"{a['emoji']} {message.author.mention} unlocked achievement **{a['name']}** — {a['desc']}"
+                    f"{a['emoji']} {message.author.mention} unlocked **{a['name']}** — {a['desc']}"
                 )
             except discord.HTTPException:
                 pass
@@ -3688,10 +3685,10 @@ async def warn_cmd(ctx: commands.Context, member: discord.Member, *, reason: str
     count = await bot.db.add_warn(ctx.guild.id, member.id, ctx.author.id, reason, source="manual")
     case_num = await bot.db.add_case(ctx.guild.id, "warn", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "warn", member.id)
-    await ctx.send(f"⚠️ {member.mention} has been warned (warn #{count}, case #{case_num}). Reason: {reason}")
+    await ctx.send(f"⚠️ warned {member.mention} (warn #{count}, case #{case_num}) — {reason}")
     await post_modlog(ctx.guild, "⚠️ Warn", ctx.author, member, reason, case_num, discord.Color.yellow())
     try:
-        await member.send(f"You were warned in **{ctx.guild.name}**: {reason}")
+        await member.send(f"you got warned in **{ctx.guild.name}** — {reason}")
     except discord.Forbidden:
         pass
 
@@ -3715,7 +3712,7 @@ async def warnings_cmd(ctx: commands.Context, member: discord.Member):
 @staff_tier_check(TIER_MOD)
 async def clearwarns_cmd(ctx: commands.Context, member: discord.Member):
     n = await bot.db.clear_warns(ctx.guild.id, member.id)
-    await ctx.send(f"🧹 Cleared {n} warning(s) for {member.mention}.")
+    await ctx.send(f"cleared {n} warning(s) for {member.mention}")
 
 
 @bot.command(name="case")
@@ -3755,11 +3752,11 @@ async def kick_cmd(ctx: commands.Context, member: discord.Member, *, reason: str
     try:
         await member.kick(reason=reason)
     except discord.Forbidden:
-        await ctx.send("⛔ I can't kick that member — their role may be above mine.")
+        await ctx.send("can't kick that person — their role might be above mine")
         return
     case_num = await bot.db.add_case(ctx.guild.id, "kick", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "kick", member.id)
-    await ctx.send(f"👋 Kicked {member.mention}. Reason: {reason}")
+    await ctx.send(f"👋 kicked {member.mention} — {reason}")
     await post_modlog(ctx.guild, "👋 Kick", ctx.author, member, reason, case_num, discord.Color.orange())
 
 
@@ -3773,11 +3770,11 @@ async def ban_cmd(ctx: commands.Context, member: discord.Member, *, reason: str 
     try:
         await member.ban(reason=reason)
     except discord.Forbidden:
-        await ctx.send("⛔ I can't ban that member — their role may be above mine.")
+        await ctx.send("can't ban that person — their role might be above mine")
         return
     case_num = await bot.db.add_case(ctx.guild.id, "ban", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "ban", member.id)
-    await ctx.send(f"🔨 Banned {member.mention}. Reason: {reason}")
+    await ctx.send(f"🔨 banned {member.mention} — {reason}")
     await post_modlog(ctx.guild, "🔨 Ban", ctx.author, member, reason, case_num, discord.Color.red())
 
 
@@ -3814,7 +3811,7 @@ async def purge_cmd(ctx: commands.Context, amount: int):
     await _send_log(ctx.guild, config, "log_mod_extra_channel",
                      embed=discord.Embed(description=f"🧹 {ctx.author.mention} purged **{len(deleted) - 1}** message(s) in {ctx.channel.mention}",
                                           color=discord.Color.dark_grey()))
-    await ctx.send(f"🧹 Purged {len(deleted) - 1} message(s).", delete_after=5)
+    await ctx.send(f"🧹 purged {len(deleted) - 1} message(s)", delete_after=5)
 
 
 @bot.command(name="mute")
@@ -3826,21 +3823,21 @@ async def mute_cmd(ctx: commands.Context, member: discord.Member, duration: str 
         return
     delta = _parse_duration(duration)
     if not delta:
-        await ctx.send("⚠️ Invalid duration. Use formats like `10m`, `1h`, `1d`.")
+        await ctx.send("invalid duration, use something like `10m`, `1h`, `1d`")
         return
     if delta > timedelta(days=28):
-        await ctx.send("⚠️ Discord's timeout max is 28 days. Use `.tempban` for a longer removal instead.")
+        await ctx.send("discord's timeout max is 28 days — use `.tempban` for longer")
         return
     unmute_at = datetime.now(timezone.utc) + delta
     try:
         await member.timeout(delta, reason=reason)
     except discord.Forbidden:
-        await ctx.send("⛔ I don't have permission to timeout that member.")
+        await ctx.send("i don't have permission to timeout that person")
         return
     await bot.db.add_tempmute(ctx.guild.id, member.id, ctx.author.id, reason, unmute_at)
     case_num = await bot.db.add_case(ctx.guild.id, "mute", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "mute", member.id)
-    await ctx.send(f"🔇 Muted {member.mention} for `{duration}`. Reason: {reason}")
+    await ctx.send(f"🔇 muted {member.mention} for `{duration}` — {reason}")
     await post_modlog(ctx.guild, f"🔇 Mute ({duration})", ctx.author, member, reason, case_num, discord.Color.dark_orange())
 
 
@@ -3851,11 +3848,11 @@ async def unmute_cmd(ctx: commands.Context, member: discord.Member, *, reason: s
     try:
         await member.timeout(None, reason=reason)
     except discord.Forbidden:
-        await ctx.send("⛔ I don't have permission to timeout that member.")
+        await ctx.send("i don't have permission to lift that timeout")
         return
     await bot.db.remove_tempmute(ctx.guild.id, member.id)
     case_num = await bot.db.add_case(ctx.guild.id, "unmute", ctx.author.id, member.id, reason)
-    await ctx.send(f"🔊 Unmuted {member.mention}. Reason: {reason}")
+    await ctx.send(f"🔊 unmuted {member.mention} — {reason}")
     await post_modlog(ctx.guild, "🔊 Unmute", ctx.author, member, reason, case_num, discord.Color.green())
 
 
@@ -3868,18 +3865,18 @@ async def tempban_cmd(ctx: commands.Context, member: discord.Member, duration: s
         return
     delta = _parse_duration(duration)
     if not delta:
-        await ctx.send("⚠️ Invalid duration. Use formats like `1h`, `1d`, `1w`.")
+        await ctx.send("invalid duration, use something like `1h`, `1d`, `1w`")
         return
     unban_at = datetime.now(timezone.utc) + delta
     try:
         await member.ban(reason=reason)
     except discord.Forbidden:
-        await ctx.send("⛔ I can't ban that member — their role may be above mine.")
+        await ctx.send("can't ban that person — their role might be above mine")
         return
     await bot.db.add_tempban(ctx.guild.id, member.id, ctx.author.id, reason, unban_at)
     case_num = await bot.db.add_case(ctx.guild.id, "tempban", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "tempban", member.id)
-    await ctx.send(f"⛔ Tempbanned {member.mention} for `{duration}`. Reason: {reason}")
+    await ctx.send(f"⛔ tempbanned {member.mention} for `{duration}` — {reason}")
     await post_modlog(ctx.guild, f"⛔ Tempban ({duration})", ctx.author, member, reason, case_num, discord.Color.dark_red())
 
 
@@ -3888,7 +3885,7 @@ async def tempban_cmd(ctx: commands.Context, member: discord.Member, duration: s
 async def strikes_cmd(ctx: commands.Context, member: discord.Member):
     """Show a member's active automod strikes (decay after 24h)."""
     count = await bot.db.get_active_strikes(ctx.guild.id, member.id)
-    await ctx.send(f"🛡️ {member.mention} has **{count}** active automod strike(s) (rolling 24h window).")
+    await ctx.send(f"{member.mention} has **{count}** active automod strike(s) (resets after 24h)")
 
 
 @bot.command(name="clearstrikes")
@@ -3896,7 +3893,7 @@ async def strikes_cmd(ctx: commands.Context, member: discord.Member):
 async def clearstrikes_cmd(ctx: commands.Context, member: discord.Member):
     """Reset a member's automod strikes back to zero (manual warns are untouched)."""
     n = await bot.db.clear_strikes(ctx.guild.id, member.id)
-    await ctx.send(f"🧹 Cleared **{n}** automod strike(s) for {member.mention}.")
+    await ctx.send(f"cleared **{n}** automod strike(s) for {member.mention}")
 
 
 AUTOMOD_RULES = {
@@ -3927,14 +3924,14 @@ async def automod_cmd(ctx: commands.Context, rule: str = None, setting: str = No
         return
     rule = rule.lower()
     if rule not in AUTOMOD_RULES:
-        await ctx.send(f"⚠️ Unknown rule `{rule}`. Options: {', '.join(AUTOMOD_RULES)}")
+        await ctx.send(f"unknown rule `{rule}` — options: {', '.join(AUTOMOD_RULES)}")
         return
     if not setting or setting.lower() not in ("on", "off"):
-        await ctx.send(f"⚠️ Usage: `{PREFIX}automod {rule} <on|off>`")
+        await ctx.send(f"usage: `{PREFIX}automod {rule} <on|off>`")
         return
     enabled = setting.lower() == "on"
     await bot.db.update_config(ctx.guild.id, AUTOMOD_RULES[rule], enabled)
-    await ctx.send(f"✅ `{rule}` automod is now **{'ON 🟢' if enabled else 'OFF 🔴'}**.")
+    await ctx.send(f"✅ `{rule}` is now **{'ON 🟢' if enabled else 'OFF 🔴'}**")
 
 
 @bot.command(name="raidmode")
@@ -4065,9 +4062,9 @@ async def lockdown_cmd(ctx: commands.Context, channel: discord.abc.GuildChannel 
     channel = channel or ctx.channel
     locked = await lock_channel(channel, f"manually triggered by {ctx.author}")
     if not locked:
-        await ctx.send(f"⚠️ {channel.mention} is already locked. Use `{PREFIX}unlock` to lift it.")
+        await ctx.send(f"{channel.mention} is already locked — use `{PREFIX}unlock` to lift it")
         return
-    await ctx.send(f"🔒 **{channel.mention} locked.** Run `{PREFIX}unlock` to restore it.")
+    await ctx.send(f"🔒 {channel.mention} locked")
 
 
 @bot.command(name="unlock")
@@ -4078,9 +4075,9 @@ async def unlock_cmd(ctx: commands.Context, channel: discord.abc.GuildChannel = 
     channel = channel or ctx.channel
     restored = await unlock_channel(channel)
     if not restored:
-        await ctx.send(f"⚠️ {channel.mention} isn't locked.")
+        await ctx.send(f"{channel.mention} isn't locked")
         return
-    await ctx.send(f"🔓 **{channel.mention} unlocked.**")
+    await ctx.send(f"🔓 {channel.mention} unlocked")
 
 
 @bot.command(name="serverlockdown", aliases=["lockdownall", "raidlock"])
@@ -4091,13 +4088,13 @@ async def serverlockdown_cmd(ctx: commands.Context):
     `.serverunlock` restores everything exactly. This is the same lockdown
     auto-triggered by a severe join-raid burst, just started by a human."""
     if is_in_lockdown(ctx.guild.id):
-        await ctx.send(f"⚠️ The server is already in lockdown. Use `{PREFIX}serverunlock` to lift it.")
+        await ctx.send(f"server's already locked down — use `{PREFIX}serverunlock` to lift it")
         return
     async with ctx.typing():
         locked_count = await serverwide_lockdown(ctx.guild, f"manually triggered by {ctx.author}")
     await ctx.send(
-        f"🔒🚨 **Server-wide lockdown engaged.** Locked **{locked_count}** text channel(s). "
-        f"Run `{PREFIX}serverunlock` once it's safe to reopen."
+        f"🔒🚨 server-wide lockdown on — locked **{locked_count}** channel(s). "
+        f"run `{PREFIX}serverunlock` when it's safe"
     )
 
 
@@ -4108,11 +4105,11 @@ async def serverunlock_cmd(ctx: commands.Context):
     exactly what it was before. Channels individually `.lockdown`-ed by staff
     outside of the server-wide lockdown stay locked — use `.unlock` for those."""
     if not is_in_lockdown(ctx.guild.id):
-        await ctx.send("⚠️ The server isn't currently in a server-wide lockdown.")
+        await ctx.send("server isn't in lockdown right now")
         return
     async with ctx.typing():
         restored = await serverwide_unlock(ctx.guild)
-    await ctx.send(f"🔓 **Server-wide lockdown lifted.** Restored **{restored}** text channel(s).")
+    await ctx.send(f"🔓 lockdown lifted — restored **{restored}** channel(s)")
 
 
 @bot.command(name="raidage")
@@ -4123,14 +4120,14 @@ async def raidage_cmd(ctx: commands.Context, hours: int = None):
     if hours is None:
         config = await get_config(ctx.guild.id, bot.db)
         current = config.get("raidcheck_minage_hours", MIN_ACCOUNT_AGE_HOURS_DEFAULT)
-        await ctx.send(f"🛡️ Current minimum account age to join: **{current}h** (0 = disabled).")
+        await ctx.send(f"min account age to join: **{current}h** (0 = off)")
         return
     hours = max(0, hours)
     await bot.db.update_config(ctx.guild.id, "raidcheck_minage_hours", hours)
     if hours == 0:
-        await ctx.send("✅ Account age gate **disabled** — all accounts may join regardless of age.")
+        await ctx.send("✅ account age gate disabled")
     else:
-        await ctx.send(f"✅ Account age gate set — accounts younger than **{hours}h** will now be flagged on join.")
+        await ctx.send(f"✅ accounts younger than **{hours}h** will now get flagged on join")
 
 
 @bot.command(name="release")
@@ -4141,9 +4138,9 @@ async def release_cmd(ctx: commands.Context, user_id: int):
     anti-nuke caught a false positive."""
     restored = await antinuke_release(ctx.guild, user_id)
     if restored == 0:
-        await ctx.send("⚠️ Nothing to restore for that user — they may not be contained, or already left.")
+        await ctx.send("nothing to restore — either they're not contained or they left")
         return
-    await ctx.send(f"🔓 Released <@{user_id}> — restored **{restored}** role(s) and lifted timeout.")
+    await ctx.send(f"🔓 released <@{user_id}> — restored **{restored}** role(s) and lifted timeout")
 
 
 @bot.command(name="analytics")
@@ -4438,14 +4435,14 @@ async def softban_cmd(ctx: commands.Context, member: discord.Member, delete_days
         await member.ban(reason=f"Softban by {ctx.author}: {reason}", delete_message_seconds=delete_days * 86400)
         await ctx.guild.unban(member, reason="Softban — lifting immediately")
     except discord.Forbidden:
-        await ctx.send("⛔ I can't do that — their role may be above mine, or I'm missing ban permissions.")
+        await ctx.send("can't do that — their role might be above mine or i'm missing ban perms")
         return
     except discord.HTTPException as e:
-        await ctx.send(f"⚠️ Softban failed: {e}")
+        await ctx.send(f"softban failed: {e}")
         return
     case_num = await bot.db.add_case(ctx.guild.id, "softban", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "softban", member.id)
-    await ctx.send(f"🧹 Softbanned {member.mention} — {delete_days}d of messages wiped, not permanently banned. Reason: {reason}")
+    await ctx.send(f"🧹 softbanned {member.mention} — wiped {delete_days}d of messages, not permanently banned. {reason}")
     await post_modlog(ctx.guild, "🧹 Softban", ctx.author, member, reason, case_num, discord.Color.orange())
 
 
@@ -4983,13 +4980,12 @@ async def serverinfo_cmd(ctx: commands.Context):
 @bot.command(name="restart", aliases=["reboot"])
 @commands.has_permissions(administrator=True)
 async def restart_cmd(ctx: commands.Context):
-    """Gracefully close and re-exec the process. Requires the bot to be launched
-    via a process manager (systemd / pm2 / supervisor) that auto-restarts it."""
-    await ctx.send("🔄 Restarting... back in a sec.")
-    logger.info("Manual restart triggered by %s (%s)", ctx.author, ctx.author.id)
+    """Gracefully shut down. Requires a process manager (systemd/pm2/supervisor) to auto-restart."""
+    await ctx.send("🔄 Restarting...")
+    logger.info("Restart triggered by %s (%s)", ctx.author, ctx.author.id)
     await bot.close()
-    import sys, os as _os
-    _os.execv(sys.executable, [sys.executable] + sys.argv)
+    import sys
+    sys.exit(0)
 
 
 
