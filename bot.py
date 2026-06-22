@@ -40,7 +40,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("lxte")
+logger = logging.getLogger("ajscrib")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -184,7 +184,7 @@ class Database:
             retryReads=True,
             w="majority",
         )
-        db = self._client["lxte_assistant"]
+        db = self._client["ajscrib"]
         self.config         = db["guild_config"]
         self.levels         = db["levels"]
         self.invites        = db["invite_tracker"]
@@ -203,11 +203,12 @@ class Database:
         self.reports        = db["reports"]
         self.ticket_ratings = db["ticket_ratings"]
         self.counters       = db["counters"]  # atomic per-guild sequence numbers (case#, report#, ...)
+        self.afk             = db["afk"]  # persisted AFK state — survives restarts
 
     @property
     def db(self):
-        """Expose the lxte_assistant database directly."""
-        return self._client["lxte_assistant"]
+        """Expose the ajscrib database directly."""
+        return self._client["ajscrib"]
 
     async def _retry(self, coro_fn, *args, retries: int = 3, **kwargs):
         """Retry wrapper for transient MongoDB errors (AutoReconnect, NetworkTimeout, etc.)."""
@@ -261,6 +262,7 @@ class Database:
             await self.ticket_ratings.create_index([("guild_id", 1), ("ticket_id", 1)])
             await self.db["daily_msg_counts"].create_index([("guild_id", 1), ("date", 1)], unique=True)
             await self.db["staff_activity"].create_index([("guild_id", 1), ("user_id", 1)], unique=True)
+            await self.afk.create_index([("guild_id", 1), ("user_id", 1)], unique=True)
             logger.info("Indexes ready")
         except Exception as exc:
             logger.error("Index error: %s", exc)
@@ -693,6 +695,20 @@ class Database:
             sort=[("created_at", -1)],
         ).to_list(length=50)
 
+    async def get_active_warns(self, gid: int, uid: int, decay_days: Optional[int] = None) -> int:
+        """Count of warns (manual + automod combined) still 'active' under the
+        server's warn-decay window. `decay_days=None` or `0` means decay is
+        off — every warn ever issued counts forever (the old, pre-decay
+        behavior). This only affects what counts as ACTIVE for display and
+        any future escalation logic; `.warnings` still always shows full
+        lifetime history regardless of decay, nothing is ever deleted."""
+        if not decay_days:
+            return await self.warns.count_documents({"guild_id": gid, "user_id": uid})
+        cutoff = datetime.now(timezone.utc) - timedelta(days=decay_days)
+        return await self.warns.count_documents({
+            "guild_id": gid, "user_id": uid, "created_at": {"$gte": cutoff},
+        })
+
     async def get_active_automod_warns(self, gid: int, uid: int, hours: int = 24) -> int:
         """Count automod-issued warns in the last `hours` — used to decide mute escalation.
         Manual warns from staff never count toward this, so a human warning never auto-mutes."""
@@ -719,6 +735,30 @@ class Database:
 
     async def get_all_warns(self, gid: int) -> list[dict]:
         return await self.warns.find({"guild_id": gid}).to_list(length=None)
+
+    # ── AFK ──────────────────────────────────────────────────────────────────
+    # Persisted so AFK status survives a bot restart/deploy — previously this
+    # was purely in-memory and a restart silently un-AFK'd everyone with no
+    # warning. Kept as a small, separate collection (not a big logging table)
+    # since there's only ever one active AFK doc per member at a time.
+
+    async def set_afk(self, gid: int, uid: int, reason: str, since: datetime):
+        await self.afk.update_one(
+            {"guild_id": gid, "user_id": uid},
+            {"$set": {"reason": reason, "since": since}},
+            upsert=True,
+        )
+
+    async def clear_afk(self, gid: int, uid: int) -> Optional[dict]:
+        return await self.afk.find_one_and_delete({"guild_id": gid, "user_id": uid})
+
+    async def get_afk(self, gid: int, uid: int) -> Optional[dict]:
+        return await self.afk.find_one({"guild_id": gid, "user_id": uid})
+
+    async def get_all_afk(self) -> list[dict]:
+        """Used once at startup to warm the in-memory AFK cache so every
+        message doesn't have to hit Mongo — see `_afk` on the bot instance."""
+        return await self.afk.find({}).to_list(length=None)
 
     # ── Case System ───────────────────────────────────────────────────────────
 
@@ -750,7 +790,7 @@ class Database:
         """Record a staff action for the audit trail / inactivity tracker.
         Also clears any pending inactivity-alert flag — acting again resets
         the clock so a staffer who goes quiet a second time gets DM'd again."""
-        await self._client["lxte_assistant"]["staff_activity"].update_one(
+        await self._client["ajscrib"]["staff_activity"].update_one(
             {"guild_id": gid, "user_id": mod_id},
             {
                 "$inc": {f"actions.{action}": 1, "actions.total": 1},
@@ -764,18 +804,18 @@ class Database:
         )
 
     async def get_staff_activity(self, gid: int, limit: int = 15) -> list[dict]:
-        coll = self._client["lxte_assistant"]["staff_activity"]
+        coll = self._client["ajscrib"]["staff_activity"]
         return await coll.find({"guild_id": gid}, sort=[("actions.total", -1)]).to_list(length=limit)
 
     async def get_staff_activity_user(self, gid: int, uid: int) -> dict:
-        coll = self._client["lxte_assistant"]["staff_activity"]
+        coll = self._client["ajscrib"]["staff_activity"]
         return await coll.find_one({"guild_id": gid, "user_id": uid}) or {}
 
     async def get_stale_staff_activity(self, gid: int, cutoff: datetime) -> list[dict]:
         """Staff who have acted before but gone quiet past `cutoff`, and
         haven't already been DM'd about it since their last action — used by
         the proactive staff-inactivity DM alert loop."""
-        coll = self._client["lxte_assistant"]["staff_activity"]
+        coll = self._client["ajscrib"]["staff_activity"]
         return await coll.find({
             "guild_id": gid,
             "last_action_at": {"$lt": cutoff},
@@ -783,7 +823,7 @@ class Database:
         }).to_list(length=200)
 
     async def mark_staff_alerted(self, gid: int, uid: int):
-        coll = self._client["lxte_assistant"]["staff_activity"]
+        coll = self._client["ajscrib"]["staff_activity"]
         await coll.update_one(
             {"guild_id": gid, "user_id": uid},
             {"$set": {"inactivity_alerted_at": datetime.now(timezone.utc)}},
@@ -848,7 +888,7 @@ class Database:
         ).to_list(length=days)
 
     async def save_snapshot(self, snapshot: dict):
-        db = self._client["lxte_assistant"]
+        db = self._client["ajscrib"]
         await db["snapshots"].insert_one(snapshot)
 
     # ── Anti-nuke containment snapshots (survive bot restarts) ──────────────────
@@ -1083,6 +1123,24 @@ INVITE_RE = re.compile(
 LINK_RE = re.compile(
     r"(?:https?://|www\.)[^\s]+", re.IGNORECASE
 )
+
+# Link-shorteners are flagged separately from generic links because they're a
+# distinct risk: the visible domain tells you nothing about where it actually
+# goes, which is exactly the trick scam/phishing links rely on. This still
+# only matters as its own rule for servers that allow normal links but want
+# the "destination is hidden" case blocked specifically — if automod_antilink
+# is already on, every shortener is caught by that anyway.
+SHORTENER_DOMAINS = {
+    "bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly", "is.gd",
+    "buff.ly", "rebrand.ly", "cutt.ly", "shorturl.at", "tiny.cc",
+    "rb.gy", "shrtco.de", "bl.ink", "lnkd.in", "soo.gd", "s.id",
+    "v.gd", "qr.ae", "adf.ly", "cli.gs", "po.st", "tr.im",
+}
+SHORTENER_RE = re.compile(
+    r"(?:https?://|www\.)?(?:" + "|".join(re.escape(d) for d in SHORTENER_DOMAINS) + r")(?:/\S*)?",
+    re.IGNORECASE,
+)
+
 ZALGO_RE = re.compile(r"[\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff]")
 EMOJI_RE = re.compile(
     r"<a?:\w+:\d+>|[\U0001F300-\U0001FAFF\u2600-\u27BF]"
@@ -1093,7 +1151,9 @@ MENTION_THRESHOLD   = 3     # unique user + role mentions before it's "mention s
 FLOOD_WINDOW_SEC    = 6.0   # burst window — widened so fast (but legitimate) typers aren't caught
 FLOOD_MAX_MESSAGES  = 10    # messages allowed in that window — raw speed alone is a weak spam signal
 DUPLICATE_WINDOW_SEC  = 20.0  # window for repeated/near-identical content
-DUPLICATE_MAX_COUNT   = 5    # repeats of a normal/longer message allowed before it's flagged as spam
+DUPLICATE_MAX_COUNT   = 4    # repeats of a normal/longer message allowed before it's flagged as spam
+                              # (tightened from 5 — this only fires on truly IDENTICAL content, so it
+                              # never touches fast typers sending varied messages, only copy-paste spam)
 DUPLICATE_SHORT_COUNT = 8    # repeats allowed for short/common messages ("hi", "lol", "ok"...) —
                               # short chat-filler is extremely common between real humans, so it
                               # gets a much higher bar before automod treats it as spam
@@ -1125,6 +1185,10 @@ SCAM_DOMAINS = {
     "csgoempire.gift", "free-robux.gg", "bloxflip.gift",
     "roblox-free.com", "epicgames.gift", "claimyourgift.gg",
     "discord-app.net", "discordapp.net", "discod.gg",
+    "discrodapp.com", "discords-nitro.com", "discord-nltro.com",
+    "dlscord-nitro.com", "steamcommunity-gift.com", "steamcomrnunity.com",
+    "discord-airdrop.com", "discordnitro.click", "robux-gen.com",
+    "free-nitro.live", "discrord.gift",
 }
 
 _msg_history: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=20))
@@ -1192,6 +1256,38 @@ def _has_scam_link(content: str) -> bool:
     return any(domain in lowered for domain in SCAM_DOMAINS)
 
 
+def _has_shortener_link(content: str) -> bool:
+    return bool(SHORTENER_RE.search(content))
+
+
+def _compile_word_filter(words: list[str]) -> Optional[re.Pattern]:
+    """Builds one combined whole-word regex from a server's custom banned-word
+    list. Whole-word matching (not substring) so a banned word like "ass"
+    doesn't trip on "class" or "assistant" — same false-positive trap a naive
+    `in` check would fall into. Returns None for an empty list so callers can
+    skip the check entirely with no wasted work."""
+    cleaned = [w.strip() for w in (words or []) if w and w.strip()]
+    if not cleaned:
+        return None
+    pattern = r"\b(?:" + "|".join(re.escape(w) for w in cleaned) + r")\b"
+    return re.compile(pattern, re.IGNORECASE)
+
+
+_word_filter_cache: dict[int, tuple[tuple, Optional[re.Pattern]]] = {}  # guild_id -> (words_tuple, compiled)
+
+
+def _has_banned_word(content: str, guild_id: int, config: dict) -> bool:
+    words = config.get("automod_bannedwords_list", []) or []
+    key = tuple(sorted(w.lower() for w in words))
+    cached = _word_filter_cache.get(guild_id)
+    if cached and cached[0] == key:
+        pattern = cached[1]
+    else:
+        pattern = _compile_word_filter(words)
+        _word_filter_cache[guild_id] = (key, pattern)
+    return bool(pattern and pattern.search(content))
+
+
 async def run_automod(message: discord.Message, config: dict, allow_invites: bool = False) -> Optional[str]:
     """Returns a human-readable violation reason, or None if the message is clean."""
     content = message.content or ""
@@ -1199,8 +1295,14 @@ async def run_automod(message: discord.Message, config: dict, allow_invites: boo
     if config.get("automod_scamlinks", True) and _has_scam_link(content):
         return "posting a known scam/phishing link"
 
+    if config.get("automod_bannedwords", True) and _has_banned_word(content, message.guild.id, config):
+        return "using a banned word/phrase"
+
     if config.get("automod_antiinvite", True) and not allow_invites and _has_invite(content):
         return "posting an unauthorized invite link"
+
+    if config.get("automod_antishortener", True) and not allow_invites and _has_shortener_link(content):
+        return "posting a link-shortener (hides the real destination)"
 
     if config.get("automod_antilink", True) and not allow_invites and _has_link(content):
         return "posting an unauthorized link"
@@ -1252,8 +1354,14 @@ async def handle_automod_violation(message: discord.Message, config: dict, reaso
     """Deletes the offending message, issues a real warn (source=automod), and
     escalates to a mute (never a kick/ban) once active automod-warns in the last
     24h cross a threshold. If the offender holds a staff tier role, the abuse is
-    zero-tolerance: strip the staff role immediately and mute, regardless of
-    warn count — staff are held to a stricter bar than regular members."""
+    zero-tolerance: strip ONLY their staff-tier role(s) (trial/mod/senior/
+    partnership — whichever are configured) and mute, regardless of warn count.
+    Every other role they hold (color roles, level roles, booster role, etc.)
+    is left completely untouched — this only ever removes roles whose IDs are
+    explicitly configured as staff-tier roles via `.quicksetup`. This is a
+    different, lighter system than anti-nuke containment (which strips ALL
+    roles + snapshots them, because that's responding to a server-nuke-in-
+    -progress, a much higher threat tier than tripping a word filter)."""
     try:
         await message.delete()
     except discord.HTTPException:
@@ -1263,15 +1371,16 @@ async def handle_automod_violation(message: discord.Message, config: dict, reaso
     tier = await get_staff_tier(member, config)
     if tier > TIER_NONE and not member.guild_permissions.administrator:
         stripped = []
+        staff_role_ids = set()
         for key in (*STAFF_TIER_KEYS.values(), PARTNERSHIP_KEY):
-            role_ids = set(config.get(key, []) or [])
-            for role in list(member.roles):
-                if role.id in role_ids:
-                    try:
-                        await member.remove_roles(role, reason=f"Automod abuse by staff: {reason}")
-                        stripped.append(role.name)
-                    except discord.Forbidden:
-                        pass
+            staff_role_ids |= set(config.get(key, []) or [])
+        for role in list(member.roles):
+            if role.id in staff_role_ids:  # ONLY the staff/partnership role(s) — nothing else is ever touched
+                try:
+                    await member.remove_roles(role, reason=f"Automod abuse by staff: {reason}")
+                    stripped.append(role.name)
+                except discord.Forbidden:
+                    pass
         try:
             await member.timeout(timedelta(minutes=30), reason=f"Staff automod abuse: {reason}")
         except discord.Forbidden:
@@ -1294,15 +1403,14 @@ async def handle_automod_violation(message: discord.Message, config: dict, reaso
                     await chan.send(embed=embed)
                 except discord.HTTPException:
                     pass
-        try:
-            await member.send(
-                f"🚨 You tripped automod in **{message.guild.name}** while holding a staff role "
-                f"(**{reason}**). Your staff role(s) have been stripped and you've been muted 30m. "
-                f"This is logged as staff abuse — reach out to a Senior Moderator/Admin if you believe "
-                f"this was a mistake."
-            )
-        except discord.Forbidden:
-            pass
+        await send_dm_embed(
+            member,
+            f"You tripped automod in **{message.guild.name}** while holding a staff role "
+            f"(**{reason}**). Your staff role(s) have been stripped and you've been muted 30m. "
+            f"This is logged as staff abuse — reach out to a Senior Moderator/Admin if you believe "
+            f"this was a mistake.",
+            title="🚨 Staff Abuse Detected", color=discord.Color.dark_red(),
+        )
         await bot.db.add_warn(message.guild.id, member.id, bot.user.id, f"STAFF ABUSE — Automod: {reason}", source="automod")
         return
 
@@ -1417,7 +1525,7 @@ def staff_tier_check(min_tier: int):
         if tier >= min_tier:
             return True
         needed = TIER_NAMES.get(min_tier, "Staff")
-        await ctx.send(f"nah, you need to be **{needed}** to use that.")
+        await send_reply(ctx, f"nah, you need to be **{needed}** to use that.")
         return False
     return commands.check(predicate)
 
@@ -1433,22 +1541,22 @@ async def validate_mod_target(ctx: commands.Context, target: discord.Member) -> 
     if ctx.author.guild_permissions.administrator:
         return True
     if target.id == ctx.author.id:
-        await ctx.send("you can't do that to yourself lol")
+        await send_reply(ctx, "you can't do that to yourself lol")
         return False
     if target.id == bot.user.id:
-        await ctx.send("bro leave me out of it 💀")
+        await send_reply(ctx, "bro leave me out of it 💀")
         return False
     if ctx.guild.owner_id and target.id == ctx.guild.owner_id:
-        await ctx.send("can't touch the owner, not doing that")
+        await send_reply(ctx, "can't touch the owner, not doing that")
         return False
     config = await get_config(ctx.guild.id, bot.db)
     actor_tier = await get_staff_tier(ctx.author, config)
     target_tier = await get_staff_tier(target, config)
     if target_tier > TIER_NONE and target_tier >= actor_tier and not target.guild_permissions.administrator:
-        await ctx.send("can't take action on someone at your tier or above")
+        await send_reply(ctx, "can't take action on someone at your tier or above")
         return False
     if target.guild_permissions.administrator:
-        await ctx.send("can't take action on an admin")
+        await send_reply(ctx, "can't take action on an admin")
         return False
     return True
 
@@ -1579,6 +1687,7 @@ async def antinuke_punish(guild: discord.Guild, executor: discord.abc.User, reas
     stripped = []
     if member:
         stripped = await antinuke_contain(member, reason)
+        await bot.db.add_warn(guild.id, executor.id, bot.user.id, f"Anti-nuke: {reason}", source="antinuke")
 
     alert_id = config.get("log_alerts_channel") or config.get("modlog_channel")
     chan = guild.get_channel(alert_id) if alert_id else None
@@ -1598,14 +1707,13 @@ async def antinuke_punish(guild: discord.Guild, executor: discord.abc.User, reas
         except discord.HTTPException:
             pass
     if member:
-        try:
-            await member.send(
-                f"🚨 Anti-nuke contained your account in **{guild.name}** — your roles were stripped "
-                f"(snapshotted, fully restorable) and you were timed out for safety. Reason: {reason}. "
-                f"If this was a mistake, contact a Senior Moderator/Admin to get released."
-            )
-        except discord.Forbidden:
-            pass
+        await send_dm_embed(
+            member,
+            f"Anti-nuke contained your account in **{guild.name}** — your roles were stripped "
+            f"(snapshotted, fully restorable) and you were timed out for safety. Reason: {reason}. "
+            f"If this was a mistake, contact a Senior Moderator/Admin to get released.",
+            title="🚨 Anti-Nuke Containment", color=discord.Color.dark_red(),
+        )
     logger.warning("ANTI-NUKE: %s tripped '%s' in guild %s", executor, reason, guild.id)
 
 
@@ -1773,6 +1881,17 @@ class AjsCrib(commands.Bot):
         self._stats_last_update: dict[int, float] = {}  # channel_id -> monotonic time
         self.invite_cache: dict[int, dict[str, int]] = {}  # guild_id -> {code: uses}
         self._voice_sessions: dict[tuple[int, int], float] = {}  # (guild_id, user_id) -> monotonic join time
+        # AFK system — purely in-memory (resets on restart, which is fine: it's a
+        # "be right back" indicator, not something that needs to survive a deploy).
+        # key: (guild_id, user_id) -> {"reason": str, "since": datetime, "pinged_by": dict[int, float]}
+        self._afk: dict[tuple[int, int], dict] = {}
+        # Global default cooldown — applies to any command that doesn't already
+        # define its own @commands.cooldown (warn/kick/ban/mute/tempban/softban
+        # keep their own, tighter, hand-tuned limits; this just closes the gap
+        # for everything else, e.g. spamming .ping or .leaderboard). Staff
+        # (TIER_TRIAL+) are exempt — they're trusted enough to run mod commands,
+        # rate-limiting their workflow would just get in the way.
+        self._default_cooldown = commands.CooldownMapping.from_cooldown(3, 8.0, commands.BucketType.user)
 
     async def setup_hook(self):
         mongo_uri = os.getenv("MONGO_URI")
@@ -1800,6 +1919,21 @@ class AjsCrib(commands.Bot):
                 for member in channel.members:
                     if _voice_member_eligible(member, channel):
                         self._voice_sessions[(guild.id, member.id)] = time.monotonic()
+
+        # warm the in-memory AFK cache from the DB — AFK now persists across
+        # restarts, this is what makes that actually take effect on boot
+        # instead of everyone silently staying "AFK" in the DB but invisible
+        # to the running bot until they happen to talk again
+        try:
+            for doc in await self.db.get_all_afk():
+                self._afk[(doc["guild_id"], doc["user_id"])] = {
+                    "reason": doc.get("reason", "AFK"),
+                    "since": doc["since"],
+                    "pinged_by": {},
+                }
+            logger.info("Restored %d AFK entr%s from the database", len(self._afk), "y" if len(self._afk) == 1 else "ies")
+        except Exception as exc:
+            logger.warning("Could not warm AFK cache from DB: %s", exc)
 
         # background loops
         self.tempmute_loop.start()
@@ -1956,13 +2090,12 @@ class AjsCrib(commands.Bot):
                         continue
                     last_at = doc.get("last_action_at")
                     idle_days = (datetime.now(timezone.utc) - last_at).days if last_at else days
-                    try:
-                        await member.send(
-                            f"hey — you haven't logged any staff actions in **{guild.name}** for **{idle_days}d** "
-                            f"(threshold: {days}d). just a heads up, not a punishment. any mod action resets this."
-                        )
-                    except discord.Forbidden:
-                        pass
+                    await send_dm_embed(
+                        member,
+                        f"You haven't logged any staff actions in **{guild.name}** for **{idle_days}d** "
+                        f"(threshold: {days}d). Just a heads up, not a punishment — any mod action resets this.",
+                        title="👀 Staff Activity Reminder", color=discord.Color.gold(),
+                    )
                     await self.db.mark_staff_alerted(guild.id, doc.get("user_id"))
             except Exception as e:
                 logger.error("staff_inactivity_loop error for guild %s: %s", guild.id, e)
@@ -2066,6 +2199,35 @@ class AjsCrib(commands.Bot):
 bot = AjsCrib()
 
 
+@bot.before_invoke
+async def _global_cooldown_gate(ctx: commands.Context):
+    """Applies a default per-user cooldown (3 uses / 8s) to any command that
+    doesn't already define its own @commands.cooldown. Commands like warn/
+    kick/ban/mute/tempban/softban keep their existing, separately-tuned
+    limits untouched — this only fills the gap for everything else (.ping,
+    .leaderboard, .userinfo, etc. previously had zero rate-limiting at all).
+    Staff (TIER_TRIAL+) are exempt since they're already trusted to run real
+    moderation commands; rate-limiting their day-to-day use would just be
+    friction with no real anti-abuse benefit."""
+    if not ctx.guild or ctx.command is None:
+        return
+    # If the command already has its own cooldown bucket configured, that one
+    # wins — don't double up or override hand-tuned per-command limits.
+    buckets = getattr(ctx.command, "_buckets", None)
+    if buckets is not None and getattr(buckets, "_cooldown", None) is not None:
+        return
+    if ctx.author.guild_permissions.administrator:
+        return
+    config = await get_config(ctx.guild.id, bot.db)
+    tier = await get_staff_tier(ctx.author, config)
+    if tier >= TIER_TRIAL:
+        return
+    bucket = bot._default_cooldown.get_bucket(ctx.message)
+    retry_after = bucket.update_rate_limit()
+    if retry_after:
+        raise commands.CommandOnCooldown(bucket, retry_after, commands.BucketType.user)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TICKETS — persistent button views
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2118,6 +2280,88 @@ async def _build_ticket_transcript_and_close(channel: discord.abc.GuildChannel, 
         await channel.delete(reason=f"Ticket closed by {closer}")
     except discord.HTTPException:
         pass
+
+
+class ConfirmView(discord.ui.View):
+    """Reusable Confirm/Cancel prompt for destructive mod actions (ban,
+    tempban, softban, kick). Only the staff member who invoked the command
+    can press a button — anyone else clicking gets a quiet ephemeral nudge,
+    nothing happens. Auto-disables both buttons after 30s of no response
+    (treated as a cancel) so a forgotten prompt can't be clicked hours later.
+    Usage:
+        view = ConfirmView(ctx.author)
+        msg = await ctx.send(embed=..., view=view)
+        await view.wait()
+        if not view.confirmed:
+            await msg.edit(content="cancelled / timed out", embed=None, view=None)
+            return
+        await msg.delete()  # or edit to a "confirmed" state, caller's choice
+    """
+    def __init__(self, author: discord.abc.User, *, timeout: float = 30.0):
+        super().__init__(timeout=timeout)
+        self.author = author
+        self.confirmed: Optional[bool] = None  # None = timed out / never answered
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message("this isn't your confirmation to answer", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
+    @discord.ui.button(label="Confirm", emoji="✅", style=discord.ButtonStyle.red)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = True
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", emoji="✖️", style=discord.ButtonStyle.grey)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.confirmed = False
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+
+async def _confirm_destructive_action(ctx: commands.Context, *, action_emoji: str, action_title: str,
+                                       member: discord.Member, reason: str, extra: str = "") -> bool:
+    """Shows a Confirm/Cancel prompt for a punitive command, waits for a
+    response, and returns True only if the staff member explicitly clicked
+    Confirm. Edits the prompt message in place to show the outcome either
+    way, so there's no leftover stale "pending" message cluttering the
+    channel. Times out after 30s and treats that as a cancel — silence
+    should never accidentally execute a ban/kick."""
+    embed = discord.Embed(
+        title=f"{action_emoji} Confirm {action_title}",
+        description=f"**Target:** {member.mention} (`{member.id}`)\n**Reason:** {reason}{extra}",
+        color=discord.Color.orange(),
+    )
+    embed.set_footer(text="This will time out in 30s if no response.")
+    view = ConfirmView(ctx.author)
+    msg = await ctx.send(embed=embed, view=view)
+    await view.wait()
+
+    if not view.confirmed:
+        timed_out = view.confirmed is None
+        embed.title = f"⏳ {action_title} cancelled (timed out)" if timed_out else f"✖️ {action_title} cancelled"
+        embed.color = discord.Color.greyple()
+        try:
+            await msg.edit(embed=embed, view=None)
+        except discord.HTTPException:
+            pass
+        return False
+
+    try:
+        await msg.delete()  # confirmed — let the command's own result message speak instead
+    except discord.HTTPException:
+        pass
+    return True
 
 
 class TicketCloseView(discord.ui.View):
@@ -2291,8 +2535,15 @@ class CloseButtonView(discord.ui.View):
         await interaction.response.edit_message(content="✅ Saved.", embed=None, view=None)
 
 
+DEFAULT_INVITE_TEMPLATE = "**{inviter}** invited **{mention}**. **{inviter}** now has **{invites}** invite(s)."
+DEFAULT_WELCOME_TEMPLATE = "🌺 Welcome to **{server}**, {mention}! You're member #{count}."
+
+
 class ChannelPickSelect(discord.ui.ChannelSelect):
-    """Generic single-channel picker that writes straight to guild config."""
+    """Generic single-channel picker that writes straight to guild config. For
+    invite_log_channel / welcome_channel specifically, also seeds a sensible
+    default message template if one isn't set yet — so picking the channel
+    alone is enough to make the feature work, with no extra command needed."""
     def __init__(self, config_key: str, label: str, channel_types=None):
         super().__init__(
             placeholder=f"Select a channel for {label}...",
@@ -2305,8 +2556,23 @@ class ChannelPickSelect(discord.ui.ChannelSelect):
     async def callback(self, interaction: discord.Interaction):
         channel = self.values[0]
         await bot.db.update_config(interaction.guild.id, self.config_key, channel.id)
+
+        extra = ""
+        if self.config_key == "invite_log_channel":
+            config = await get_config(interaction.guild.id, bot.db)
+            if not config.get("invite_template"):
+                await bot.db.update_config(interaction.guild.id, "invite_template", DEFAULT_INVITE_TEMPLATE)
+                extra = (f"\n📨 A default message is now active here, e.g. *\"{DEFAULT_INVITE_TEMPLATE}\"* "
+                         f"— customize anytime with `{PREFIX}setinvitelog <message>`.")
+        elif self.config_key == "welcome_channel":
+            config = await get_config(interaction.guild.id, bot.db)
+            if not config.get("welcome_template"):
+                await bot.db.update_config(interaction.guild.id, "welcome_template", DEFAULT_WELCOME_TEMPLATE)
+                extra = (f"\n👋 A default welcome message is now active here — customize anytime with "
+                         f"`{PREFIX}setwelcome <message>`.")
+
         await interaction.response.edit_message(
-            content=f"✅ **{self.label_text}** set to <#{channel.id}>.", view=CloseButtonView(),
+            content=f"✅ **{self.label_text}** set to <#{channel.id}>.{extra}", view=CloseButtonView(),
         )
 
 
@@ -2477,11 +2743,13 @@ AUTOMOD_FEATURES = [
     ("antispam",    "Anti-Spam / Flood",        "🌊"),
     ("antiinvite",  "Anti-Invite Links",        "🔗"),
     ("antilink",    "Anti-Link (all URLs)",     "🚫"),
+    ("antishortener", "Anti-Link-Shortener",    "🔀"),
     ("mentionspam", "Mass Mention Spam",        "📣"),
     ("zalgo",       "Zalgo / Unicode Spam",     "👹"),
     ("capsspam",    "Excessive Caps",           "🔠"),
     ("emojispam",   "Emoji Spam",               "🤡"),
     ("scamlinks",   "Scam/Phishing Domains",    "🎣"),
+    ("bannedwords", "Custom Word Filter",       "🚷"),
 ]
 
 
@@ -2536,6 +2804,62 @@ class AutomodView(discord.ui.View):
         super().__init__(timeout=300)
         self.add_item(AutomodToggleSelect(config))
         self.add_item(AutomodLogSelect())
+
+    @discord.ui.button(label="Done", emoji="✅", style=discord.ButtonStyle.success, row=2)
+    async def done(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(view=None)
+
+
+# ── Anti-Nuke configuration ──────────────────────────────────────────────────
+
+ANTINUKE_FEATURES = [
+    ("channels",   "Mass Channel Create/Delete", "📁"),
+    ("roles",      "Mass Role Create/Delete",    "🪪"),
+    ("bans",       "Mass Bans/Kicks",             "🔨"),
+    ("webhooks",   "Webhook Spam",                "🪝"),
+    ("permgrant",  "Admin-Perm Grants (zero tolerance)", "🚨"),
+]
+
+
+def _antinuke_status_embed(config: dict) -> discord.Embed:
+    lines = []
+    for key, label, emoji in ANTINUKE_FEATURES:
+        on = config.get(f"antinuke_{key}", True)
+        lines.append(f"{emoji} **{label}** — {'🟢 ON' if on else '🔴 OFF'}")
+    alert_id = config.get("log_alerts_channel") or config.get("modlog_channel")
+    lines.append(f"\n🚨 Alerts channel: {f'<#{alert_id}>' if alert_id else '*not set — set it in Logs!*'}")
+    lines.append(
+        "\n**On trigger:** the culprit is contained — every role stripped (snapshotted, fully "
+        "restorable with `.release`), 60-minute safety timeout, owner pinged in the alerts channel. "
+        "Only the server owner is exempt — staff and admins are NOT. Never bans/kicks automatically."
+    )
+    return discord.Embed(title="🚨 Anti-Nuke Settings", color=discord.Color.dark_red(), description="\n".join(lines))
+
+
+class AntinukeToggleSelect(discord.ui.Select):
+    def __init__(self, config: dict):
+        options = [
+            discord.SelectOption(label=label, value=key, emoji=emoji, default=config.get(f"antinuke_{key}", True))
+            for key, label, emoji in ANTINUKE_FEATURES
+        ]
+        super().__init__(
+            placeholder="Toggle protections — selected = ON",
+            min_values=0, max_values=len(options), options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        chosen = set(self.values)
+        for key, _, _ in ANTINUKE_FEATURES:
+            await bot.db.update_config(interaction.guild.id, f"antinuke_{key}", key in chosen)
+        config = await get_config(interaction.guild.id, bot.db)
+        await interaction.response.edit_message(embed=_antinuke_status_embed(config), view=self.view)
+
+
+class AntinukeView(discord.ui.View):
+    def __init__(self, config: dict):
+        super().__init__(timeout=300)
+        self.add_item(AntinukeToggleSelect(config))
+        self.add_item(ChannelPickSelectInline("log_alerts_channel", "Anti-Nuke Alerts Channel"))
 
     @discord.ui.button(label="Done", emoji="✅", style=discord.ButtonStyle.success, row=2)
     async def done(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2630,8 +2954,10 @@ class LogsSetupSelect(discord.ui.Select):
                                   description="Channel/role create, delete, update"),
             discord.SelectOption(label="Entry/Exit Logs", value="log_entryexit_channel", emoji="🚪",
                                   description="Member joins (raid screening included)"),
+            discord.SelectOption(label="Welcome Messages", value="welcome_channel", emoji="👋",
+                                  description="Public 'welcome to the server' announcement"),
             discord.SelectOption(label="Invite Tracker", value="invite_log_channel", emoji="📨",
-                                  description="Who invited each new member (set text via .setinvitelog)"),
+                                  description="\"X invited Y, who now has Z invites\" — works immediately"),
             discord.SelectOption(label="Bot Logs", value="log_bot_channel", emoji="🤖",
                                   description="Command errors & bot status"),
             discord.SelectOption(label="Ticket Transcripts", value="transcript_channel", emoji="🧾",
@@ -2655,15 +2981,30 @@ class LogsSetupView(discord.ui.View):
         self.add_item(LogsSetupSelect())
 
 
+class AutorolesView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(RolePickSelect("autoroles", "Autoroles", max_values=10))
+
+    @discord.ui.button(label="Clear All Autoroles", emoji="🗑️", style=discord.ButtonStyle.danger, row=1)
+    async def clear(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await bot.db.update_config(interaction.guild.id, "autoroles", [])
+        await interaction.response.edit_message(content="🗑️ Cleared all autoroles — new members won't get any role automatically now.", embed=None, view=CloseButtonView())
+
+
 class SetupHubSelect(discord.ui.Select):
     def __init__(self):
         options = [
+            discord.SelectOption(label="Autoroles", value="autoroles", emoji="🎭",
+                                  description="Role(s) auto-given to every new member on join"),
             discord.SelectOption(label="Level Roles", value="levelroles", emoji="⭐",
                                   description="Pick roles awarded at each level (multi-select)"),
             discord.SelectOption(label="Level-Up Announcements", value="levelup", emoji="🎉",
                                   description="Channel where level-up messages are posted"),
             discord.SelectOption(label="Automod", value="automod", emoji="🛡️",
                                   description="Toggle spam/invite/mention/zalgo filters"),
+            discord.SelectOption(label="Anti-Nuke", value="antinuke", emoji="🚨",
+                                  description="Mass channel/role/ban/webhook/permgrant protection"),
             discord.SelectOption(label="Tickets", value="tickets", emoji="🎫",
                                   description="Ticket category & support role"),
             discord.SelectOption(label="Staff Roles", value="staffroles", emoji="🪪",
@@ -2677,7 +3018,20 @@ class SetupHubSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         value = self.values[0]
-        if value == "levelroles":
+        if value == "autoroles":
+            config = await get_config(interaction.guild.id, bot.db)
+            current = config.get("autoroles", []) or []
+            mentions = ", ".join(f"<@&{rid}>" for rid in current) if current else "*none set*"
+            embed = discord.Embed(
+                title="🎭 Autoroles", color=discord.Color.teal(),
+                description=(
+                    f"Currently given to every new member on join: {mentions}\n\n"
+                    "Pick up to 10 roles below — selecting saves immediately and **replaces** the "
+                    "current set. Make sure my role sits above any role you pick, or I can't assign it."
+                ),
+            )
+            await interaction.response.send_message(embed=embed, view=AutorolesView(), ephemeral=True)
+        elif value == "levelroles":
             ladder = await _build_ladder_text(interaction.guild)
             embed = discord.Embed(title="⭐ Level Roles", color=discord.Color.gold(),
                                    description=f"**Current ladder:**\n{ladder}")
@@ -2690,6 +3044,9 @@ class SetupHubSelect(discord.ui.Select):
         elif value == "automod":
             config = await get_config(interaction.guild.id, bot.db)
             await interaction.response.send_message(embed=_automod_status_embed(config), view=AutomodView(config), ephemeral=True)
+        elif value == "antinuke":
+            config = await get_config(interaction.guild.id, bot.db)
+            await interaction.response.send_message(embed=_antinuke_status_embed(config), view=AntinukeView(config), ephemeral=True)
         elif value == "tickets":
             await interaction.response.send_message(
                 "Set up your ticket category and support role:", view=TicketsSetupView(), ephemeral=True,
@@ -2724,6 +3081,49 @@ class SetupHubView(discord.ui.View):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  EMBED REPLIES — every command response goes through this, never plain text
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _embed_color_for(text: str) -> discord.Color:
+    """Auto-picks a color based on the leading emoji/tone of the message, so
+    every reply looks intentional without hand-picking a color every time."""
+    t = text.strip()
+    if t.startswith(("✅", "🟢", "🔓", "🧹")):
+        return discord.Color.green()
+    if t.startswith(("⚠️", "🟡")):
+        return discord.Color.gold()
+    if t.startswith(("⛔", "❌", "🔴", "can't", "you can't", "nah", "bro")):
+        return discord.Color.red()
+    if t.startswith(("🔨", "👋", "🔇", "🔒", "⛔", "🚨")):
+        return discord.Color.orange()
+    if t.startswith(("🏓", "📨", "📊", "🏆", "🌺")):
+        return discord.Color.blurple()
+    return discord.Color.blurple()
+
+
+def make_embed(text: str, *, title: Optional[str] = None, color: Optional[discord.Color] = None) -> discord.Embed:
+    return discord.Embed(title=title, description=text, color=color or _embed_color_for(text))
+
+
+async def send_reply(ctx: commands.Context, text: str, *, title: Optional[str] = None,
+                      color: Optional[discord.Color] = None, **kwargs):
+    """Drop-in replacement for `ctx.send(text)` that wraps the text in a clean,
+    auto-colored embed instead of sending plain text. Returns the sent Message
+    (same as ctx.send), so callers that later `.edit()` the result still work."""
+    return await ctx.send(embed=make_embed(text, title=title, color=color), **kwargs)
+
+
+async def send_dm_embed(member: discord.abc.User, text: str, *, title: Optional[str] = None,
+                         color: Optional[discord.Color] = None):
+    """Same idea as send_reply, but for direct messages to a member."""
+    try:
+        await member.send(embed=make_embed(text, title=title, color=color))
+        return True
+    except discord.Forbidden:
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  EVENTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2753,6 +3153,128 @@ async def on_ready():
     logger.info("aj's crib is online as %s (id: %s) — prefix '%s'", bot.user, bot.user.id, PREFIX)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AFK SYSTEM
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Persisted to MongoDB (the `afk` collection) so AFK status survives a bot
+# restart/deploy — previously this was purely in-memory and a restart would
+# silently un-AFK everyone with zero warning. `bot._afk` is still kept as an
+# in-memory read-through cache (every single message in the server checks
+# AFK status, so hitting Mongo on every message would be wasteful) — it's
+# warmed once from the DB in setup_hook and kept in sync on every write.
+# Handles: setting/clearing AFK with an optional reason, auto-clearing the
+# moment the AFK member talks again, notifying anyone who @mentions them
+# (rate-limited per-pinger so one person spamming pings doesn't spam replies
+# back), and a best-effort `[AFK]` nickname tag.
+
+AFK_PING_NOTICE_COOLDOWN = 30.0  # seconds — don't re-notify the same pinger faster than this
+AFK_NICK_TAG = "[AFK] "
+
+
+def _afk_key(guild_id: int, user_id: int) -> tuple[int, int]:
+    return (guild_id, user_id)
+
+
+async def _set_afk(member: discord.Member, reason: str):
+    since = datetime.now(timezone.utc)
+    await bot.db.set_afk(member.guild.id, member.id, reason, since)
+    bot._afk[_afk_key(member.guild.id, member.id)] = {
+        "reason": reason,
+        "since": since,
+        "pinged_by": {},  # pinger_id -> last-notified monotonic time (in-memory only, not persisted)
+    }
+    if len(member.display_name) + len(AFK_NICK_TAG) <= 32 and not member.display_name.startswith(AFK_NICK_TAG):
+        try:
+            await member.edit(nick=f"{AFK_NICK_TAG}{member.display_name}", reason="AFK")
+        except discord.HTTPException:
+            pass  # missing perms, role hierarchy, rate limit, etc. — silently skip, AFK still works without it
+
+
+async def _clear_afk(member: discord.Member) -> Optional[dict]:
+    entry = bot._afk.pop(_afk_key(member.guild.id, member.id), None)
+    await bot.db.clear_afk(member.guild.id, member.id)
+    if entry and member.display_name.startswith(AFK_NICK_TAG):
+        try:
+            await member.edit(nick=member.display_name[len(AFK_NICK_TAG):] or None, reason="No longer AFK")
+        except discord.HTTPException:
+            pass
+    return entry
+
+
+def _format_afk_duration(since: datetime) -> str:
+    delta = datetime.now(timezone.utc) - since
+    secs = int(delta.total_seconds())
+    if secs < 60:
+        return f"{secs}s"
+    mins, secs = divmod(secs, 60)
+    if mins < 60:
+        return f"{mins}m"
+    hours, mins = divmod(mins, 60)
+    if hours < 24:
+        return f"{hours}h {mins}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h"
+
+
+async def _handle_afk(message: discord.Message) -> bool:
+    """Returns True if the author was AFK and just got auto-cleared (caller
+    should skip the rest of normal processing for THIS message — they were
+    just announcing they're back, that's not a real message to react to —
+    though commands still run as normal via process_commands later)."""
+    author_key = _afk_key(message.guild.id, message.author.id)
+    was_afk = bot._afk.get(author_key)
+    if was_afk:
+        await _clear_afk(message.author)
+        try:
+            await message.channel.send(
+                f"👋 Welcome back {message.author.mention}, I've removed your AFK "
+                f"(you were away for **{_format_afk_duration(was_afk['since'])}**).",
+                delete_after=15,
+            )
+        except discord.HTTPException:
+            pass
+
+    # notify pingers about any mentioned member who's currently AFK
+    if message.mentions:
+        now = time.monotonic()
+        notices = []
+        for mentioned in message.mentions:
+            if mentioned.id == message.author.id or mentioned.bot:
+                continue
+            entry = bot._afk.get(_afk_key(message.guild.id, mentioned.id))
+            if not entry:
+                continue
+            last_notice = entry["pinged_by"].get(message.author.id, 0)
+            if now - last_notice < AFK_PING_NOTICE_COOLDOWN:
+                continue
+            entry["pinged_by"][message.author.id] = now
+            reason = entry["reason"] or "AFK"
+            notices.append(f"💤 **{mentioned.display_name}** is away ({reason}) — AFK for {_format_afk_duration(entry['since'])}")
+        if notices:
+            try:
+                await message.channel.send("\n".join(notices), delete_after=20)
+            except discord.HTTPException:
+                pass
+
+    return bool(was_afk)
+
+
+@bot.command(name="afk")
+async def afk_cmd(ctx: commands.Context, *, reason: str = "AFK"):
+    """Mark yourself AFK. Clears automatically the moment you send another
+    message. Anyone who @mentions you while you're AFK gets a heads-up.
+    Persists across bot restarts — you'll still show as AFK if the bot
+    reconnects while you're away."""
+    reason = reason.strip()[:100] or "AFK"
+    await _set_afk(ctx.author, reason)
+    embed = discord.Embed(
+        description=f"💤 {ctx.author.mention} is now AFK: **{reason}**",
+        color=discord.Color.greyple(),
+    )
+    await ctx.send(embed=embed)
+
+
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     await _refresh_invite_cache(guild)
@@ -2772,6 +3294,11 @@ async def on_invite_delete(invite: discord.Invite):
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
+
+    # AFK: auto-clear the author if they were away, and notify anyone who
+    # @mentioned a currently-AFK member. Runs before automod/XP so it always
+    # fires even if the message later gets deleted for another reason.
+    await _handle_afk(message)
 
     config = await get_config(message.guild.id, bot.db)
 
@@ -2831,7 +3358,7 @@ async def on_message(message: discord.Message):
     # Daily message activity counter (for .analytics activity)
     try:
         today = datetime.now(timezone.utc).date().isoformat()
-        await bot.db._client["lxte_assistant"]["daily_msg_counts"].update_one(
+        await bot.db._client["ajscrib"]["daily_msg_counts"].update_one(
             {"guild_id": message.guild.id, "date": today},
             {"$inc": {"count": 1}},
             upsert=True,
@@ -2907,14 +3434,13 @@ async def _dm_raid_flag(member: discord.Member, action: str, reason: str):
     if action == "log_only":
         return
     verb = {"kick": "removed you from", "timeout": "temporarily restricted you in"}.get(action, "flagged you in")
-    try:
-        await member.send(
-            f"👋 Heads up — our anti-raid system {verb} **{member.guild.name}**.\n"
-            f"Reason: {reason}\n\n"
-            f"If this was a mistake, reach out to the server's staff to get it sorted."
-        )
-    except discord.Forbidden:
-        pass
+    await send_dm_embed(
+        member,
+        f"Our anti-raid system {verb} **{member.guild.name}**.\n"
+        f"Reason: {reason}\n\n"
+        f"If this was a mistake, reach out to the server's staff to get it sorted.",
+        title="👋 Heads Up", color=discord.Color.orange(),
+    )
 
 
 @bot.event
@@ -2926,9 +3452,21 @@ async def on_member_join(member: discord.Member):
     config = await get_config(member.guild.id, bot.db)
     age_days = (datetime.now(timezone.utc) - member.created_at).days
 
+    autorole_ids = config.get("autoroles", []) or []
+    if autorole_ids:
+        roles = [member.guild.get_role(rid) for rid in autorole_ids]
+        roles = [r for r in roles if r is not None]
+        if roles:
+            try:
+                await member.add_roles(*roles, reason="Autorole on join")
+            except discord.Forbidden:
+                logger.warning("Autorole failed in guild %s — missing permissions or role above bot's top role", member.guild.id)
+
     raid_reason, is_severe = await _check_join_raid(member, config)
     if raid_reason:
         action = config.get("raidcheck_action", "timeout")  # "timeout", "kick", or "log_only"
+        if action != "log_only":
+            await bot.db.add_warn(member.guild.id, member.id, bot.user.id, f"Anti-raid: {raid_reason}", source="antiraid")
         if action == "kick":
             try:
                 await member.kick(reason=f"Anti-raid: {raid_reason}")
@@ -3024,6 +3562,12 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_member_remove(member: discord.Member):
+    bot._afk.pop(_afk_key(member.guild.id, member.id), None)  # don't leak AFK entries for members who left
+    try:
+        await bot.db.clear_afk(member.guild.id, member.id)
+    except Exception as e:
+        logger.warning("Failed to clear persisted AFK on member leave: %s", e)
+
     try:
         await bot.refresh_stats_channels(member.guild)
     except Exception as e:
@@ -3178,26 +3722,48 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.CommandOnCooldown):
-        await ctx.send(f"⏳ Slow down — try that again in `{error.retry_after:.1f}s`.", delete_after=5)
+        await send_reply(ctx, f"⏳ Slow down — try that again in `{error.retry_after:.1f}s`.", delete_after=5)
         return
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"⚠️ Missing argument: `{error.param.name}`. Check `{PREFIX}help`.")
+        await send_reply(ctx, f"⚠️ Missing argument: `{error.param.name}`. Check `{PREFIX}help`.")
+        return
+    if isinstance(error, commands.TooManyArguments):
+        await send_reply(ctx, f"⚠️ Too many arguments for that command. Check `{PREFIX}help`.")
         return
     if isinstance(error, (commands.MissingPermissions, commands.CheckFailure)):
         return  # staff_tier_check() and friends already message the user themselves
     if isinstance(error, commands.BotMissingPermissions):
-        await ctx.send("⛔ I'm missing the permissions needed to do that.")
+        await send_reply(ctx, "⛔ I'm missing the permissions needed to do that.")
+        return
+    if isinstance(error, commands.NoPrivateMessage):
+        await send_reply(ctx, "⚠️ That command only works in a server, not in DMs.")
         return
     if isinstance(error, commands.BadArgument):
-        await ctx.send(f"⚠️ Bad argument: {error}")
+        await send_reply(ctx, f"⚠️ Bad argument: {error}")
         return
-    logger.exception("Unhandled command error in %s: %s", ctx.command, error)
-    await ctx.send("❌ Something went wrong running that command.")
+
+    # CommandInvokeError wraps whatever actually went wrong inside the command
+    # body (a discord.Forbidden, a KeyError, etc.) — unwrap it so both the
+    # user-facing message and the log show the REAL error, not just
+    # "CommandInvokeError" with no useful detail.
+    original = getattr(error, "original", error)
+    if isinstance(original, discord.Forbidden):
+        await send_reply(ctx, "⛔ I don't have permission to do that — check my role position/permissions.")
+        return
+    if isinstance(original, discord.NotFound):
+        await send_reply(ctx, "⚠️ That couldn't be found — it may have already been deleted.")
+        return
+    if isinstance(original, discord.HTTPException):
+        await send_reply(ctx, "⚠️ Discord rejected that request — try again in a moment.")
+        return
+
+    logger.exception("Unhandled command error in %s: %s", ctx.command, original)
+    await send_reply(ctx, "❌ Something went wrong running that command.")
     if ctx.guild:
         config = await get_config(ctx.guild.id, bot.db)
         await _send_log(ctx.guild, config, "log_bot_channel",
                          embed=discord.Embed(title="❌ Command Error", color=discord.Color.red(),
-                                              description=f"`{ctx.command}` by {ctx.author.mention}: ```{error}```"))
+                                              description=f"`{ctx.command}` by {ctx.author.mention}: ```{original}```"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3206,7 +3772,7 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 
 @bot.command(name="ping")
 async def ping_cmd(ctx: commands.Context):
-    await ctx.send(f"🏓 Pong! `{round(bot.latency * 1000)}ms`")
+    await send_reply(ctx, f"🏓 Pong! `{round(bot.latency * 1000)}ms`")
 
 
 @bot.command(name="help")
@@ -3228,6 +3794,7 @@ async def help_cmd(ctx: commands.Context, category: str = None):
             "title": "Moderation",
             "value": (
                 f"`{PREFIX}warn` `{PREFIX}warnings` `{PREFIX}clearwarns` @user\n"
+                f"`{PREFIX}warndecay [days]` — warns expire after N days *(Senior+)*\n"
                 f"`{PREFIX}kick` `{PREFIX}ban` `{PREFIX}tempban @user 1d`\n"
                 f"`{PREFIX}mute @user 10m` `{PREFIX}unmute`\n"
                 f"`{PREFIX}case <#>` `{PREFIX}cases @user`\n"
@@ -3240,10 +3807,12 @@ async def help_cmd(ctx: commands.Context, category: str = None):
             "emoji": "🛡️",
             "title": "Automod",
             "value": (
-                f"Auto-deletes spam, invites, links, mass mentions, zalgo, caps, scam domains\n"
+                f"Auto-deletes spam, invites, links, shorteners, banned words, mass mentions, "
+                f"zalgo, caps, scam domains\n"
                 f"Always warns first — mutes only after repeat warns (5m → +5m each time, max 1h)\n"
                 f"`{PREFIX}strikes` `{PREFIX}clearstrikes` @user\n"
-                f"Configure: `{PREFIX}quicksetup`"
+                f"`{PREFIX}bannedwords add|remove|clear <word>` *(Senior+)*\n"
+                f"Configure: `{PREFIX}quicksetup` or `{PREFIX}automod`"
             ),
         },
         "raid": {
@@ -3311,6 +3880,17 @@ async def help_cmd(ctx: commands.Context, category: str = None):
                 f"`{PREFIX}ping`"
             ),
         },
+        "utility": {
+            "emoji": "⏰",
+            "title": "Utility",
+            "value": (
+                f"`{PREFIX}afk [reason]` — mark yourself away (persists across restarts)\n"
+                f"Clears automatically the moment you send another message\n"
+                f"Anyone who @mentions you while you're AFK gets a heads-up\n"
+                f"`{PREFIX}userinfo [@user]` / `{PREFIX}serverinfo`\n"
+                f"`{PREFIX}snipe` — last deleted message in this channel"
+            ),
+        },
     }
 
 
@@ -3355,6 +3935,8 @@ async def help_cmd(ctx: commands.Context, category: str = None):
         async def anal(self, i, b): await _help_cat(i, "analytics", categories)
         @discord.ui.button(label="Setup ⚙️", style=discord.ButtonStyle.secondary, row=2)
         async def setup(self, i, b): await _help_cat(i, "setup", categories)
+        @discord.ui.button(label="Utility ⏰", style=discord.ButtonStyle.secondary, row=2)
+        async def util(self, i, b): await _help_cat(i, "utility", categories)
 
     await ctx.send(embed=embed, view=HelpView())
 
@@ -3375,7 +3957,7 @@ async def rank_cmd(ctx: commands.Context, member: discord.Member = None):
     member = member or ctx.author
     data = await bot.db.get_level_data(member.id, ctx.guild.id)
     if not data:
-        await ctx.send(f"{member.mention} hasn't earned any XP yet.")
+        await send_reply(ctx, f"{member.mention} hasn't earned any XP yet.")
         return
     level, xp_in, xp_need = calculate_level(data.get("total_xp", 0))
     bar = progress_bar(xp_in, xp_need)
@@ -3417,7 +3999,7 @@ async def leaderboard_cmd(ctx: commands.Context):
     in one place, use `.top`."""
     rows = await bot.db.get_leaderboard(ctx.guild.id, limit=10)
     if not rows:
-        await ctx.send("No leveling data yet for this server.")
+        await send_reply(ctx, "No leveling data yet for this server.")
         return
     lines = []
     for i, row in enumerate(rows, start=1):
@@ -3553,7 +4135,7 @@ async def staffactivity_cmd(ctx: commands.Context, member: discord.Member = None
     if member:
         doc = await bot.db.get_staff_activity_user(ctx.guild.id, member.id)
         if not doc:
-            await ctx.send(f"No recorded actions for {member.mention} yet.")
+            await send_reply(ctx, f"No recorded actions for {member.mention} yet.")
             return
         actions = doc.get("actions", {})
         last_at = doc.get("last_action_at")
@@ -3571,7 +4153,7 @@ async def staffactivity_cmd(ctx: commands.Context, member: discord.Member = None
 
     rows = await bot.db.get_staff_activity(ctx.guild.id)
     if not rows:
-        await ctx.send("No staff activity recorded yet.")
+        await send_reply(ctx, "No staff activity recorded yet.")
         return
     lines = []
     for row in rows:
@@ -3606,12 +4188,12 @@ async def staffinactive_cmd(ctx: commands.Context, days: int = 7):
     for key in STAFF_TIER_KEYS.values():
         all_staff_role_ids |= set(config.get(key, []) or [])
     if not all_staff_role_ids:
-        await ctx.send("⚠️ No staff roles configured yet. Set them up via the setup wizard first.")
+        await send_reply(ctx, "⚠️ No staff roles configured yet. Set them up via the setup wizard first.")
         return
 
     staff_members = {m for m in ctx.guild.members if not m.bot and {r.id for r in m.roles} & all_staff_role_ids}
     if not staff_members:
-        await ctx.send("No staff members currently hold a configured staff role.")
+        await send_reply(ctx, "No staff members currently hold a configured staff role.")
         return
 
     inactive_lines = []
@@ -3628,7 +4210,7 @@ async def staffinactive_cmd(ctx: commands.Context, days: int = 7):
             inactive_lines.append(f"⚠️ {member.mention} — last action **{idle_days}d ago**")
 
     if not inactive_lines:
-        await ctx.send(f"✅ Every staff member has logged an action within the last **{days}d**.")
+        await send_reply(ctx, f"✅ Every staff member has logged an action within the last **{days}d**.")
         return
 
     embed = discord.Embed(
@@ -3660,20 +4242,20 @@ async def staffalert_cmd(ctx: commands.Context, setting: str = None):
     setting = setting.lower()
     if setting in ("off", "disable", "disabled"):
         await bot.db.update_config(ctx.guild.id, "staffalert_enabled", False)
-        await ctx.send("✅ Staff inactivity DM alerts **disabled**.")
+        await send_reply(ctx, "✅ Staff inactivity DM alerts **disabled**.")
         return
     if setting in ("on", "enable", "enabled"):
         await bot.db.update_config(ctx.guild.id, "staffalert_enabled", True)
-        await ctx.send("✅ Staff inactivity DM alerts **enabled**.")
+        await send_reply(ctx, "✅ Staff inactivity DM alerts **enabled**.")
         return
     try:
         days = max(1, int(setting))
     except ValueError:
-        await ctx.send("⚠️ Usage: `.staffalert [days]`, `.staffalert on`, or `.staffalert off`.")
+        await send_reply(ctx, "⚠️ Usage: `.staffalert [days]`, `.staffalert on`, or `.staffalert off`.")
         return
     await bot.db.update_config(ctx.guild.id, "staffalert_days", days)
     await bot.db.update_config(ctx.guild.id, "staffalert_enabled", True)
-    await ctx.send(f"✅ Staff will now be DM'd automatically after **{days}d** of zero logged actions.")
+    await send_reply(ctx, f"✅ Staff will now be DM'd automatically after **{days}d** of zero logged actions.")
 
 
 @bot.command(name="warn")
@@ -3685,10 +4267,11 @@ async def warn_cmd(ctx: commands.Context, member: discord.Member, *, reason: str
     count = await bot.db.add_warn(ctx.guild.id, member.id, ctx.author.id, reason, source="manual")
     case_num = await bot.db.add_case(ctx.guild.id, "warn", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "warn", member.id)
-    await ctx.send(f"⚠️ warned {member.mention} (warn #{count}, case #{case_num}) — {reason}")
+    await send_reply(ctx, f"⚠️ warned {member.mention} (warn #{count}, case #{case_num}) — {reason}")
     await post_modlog(ctx.guild, "⚠️ Warn", ctx.author, member, reason, case_num, discord.Color.yellow())
     try:
-        await member.send(f"you got warned in **{ctx.guild.name}** — {reason}")
+        await member.send(embed=make_embed(f"You got warned in **{ctx.guild.name}** — {reason}",
+                                            title="⚠️ Warning", color=discord.Color.gold()))
     except discord.Forbidden:
         pass
 
@@ -3698,13 +4281,25 @@ async def warn_cmd(ctx: commands.Context, member: discord.Member, *, reason: str
 async def warnings_cmd(ctx: commands.Context, member: discord.Member):
     warns = await bot.db.get_warns(ctx.guild.id, member.id)
     if not warns:
-        await ctx.send(f"{member.mention} has no warnings.")
+        await send_reply(ctx, f"{member.mention} has no warnings.")
         return
+    config = await get_config(ctx.guild.id, bot.db)
+    decay_days = config.get("warn_decay_days", 0)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=decay_days) if decay_days else None
     lines = []
+    active_count = 0
     for w in warns:
         tag = "🤖 automod" if w.get("source") == "automod" else f"by <@{w['mod_id']}>"
-        lines.append(f"`{w['created_at']:%Y-%m-%d}` — {w['reason']} ({tag})")
+        expired = cutoff and w["created_at"] < cutoff
+        if not expired:
+            active_count += 1
+        status = " *(expired)*" if expired else ""
+        lines.append(f"`{w['created_at']:%Y-%m-%d}` — {w['reason']} ({tag}){status}")
     embed = discord.Embed(title=f"Warnings for {member.display_name}", description="\n".join(lines))
+    footer = f"{len(warns)} total"
+    if decay_days:
+        footer += f" • {active_count} active (decay: {decay_days}d)"
+    embed.set_footer(text=footer)
     await ctx.send(embed=embed)
 
 
@@ -3712,7 +4307,33 @@ async def warnings_cmd(ctx: commands.Context, member: discord.Member):
 @staff_tier_check(TIER_MOD)
 async def clearwarns_cmd(ctx: commands.Context, member: discord.Member):
     n = await bot.db.clear_warns(ctx.guild.id, member.id)
-    await ctx.send(f"cleared {n} warning(s) for {member.mention}")
+    await send_reply(ctx, f"cleared {n} warning(s) for {member.mention}")
+
+
+@bot.command(name="warndecay")
+@staff_tier_check(TIER_SENIOR)
+async def warndecay_cmd(ctx: commands.Context, days: int = None):
+    """.warndecay — show the current warn-decay window.
+    .warndecay <days> — warns older than this stop counting as "active"
+    (shown as *(expired)* in `.warnings`). Nothing is ever deleted — this
+    only affects what counts as active. Use `.warndecay 0` to disable decay
+    entirely (every warn counts forever, the original behavior)."""
+    config = await get_config(ctx.guild.id, bot.db)
+    if days is None:
+        current = config.get("warn_decay_days", 0)
+        await ctx.send(
+            f"Warn decay is **{f'{current} days' if current else 'OFF'}**.\n"
+            f"`{PREFIX}warndecay <days>` to set it, `{PREFIX}warndecay 0` to disable."
+        )
+        return
+    if days < 0:
+        await send_reply(ctx, "⚠️ Decay days can't be negative.")
+        return
+    await bot.db.update_config(ctx.guild.id, "warn_decay_days", days)
+    if days == 0:
+        await send_reply(ctx, "✅ Warn decay **disabled** — every warn counts as active forever again.")
+    else:
+        await send_reply(ctx, f"✅ Warns now decay after **{days} days** — older ones still show in `.warnings` but as expired.")
 
 
 @bot.command(name="case")
@@ -3720,7 +4341,7 @@ async def clearwarns_cmd(ctx: commands.Context, member: discord.Member):
 async def case_cmd(ctx: commands.Context, number: int):
     case = await bot.db.get_case(ctx.guild.id, number)
     if not case:
-        await ctx.send(f"No case #{number} found.")
+        await send_reply(ctx, f"No case #{number} found.")
         return
     embed = discord.Embed(title=f"Case #{number}", color=discord.Color.orange())
     embed.add_field(name="Action", value=case["action"])
@@ -3735,7 +4356,7 @@ async def case_cmd(ctx: commands.Context, number: int):
 async def cases_cmd(ctx: commands.Context, member: discord.Member):
     cases = await bot.db.get_user_cases(ctx.guild.id, member.id)
     if not cases:
-        await ctx.send(f"{member.mention} has no cases.")
+        await send_reply(ctx, f"{member.mention} has no cases.")
         return
     lines = [f"`#{c['case_number']}` {c['action']} — {c['reason']}" for c in cases]
     embed = discord.Embed(title=f"Cases for {member.display_name}", description="\n".join(lines))
@@ -3749,14 +4370,16 @@ async def cases_cmd(ctx: commands.Context, member: discord.Member):
 async def kick_cmd(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
     if not await validate_mod_target(ctx, member):
         return
+    if not await _confirm_destructive_action(ctx, action_emoji="👋", action_title="Kick", member=member, reason=reason):
+        return
     try:
         await member.kick(reason=reason)
     except discord.Forbidden:
-        await ctx.send("can't kick that person — their role might be above mine")
+        await send_reply(ctx, "can't kick that person — their role might be above mine")
         return
     case_num = await bot.db.add_case(ctx.guild.id, "kick", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "kick", member.id)
-    await ctx.send(f"👋 kicked {member.mention} — {reason}")
+    await send_reply(ctx, f"👋 kicked {member.mention} — {reason}")
     await post_modlog(ctx.guild, "👋 Kick", ctx.author, member, reason, case_num, discord.Color.orange())
 
 
@@ -3767,14 +4390,16 @@ async def kick_cmd(ctx: commands.Context, member: discord.Member, *, reason: str
 async def ban_cmd(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
     if not await validate_mod_target(ctx, member):
         return
+    if not await _confirm_destructive_action(ctx, action_emoji="🔨", action_title="Ban", member=member, reason=reason):
+        return
     try:
         await member.ban(reason=reason)
     except discord.Forbidden:
-        await ctx.send("can't ban that person — their role might be above mine")
+        await send_reply(ctx, "can't ban that person — their role might be above mine")
         return
     case_num = await bot.db.add_case(ctx.guild.id, "ban", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "ban", member.id)
-    await ctx.send(f"🔨 banned {member.mention} — {reason}")
+    await send_reply(ctx, f"🔨 banned {member.mention} — {reason}")
     await post_modlog(ctx.guild, "🔨 Ban", ctx.author, member, reason, case_num, discord.Color.red())
 
 
@@ -3811,7 +4436,7 @@ async def purge_cmd(ctx: commands.Context, amount: int):
     await _send_log(ctx.guild, config, "log_mod_extra_channel",
                      embed=discord.Embed(description=f"🧹 {ctx.author.mention} purged **{len(deleted) - 1}** message(s) in {ctx.channel.mention}",
                                           color=discord.Color.dark_grey()))
-    await ctx.send(f"🧹 purged {len(deleted) - 1} message(s)", delete_after=5)
+    await send_reply(ctx, f"🧹 purged {len(deleted) - 1} message(s)", delete_after=5)
 
 
 @bot.command(name="mute")
@@ -3823,21 +4448,21 @@ async def mute_cmd(ctx: commands.Context, member: discord.Member, duration: str 
         return
     delta = _parse_duration(duration)
     if not delta:
-        await ctx.send("invalid duration, use something like `10m`, `1h`, `1d`")
+        await send_reply(ctx, "invalid duration, use something like `10m`, `1h`, `1d`")
         return
     if delta > timedelta(days=28):
-        await ctx.send("discord's timeout max is 28 days — use `.tempban` for longer")
+        await send_reply(ctx, "discord's timeout max is 28 days — use `.tempban` for longer")
         return
     unmute_at = datetime.now(timezone.utc) + delta
     try:
         await member.timeout(delta, reason=reason)
     except discord.Forbidden:
-        await ctx.send("i don't have permission to timeout that person")
+        await send_reply(ctx, "i don't have permission to timeout that person")
         return
     await bot.db.add_tempmute(ctx.guild.id, member.id, ctx.author.id, reason, unmute_at)
     case_num = await bot.db.add_case(ctx.guild.id, "mute", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "mute", member.id)
-    await ctx.send(f"🔇 muted {member.mention} for `{duration}` — {reason}")
+    await send_reply(ctx, f"🔇 muted {member.mention} for `{duration}` — {reason}")
     await post_modlog(ctx.guild, f"🔇 Mute ({duration})", ctx.author, member, reason, case_num, discord.Color.dark_orange())
 
 
@@ -3848,11 +4473,11 @@ async def unmute_cmd(ctx: commands.Context, member: discord.Member, *, reason: s
     try:
         await member.timeout(None, reason=reason)
     except discord.Forbidden:
-        await ctx.send("i don't have permission to lift that timeout")
+        await send_reply(ctx, "i don't have permission to lift that timeout")
         return
     await bot.db.remove_tempmute(ctx.guild.id, member.id)
     case_num = await bot.db.add_case(ctx.guild.id, "unmute", ctx.author.id, member.id, reason)
-    await ctx.send(f"🔊 unmuted {member.mention} — {reason}")
+    await send_reply(ctx, f"🔊 unmuted {member.mention} — {reason}")
     await post_modlog(ctx.guild, "🔊 Unmute", ctx.author, member, reason, case_num, discord.Color.green())
 
 
@@ -3865,18 +4490,23 @@ async def tempban_cmd(ctx: commands.Context, member: discord.Member, duration: s
         return
     delta = _parse_duration(duration)
     if not delta:
-        await ctx.send("invalid duration, use something like `1h`, `1d`, `1w`")
+        await send_reply(ctx, "invalid duration, use something like `1h`, `1d`, `1w`")
         return
     unban_at = datetime.now(timezone.utc) + delta
+    if not await _confirm_destructive_action(
+        ctx, action_emoji="⛔", action_title="Tempban", member=member, reason=reason,
+        extra=f"\n**Duration:** `{duration}` (unbans <t:{int(unban_at.timestamp())}:R>)",
+    ):
+        return
     try:
         await member.ban(reason=reason)
     except discord.Forbidden:
-        await ctx.send("can't ban that person — their role might be above mine")
+        await send_reply(ctx, "can't ban that person — their role might be above mine")
         return
     await bot.db.add_tempban(ctx.guild.id, member.id, ctx.author.id, reason, unban_at)
     case_num = await bot.db.add_case(ctx.guild.id, "tempban", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "tempban", member.id)
-    await ctx.send(f"⛔ tempbanned {member.mention} for `{duration}` — {reason}")
+    await send_reply(ctx, f"⛔ tempbanned {member.mention} for `{duration}` — {reason}")
     await post_modlog(ctx.guild, f"⛔ Tempban ({duration})", ctx.author, member, reason, case_num, discord.Color.dark_red())
 
 
@@ -3885,7 +4515,7 @@ async def tempban_cmd(ctx: commands.Context, member: discord.Member, duration: s
 async def strikes_cmd(ctx: commands.Context, member: discord.Member):
     """Show a member's active automod strikes (decay after 24h)."""
     count = await bot.db.get_active_strikes(ctx.guild.id, member.id)
-    await ctx.send(f"{member.mention} has **{count}** active automod strike(s) (resets after 24h)")
+    await send_reply(ctx, f"{member.mention} has **{count}** active automod strike(s) (resets after 24h)")
 
 
 @bot.command(name="clearstrikes")
@@ -3893,13 +4523,15 @@ async def strikes_cmd(ctx: commands.Context, member: discord.Member):
 async def clearstrikes_cmd(ctx: commands.Context, member: discord.Member):
     """Reset a member's automod strikes back to zero (manual warns are untouched)."""
     n = await bot.db.clear_strikes(ctx.guild.id, member.id)
-    await ctx.send(f"cleared **{n}** automod strike(s) for {member.mention}")
+    await send_reply(ctx, f"cleared **{n}** automod strike(s) for {member.mention}")
 
 
 AUTOMOD_RULES = {
     "scamlinks":   "automod_scamlinks",
     "antiinvite":  "automod_antiinvite",
     "antilink":    "automod_antilink",
+    "antishortener": "automod_antishortener",
+    "bannedwords": "automod_bannedwords",
     "mentionspam": "automod_mentionspam",
     "zalgo":       "automod_zalgo",
     "capsspam":    "automod_capsspam",
@@ -3913,7 +4545,8 @@ AUTOMOD_RULES = {
 async def automod_cmd(ctx: commands.Context, rule: str = None, setting: str = None):
     """.automod — view every rule's on/off state.
     .automod <rule> <on|off> — toggle one rule.
-    Rules: scamlinks, antiinvite, antilink, mentionspam, zalgo, capsspam, emojispam, antispam."""
+    Rules: scamlinks, antiinvite, antilink, antishortener, bannedwords,
+    mentionspam, zalgo, capsspam, emojispam, antispam."""
     config = await get_config(ctx.guild.id, bot.db)
     if rule is None:
         lines = [f"{'🟢' if config.get(key, True) else '🔴'} `{name}` — "
@@ -3924,14 +4557,72 @@ async def automod_cmd(ctx: commands.Context, rule: str = None, setting: str = No
         return
     rule = rule.lower()
     if rule not in AUTOMOD_RULES:
-        await ctx.send(f"unknown rule `{rule}` — options: {', '.join(AUTOMOD_RULES)}")
+        await send_reply(ctx, f"unknown rule `{rule}` — options: {', '.join(AUTOMOD_RULES)}")
         return
     if not setting or setting.lower() not in ("on", "off"):
-        await ctx.send(f"usage: `{PREFIX}automod {rule} <on|off>`")
+        await send_reply(ctx, f"usage: `{PREFIX}automod {rule} <on|off>`")
         return
     enabled = setting.lower() == "on"
     await bot.db.update_config(ctx.guild.id, AUTOMOD_RULES[rule], enabled)
-    await ctx.send(f"✅ `{rule}` is now **{'ON 🟢' if enabled else 'OFF 🔴'}**")
+    await send_reply(ctx, f"✅ `{rule}` is now **{'ON 🟢' if enabled else 'OFF 🔴'}**")
+
+
+@bot.command(name="bannedwords", aliases=["wordfilter", "blacklistword"])
+@staff_tier_check(TIER_SENIOR)
+async def bannedwords_cmd(ctx: commands.Context, action: str = None, *, word: str = None):
+    """.bannedwords — list the server's custom banned words/phrases.
+    .bannedwords add <word> — add one (whole-word match, case-insensitive).
+    .bannedwords remove <word> — remove one.
+    .bannedwords clear — wipe the whole list.
+    Toggle the rule on/off with `.automod bannedwords <on|off>` — the list
+    itself stays saved either way, so turning it off and back on doesn't
+    lose anything."""
+    config = await get_config(ctx.guild.id, bot.db)
+    words = list(config.get("automod_bannedwords_list", []) or [])
+
+    if action is None:
+        if not words:
+            await send_reply(ctx, f"No banned words set. Add one with `{PREFIX}bannedwords add <word>`.")
+            return
+        await ctx.send(embed=discord.Embed(
+            title="🚷 Custom Word Filter",
+            description=", ".join(f"`{w}`" for w in words),
+            color=discord.Color.dark_red(),
+        ).set_footer(text=f"{len(words)} word(s) • rule is "
+                          f"{'ON 🟢' if config.get('automod_bannedwords', True) else 'OFF 🔴'}"))
+        return
+
+    action = action.lower()
+    if action == "clear":
+        await bot.db.update_config(ctx.guild.id, "automod_bannedwords_list", [])
+        await send_reply(ctx, "✅ Cleared the banned word list.")
+        return
+
+    if action not in ("add", "remove"):
+        await send_reply(ctx, f"usage: `{PREFIX}bannedwords [add|remove|clear] [word]`")
+        return
+    if not word or not word.strip():
+        await send_reply(ctx, f"usage: `{PREFIX}bannedwords {action} <word>`")
+        return
+    word = word.strip().lower()
+
+    if action == "add":
+        if word in words:
+            await send_reply(ctx, f"`{word}` is already on the list.")
+            return
+        if len(words) >= 200:
+            await send_reply(ctx, "⚠️ Banned word list is capped at 200 entries — remove some first.")
+            return
+        words.append(word)
+        await bot.db.update_config(ctx.guild.id, "automod_bannedwords_list", words)
+        await send_reply(ctx, f"✅ Added `{word}` to the banned word list.")
+    else:
+        if word not in words:
+            await send_reply(ctx, f"`{word}` isn't on the list.")
+            return
+        words.remove(word)
+        await bot.db.update_config(ctx.guild.id, "automod_bannedwords_list", words)
+        await send_reply(ctx, f"✅ Removed `{word}` from the banned word list.")
 
 
 @bot.command(name="raidmode")
@@ -3961,23 +4652,23 @@ async def raidmode_cmd(ctx: commands.Context, setting: str = None, action: str =
     setting = setting.lower()
     if setting in ("on", "off"):
         await bot.db.update_config(ctx.guild.id, "raidcheck_enabled", setting == "on")
-        await ctx.send(f"✅ Anti-raid screening is now **{'ON' if setting == 'on' else 'OFF'}**.")
+        await send_reply(ctx, f"✅ Anti-raid screening is now **{'ON' if setting == 'on' else 'OFF'}**.")
         return
     if setting == "action":
         if action not in ("timeout", "kick", "log_only"):
-            await ctx.send(f"⚠️ Usage: `{PREFIX}raidmode action <timeout|kick|log_only>`")
+            await send_reply(ctx, f"⚠️ Usage: `{PREFIX}raidmode action <timeout|kick|log_only>`")
             return
         await bot.db.update_config(ctx.guild.id, "raidcheck_action", action)
-        await ctx.send(f"✅ Flagged joins will now trigger: **{action}**.")
+        await send_reply(ctx, f"✅ Flagged joins will now trigger: **{action}**.")
         return
     if setting == "lockdown":
         if not action or action.lower() not in ("on", "off"):
-            await ctx.send(f"⚠️ Usage: `{PREFIX}raidmode lockdown <on|off>`")
+            await send_reply(ctx, f"⚠️ Usage: `{PREFIX}raidmode lockdown <on|off>`")
             return
         await bot.db.update_config(ctx.guild.id, "raidcheck_autolockdown", action.lower() == "on")
-        await ctx.send(f"✅ Auto-lockdown on severe raid bursts is now **{action.upper()}**.")
+        await send_reply(ctx, f"✅ Auto-lockdown on severe raid bursts is now **{action.upper()}**.")
         return
-    await ctx.send(f"⚠️ Usage: `{PREFIX}raidmode [on|off]`, `{PREFIX}raidmode action <type>`, "
+    await send_reply(ctx, f"⚠️ Usage: `{PREFIX}raidmode [on|off]`, `{PREFIX}raidmode action <type>`, "
                     f"or `{PREFIX}raidmode lockdown <on|off>`.")
 
 
@@ -3990,10 +4681,11 @@ async def raidmode_cmd(ctx: commands.Context, setting: str = None, action: str =
 async def quicksetup_cmd(ctx: commands.Context):
     """One-command setup: creates live Members/Boosts counter channels and saves config."""
     guild = ctx.guild
-    msg = await ctx.send("✨ Setting up **aj's crib**... this'll take a moment.")
+    msg = await send_reply(ctx, "✨ Setting up **aj's crib**... this'll take a moment.")
 
     # Find or create the stats category
     category = discord.utils.find(lambda c: c.name == "📊 Server Stats", guild.categories)
+    category_created = category is None
     if category is None:
         category = await guild.create_category("📊 Server Stats", reason="aj's crib quicksetup")
 
@@ -4003,7 +4695,7 @@ async def quicksetup_cmd(ctx: commands.Context):
     }
 
     config = await bot.db.get_config(guild.id)
-    created = []
+    created = ["Category"] if category_created else []
 
     # Members counter channel
     members_chan_id = config.get("members_stats_channel")
@@ -4038,15 +4730,22 @@ async def quicksetup_cmd(ctx: commands.Context):
     bot._stats_last_update[members_chan.id] = time.monotonic()
     bot._stats_last_update[boosts_chan.id] = time.monotonic()
 
+    if created:
+        status_line = f"🆕 Created: {', '.join(created)}."
+    else:
+        status_line = "♻️ Both already existed — left them as-is and just refreshed their counts."
+
     embed = discord.Embed(
         title="✅ aj's crib is set up!",
         color=discord.Color.green(),
         description=(
             f"📁 Category: **{category.name}**\n"
             f"👥 Members tracker: {members_chan.mention}\n"
-            f"🚀 Boosts tracker: {boosts_chan.mention}\n\n"
-            "Both update on their own as people join, leave, or boost.\n\n"
-            "**Want more?** Pick a category below — level roles, automod, tickets, logs, and more."
+            f"🚀 Boosts tracker: {boosts_chan.mention}\n"
+            f"{status_line}\n\n"
+            "Both update on their own as people join, leave, or boost. Running this command again "
+            "is always safe — it never makes duplicates, it just leaves what's already there.\n\n"
+            "**Want more?** Pick a category below — level roles, automod, anti-nuke, tickets, logs, and more."
         ),
     )
     await msg.edit(content=None, embed=embed, view=SetupHubView())
@@ -4062,9 +4761,9 @@ async def lockdown_cmd(ctx: commands.Context, channel: discord.abc.GuildChannel 
     channel = channel or ctx.channel
     locked = await lock_channel(channel, f"manually triggered by {ctx.author}")
     if not locked:
-        await ctx.send(f"{channel.mention} is already locked — use `{PREFIX}unlock` to lift it")
+        await send_reply(ctx, f"{channel.mention} is already locked — use `{PREFIX}unlock` to lift it")
         return
-    await ctx.send(f"🔒 {channel.mention} locked")
+    await send_reply(ctx, f"🔒 {channel.mention} locked")
 
 
 @bot.command(name="unlock")
@@ -4075,9 +4774,9 @@ async def unlock_cmd(ctx: commands.Context, channel: discord.abc.GuildChannel = 
     channel = channel or ctx.channel
     restored = await unlock_channel(channel)
     if not restored:
-        await ctx.send(f"{channel.mention} isn't locked")
+        await send_reply(ctx, f"{channel.mention} isn't locked")
         return
-    await ctx.send(f"🔓 {channel.mention} unlocked")
+    await send_reply(ctx, f"🔓 {channel.mention} unlocked")
 
 
 @bot.command(name="serverlockdown", aliases=["lockdownall", "raidlock"])
@@ -4088,7 +4787,7 @@ async def serverlockdown_cmd(ctx: commands.Context):
     `.serverunlock` restores everything exactly. This is the same lockdown
     auto-triggered by a severe join-raid burst, just started by a human."""
     if is_in_lockdown(ctx.guild.id):
-        await ctx.send(f"server's already locked down — use `{PREFIX}serverunlock` to lift it")
+        await send_reply(ctx, f"server's already locked down — use `{PREFIX}serverunlock` to lift it")
         return
     async with ctx.typing():
         locked_count = await serverwide_lockdown(ctx.guild, f"manually triggered by {ctx.author}")
@@ -4105,11 +4804,11 @@ async def serverunlock_cmd(ctx: commands.Context):
     exactly what it was before. Channels individually `.lockdown`-ed by staff
     outside of the server-wide lockdown stay locked — use `.unlock` for those."""
     if not is_in_lockdown(ctx.guild.id):
-        await ctx.send("server isn't in lockdown right now")
+        await send_reply(ctx, "server isn't in lockdown right now")
         return
     async with ctx.typing():
         restored = await serverwide_unlock(ctx.guild)
-    await ctx.send(f"🔓 lockdown lifted — restored **{restored}** channel(s)")
+    await send_reply(ctx, f"🔓 lockdown lifted — restored **{restored}** channel(s)")
 
 
 @bot.command(name="raidage")
@@ -4120,14 +4819,14 @@ async def raidage_cmd(ctx: commands.Context, hours: int = None):
     if hours is None:
         config = await get_config(ctx.guild.id, bot.db)
         current = config.get("raidcheck_minage_hours", MIN_ACCOUNT_AGE_HOURS_DEFAULT)
-        await ctx.send(f"min account age to join: **{current}h** (0 = off)")
+        await send_reply(ctx, f"min account age to join: **{current}h** (0 = off)")
         return
     hours = max(0, hours)
     await bot.db.update_config(ctx.guild.id, "raidcheck_minage_hours", hours)
     if hours == 0:
-        await ctx.send("✅ account age gate disabled")
+        await send_reply(ctx, "✅ account age gate disabled")
     else:
-        await ctx.send(f"✅ accounts younger than **{hours}h** will now get flagged on join")
+        await send_reply(ctx, f"✅ accounts younger than **{hours}h** will now get flagged on join")
 
 
 @bot.command(name="release")
@@ -4138,9 +4837,9 @@ async def release_cmd(ctx: commands.Context, user_id: int):
     anti-nuke caught a false positive."""
     restored = await antinuke_release(ctx.guild, user_id)
     if restored == 0:
-        await ctx.send("nothing to restore — either they're not contained or they left")
+        await send_reply(ctx, "nothing to restore — either they're not contained or they left")
         return
-    await ctx.send(f"🔓 released <@{user_id}> — restored **{restored}** role(s) and lifted timeout")
+    await send_reply(ctx, f"🔓 released <@{user_id}> — restored **{restored}** role(s) and lifted timeout")
 
 
 @bot.command(name="analytics")
@@ -4153,7 +4852,7 @@ async def analytics_cmd(ctx: commands.Context, subcommand: str = "growth", days:
     if sub == "growth":
         history = await bot.db.get_member_count_history(ctx.guild.id, days=days)
         if not history:
-            await ctx.send("📊 No data yet — snapshots are taken hourly.")
+            await send_reply(ctx, "📊 No data yet — snapshots are taken hourly.")
             return
         lines = []
         prev = None
@@ -4169,8 +4868,8 @@ async def analytics_cmd(ctx: commands.Context, subcommand: str = "growth", days:
 
     elif sub == "joins":
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        join_col = bot.db._client["lxte_assistant"]["join_log"]
-        leave_col = bot.db._client["lxte_assistant"]["leave_log"]
+        join_col = bot.db._client["ajscrib"]["join_log"]
+        leave_col = bot.db._client["ajscrib"]["leave_log"]
         join_count = await join_col.count_documents({"guild_id": ctx.guild.id, "joined_at": {"$gte": cutoff}})
         leave_count = await leave_col.count_documents({"guild_id": ctx.guild.id, "left_at": {"$gte": cutoff}})
         net = join_count - leave_count
@@ -4182,13 +4881,13 @@ async def analytics_cmd(ctx: commands.Context, subcommand: str = "growth", days:
 
     elif sub == "activity":
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        msg_col = bot.db._client["lxte_assistant"]["daily_msg_counts"]
+        msg_col = bot.db._client["ajscrib"]["daily_msg_counts"]
         rows = await msg_col.find(
             {"guild_id": ctx.guild.id, "date": {"$gte": cutoff.date().isoformat()}},
             sort=[("date", 1)],
         ).to_list(length=days)
         if not rows:
-            await ctx.send("📊 No message activity data yet — this starts tracking from now.")
+            await send_reply(ctx, "📊 No message activity data yet — this starts tracking from now.")
             return
         lines = [f"`{r['date']}` → **{r.get('count', 0)}** messages" for r in rows[-25:]]
         embed = discord.Embed(title=f"💬 Message Activity (last {days}d)", color=discord.Color.blurple(),
@@ -4196,7 +4895,7 @@ async def analytics_cmd(ctx: commands.Context, subcommand: str = "growth", days:
         await ctx.send(embed=embed)
 
     else:
-        await ctx.send(f"⚠️ Unknown subcommand. Options: `growth`, `joins`, `activity`")
+        await send_reply(ctx, f"⚠️ Unknown subcommand. Options: `growth`, `joins`, `activity`")
 
 
 @bot.command(name="setwelcome")
@@ -4228,7 +4927,7 @@ async def testinvitelog_cmd(ctx: commands.Context):
     config = await bot.db.get_config(ctx.guild.id)
     tpl = config.get("invite_template")
     if not tpl:
-        await ctx.send(f"No invite tracker template set. Use `{PREFIX}setinvitelog <message>`.")
+        await send_reply(ctx, f"No invite tracker template set. Use `{PREFIX}setinvitelog <message>`.")
         return
     chan_id = config.get("invite_log_channel")
     chan = ctx.guild.get_channel(chan_id) if chan_id else ctx.channel
@@ -4243,7 +4942,7 @@ async def testwelcome_cmd(ctx: commands.Context):
     config = await bot.db.get_config(ctx.guild.id)
     tpl = config.get("welcome_template")
     if not tpl:
-        await ctx.send(f"No welcome template set. Use `{PREFIX}setwelcome <message>`.")
+        await send_reply(ctx, f"No welcome template set. Use `{PREFIX}setwelcome <message>`.")
         return
     chan_id = config.get("welcome_channel") or config.get("log_entryexit_channel")
     chan = ctx.guild.get_channel(chan_id) if chan_id else ctx.channel
@@ -4300,11 +4999,9 @@ def _build_invite_embed(template: str, member: discord.Member, guild: discord.Gu
         .replace("{inviter}", inviter.mention if inviter else "an unknown/vanity invite")
         .replace("{invites}", str(invite_total) if invite_total is not None else "?")
     )
-    embed = discord.Embed(title="📨 Invite Tracker", description=description, color=discord.Color.blurple())
-    if inviter:
-        embed.add_field(name="Invited by", value=f"{inviter.mention} ({invite_total or 0} total)", inline=True)
-    else:
-        embed.add_field(name="Invited by", value="Unknown / vanity URL", inline=True)
+    embed = discord.Embed(title="🌺 New Invite", description=description, color=discord.Color.blurple())
+    embed.add_field(name="Invited By", value=inviter.mention if inviter else "Unknown / vanity URL", inline=True)
+    embed.add_field(name="Total Invites", value=str(invite_total) if invite_total is not None else "—", inline=True)
     embed.add_field(name="Member #", value=str(guild.member_count), inline=True)
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.set_footer(text=f"{member} • {member.id}")
@@ -4337,18 +5034,18 @@ async def config_cmd(ctx: commands.Context, key: str = None, value: str = None):
     if key is None:
         config = await bot.db.get_config(ctx.guild.id)
         if not config:
-            await ctx.send("No config set for this server yet.")
+            await send_reply(ctx, "No config set for this server yet.")
             return
         lines = [f"**{k}**: {v}" for k, v in config.items() if k not in ("_id", "guild_id")]
         await ctx.send(embed=discord.Embed(title="Server Config", description="\n".join(lines) or "Empty"))
         return
     if value is None:
         config = await bot.db.get_config(ctx.guild.id)
-        await ctx.send(f"`{key}` = `{config.get(key, 'not set')}`")
+        await send_reply(ctx, f"`{key}` = `{config.get(key, 'not set')}`")
         return
     parsed = _coerce_config_value(value)
     await bot.db.update_config(ctx.guild.id, key, parsed)
-    await ctx.send(f"✅ Set `{key}` = `{parsed}` ({type(parsed).__name__})")
+    await send_reply(ctx, f"✅ Set `{key}` = `{parsed}` ({type(parsed).__name__})")
 
 
 
@@ -4378,7 +5075,7 @@ async def snipe_cmd(ctx: commands.Context):
     """Show the last deleted message in this channel."""
     cached = _snipe_cache.get(ctx.channel.id)
     if not cached:
-        await ctx.send("Nothing to snipe in this channel.")
+        await send_reply(ctx, "Nothing to snipe in this channel.")
         return
     embed = discord.Embed(
         description=cached["content"][:2000],
@@ -4406,17 +5103,17 @@ async def slowmode_cmd(ctx: commands.Context, channel: Optional[discord.TextChan
     else:
         delta = _parse_duration(duration)
         if not delta:
-            await ctx.send("⚠️ Bad duration. Examples: `5s`, `30s`, `2m`, `1h`.")
+            await send_reply(ctx, "⚠️ Bad duration. Examples: `5s`, `30s`, `2m`, `1h`.")
             return
         delay = int(delta.total_seconds())
         if delay > 21600:  # Discord max is 6h
-            await ctx.send("⚠️ Discord's slowmode max is 6 hours.")
+            await send_reply(ctx, "⚠️ Discord's slowmode max is 6 hours.")
             return
     await channel.edit(slowmode_delay=delay, reason=f"Slowmode set by {ctx.author}")
     if delay == 0:
-        await ctx.send(f"✅ Slowmode cleared in {channel.mention}.")
+        await send_reply(ctx, f"✅ Slowmode cleared in {channel.mention}.")
     else:
-        await ctx.send(f"🐢 Slowmode set to `{_format_duration(delay)}` in {channel.mention}.")
+        await send_reply(ctx, f"🐢 Slowmode set to `{_format_duration(delay)}` in {channel.mention}.")
 
 
 @bot.command(name="softban")
@@ -4429,20 +5126,25 @@ async def softban_cmd(ctx: commands.Context, member: discord.Member, delete_days
     if not await validate_mod_target(ctx, member):
         return
     delete_days = max(1, min(delete_days, 7))
+    if not await _confirm_destructive_action(
+        ctx, action_emoji="🧹", action_title="Softban", member=member, reason=reason,
+        extra=f"\n**Message prune:** {delete_days}d",
+    ):
+        return
     try:
         # delete_message_seconds is the current discord.py API — delete_message_days
         # is deprecated and not guaranteed to keep working across library versions.
         await member.ban(reason=f"Softban by {ctx.author}: {reason}", delete_message_seconds=delete_days * 86400)
         await ctx.guild.unban(member, reason="Softban — lifting immediately")
     except discord.Forbidden:
-        await ctx.send("can't do that — their role might be above mine or i'm missing ban perms")
+        await send_reply(ctx, "can't do that — their role might be above mine or i'm missing ban perms")
         return
     except discord.HTTPException as e:
-        await ctx.send(f"softban failed: {e}")
+        await send_reply(ctx, f"softban failed: {e}")
         return
     case_num = await bot.db.add_case(ctx.guild.id, "softban", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "softban", member.id)
-    await ctx.send(f"🧹 softbanned {member.mention} — wiped {delete_days}d of messages, not permanently banned. {reason}")
+    await send_reply(ctx, f"🧹 softbanned {member.mention} — wiped {delete_days}d of messages, not permanently banned. {reason}")
     await post_modlog(ctx.guild, "🧹 Softban", ctx.author, member, reason, case_num, discord.Color.orange())
 
 
@@ -4482,7 +5184,7 @@ async def invitelb_cmd(ctx: commands.Context):
     """Top 10 inviters in this server."""
     rows = await bot.db.get_invite_leaderboard(ctx.guild.id, limit=10)
     if not rows:
-        await ctx.send("No invite data yet.")
+        await send_reply(ctx, "No invite data yet.")
         return
     lines = []
     for i, row in enumerate(rows, 1):
@@ -4507,7 +5209,7 @@ async def tickets_cmd(ctx: commands.Context):
     """List every open ticket in this server with priority and claim status."""
     open_tickets = await bot.db.get_open_tickets(ctx.guild.id)
     if not open_tickets:
-        await ctx.send("📭 No open tickets right now.")
+        await send_reply(ctx, "📭 No open tickets right now.")
         return
     priority_order = {"urgent": 0, "high": 1, "medium": 2, "low": 3}
     open_tickets.sort(key=lambda d: priority_order.get(d.get("priority", "medium"), 2))
@@ -4527,18 +5229,18 @@ async def priority_cmd(ctx: commands.Context, level: str):
     """Set this ticket channel's priority: low / medium / high / urgent."""
     level = level.lower()
     if level not in TICKET_PRIORITIES:
-        await ctx.send(f"⚠️ Invalid priority. Choose from: {', '.join(TICKET_PRIORITIES)}.")
+        await send_reply(ctx, f"⚠️ Invalid priority. Choose from: {', '.join(TICKET_PRIORITIES)}.")
         return
     doc = await bot.db.get_ticket(ctx.channel.id)
     if not doc:
-        await ctx.send("⚠️ This doesn't look like a ticket channel.")
+        await send_reply(ctx, "⚠️ This doesn't look like a ticket channel.")
         return
     await bot.db.set_ticket_priority(ctx.channel.id, level)
     try:
         await ctx.channel.edit(topic=f"Priority: {_ticket_priority_label(level)}")
     except discord.HTTPException:
         pass
-    await ctx.send(f"{_ticket_priority_label(level)} priority set by {ctx.author.mention}.")
+    await send_reply(ctx, f"{_ticket_priority_label(level)} priority set by {ctx.author.mention}.")
 
 
 @bot.command(name="claim")
@@ -4547,17 +5249,17 @@ async def claim_cmd(ctx: commands.Context):
     """Claim this ticket channel."""
     doc = await bot.db.get_ticket(ctx.channel.id)
     if not doc:
-        await ctx.send("⚠️ This doesn't look like a ticket channel.")
+        await send_reply(ctx, "⚠️ This doesn't look like a ticket channel.")
         return
     if doc.get("claimed_by") == ctx.author.id:
         await bot.db.unclaim_ticket(ctx.channel.id)
-        await ctx.send(f"🙋 {ctx.author.mention} unclaimed this ticket.")
+        await send_reply(ctx, f"🙋 {ctx.author.mention} unclaimed this ticket.")
         return
     ok = await bot.db.claim_ticket(ctx.channel.id, ctx.author.id)
     if not ok:
-        await ctx.send(f"⚠️ Already claimed by <@{doc.get('claimed_by')}>.")
+        await send_reply(ctx, f"⚠️ Already claimed by <@{doc.get('claimed_by')}>.")
         return
-    await ctx.send(f"🙋 {ctx.author.mention} claimed this ticket.")
+    await send_reply(ctx, f"🙋 {ctx.author.mention} claimed this ticket.")
 
 
 @bot.command(name="ticketstats")
@@ -4681,7 +5383,7 @@ async def gstart_cmd(ctx: commands.Context, duration: str, winners: int, *, priz
     """.gstart <duration> <winners> <prize> — starts a giveaway. Duration: 10m, 2h, 1d etc."""
     delta = _parse_duration(duration)
     if not delta:
-        await ctx.send("⚠️ Bad duration. Examples: `10m`, `2h`, `1d`.")
+        await send_reply(ctx, "⚠️ Bad duration. Examples: `10m`, `2h`, `1d`.")
         return
     winners = max(1, min(winners, 20))
     ends_at = datetime.now(timezone.utc) + delta
@@ -4727,13 +5429,13 @@ async def gend_cmd(ctx: commands.Context, message_id: int):
     """.gend <message_id> — end a giveaway early and pick winners now."""
     doc = await bot.db.get_giveaway(message_id)
     if not doc:
-        await ctx.send("⚠️ No giveaway found with that message ID.")
+        await send_reply(ctx, "⚠️ No giveaway found with that message ID.")
         return
     if doc.get("ended"):
-        await ctx.send("⚠️ That giveaway already ended.")
+        await send_reply(ctx, "⚠️ That giveaway already ended.")
         return
     await _resolve_giveaway(doc)
-    await ctx.send("✅ Giveaway ended early.")
+    await send_reply(ctx, "✅ Giveaway ended early.")
 
 
 @bot.command(name="greroll")
@@ -4742,11 +5444,11 @@ async def greroll_cmd(ctx: commands.Context, message_id: int, count: int = 1):
     """.greroll <message_id> [count] — reroll winners for an ended giveaway."""
     doc = await bot.db.get_giveaway(message_id)
     if not doc:
-        await ctx.send("⚠️ No giveaway found with that message ID.")
+        await send_reply(ctx, "⚠️ No giveaway found with that message ID.")
         return
     entrants = doc.get("entrants", [])
     if not entrants:
-        await ctx.send("⚠️ No entrants to reroll from.")
+        await send_reply(ctx, "⚠️ No entrants to reroll from.")
         return
     config = await get_config(ctx.guild.id, bot.db)
     winners = await _weighted_pick(ctx.guild, entrants, config, count)
@@ -4757,7 +5459,7 @@ async def greroll_cmd(ctx: commands.Context, message_id: int, count: int = 1):
             await channel.send(f"🔁 **Reroll** for **{doc['prize']}** — new winner(s): {mention_str}! Congrats!")
         except discord.HTTPException:
             pass
-    await ctx.send(f"✅ Rerolled — {mention_str}")
+    await send_reply(ctx, f"✅ Rerolled — {mention_str}")
 
 
 @bot.command(name="gblacklist")
@@ -4768,7 +5470,7 @@ async def gblacklist_cmd(ctx: commands.Context, action: str, target: str):
     are blocked at react-time and silently excluded from winner draws."""
     action = action.lower()
     if action not in ("add", "remove"):
-        await ctx.send("⚠️ Usage: `.gblacklist add|remove @user` or `@role`.")
+        await send_reply(ctx, "⚠️ Usage: `.gblacklist add|remove @user` or `@role`.")
         return
 
     config = await get_config(ctx.guild.id, bot.db)
@@ -4784,7 +5486,7 @@ async def gblacklist_cmd(ctx: commands.Context, action: str, target: str):
         try:
             role = await role_conv.convert(ctx, target)
         except commands.BadArgument:
-            await ctx.send("⚠️ Couldn't resolve that as a member or role.")
+            await send_reply(ctx, "⚠️ Couldn't resolve that as a member or role.")
             return
 
     if member:
@@ -4793,14 +5495,14 @@ async def gblacklist_cmd(ctx: commands.Context, action: str, target: str):
         else:
             users.discard(member.id)
         await bot.db.update_config(ctx.guild.id, "giveaway_blacklist_users", list(users))
-        await ctx.send(f"✅ {'Blacklisted' if action == 'add' else 'Unblacklisted'} {member.mention} from giveaways.")
+        await send_reply(ctx, f"✅ {'Blacklisted' if action == 'add' else 'Unblacklisted'} {member.mention} from giveaways.")
     else:
         if action == "add":
             roles.add(role.id)
         else:
             roles.discard(role.id)
         await bot.db.update_config(ctx.guild.id, "giveaway_blacklist_roles", list(roles))
-        await ctx.send(f"✅ {'Blacklisted' if action == 'add' else 'Unblacklisted'} {role.mention} from giveaways.")
+        await send_reply(ctx, f"✅ {'Blacklisted' if action == 'add' else 'Unblacklisted'} {role.mention} from giveaways.")
 
 
 @bot.command(name="gbonus")
@@ -4814,11 +5516,11 @@ async def gbonus_cmd(ctx: commands.Context, role: discord.Role, amount: int):
     if amount <= 0:
         bonus_map.pop(role.id, None)
         await bot.db.update_config(ctx.guild.id, "giveaway_bonus_roles", {str(k): v for k, v in bonus_map.items()})
-        await ctx.send(f"✅ Removed bonus entries for {role.mention}.")
+        await send_reply(ctx, f"✅ Removed bonus entries for {role.mention}.")
         return
     bonus_map[role.id] = amount
     await bot.db.update_config(ctx.guild.id, "giveaway_bonus_roles", {str(k): v for k, v in bonus_map.items()})
-    await ctx.send(f"✅ {role.mention} now grants **+{amount}** bonus entries per giveaway.")
+    await send_reply(ctx, f"✅ {role.mention} now grants **+{amount}** bonus entries per giveaway.")
 
 
 async def _resolve_giveaway(doc: dict):
@@ -4877,7 +5579,8 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
             except discord.HTTPException:
                 pass
             try:
-                await user.send(f"⛔ You're blacklisted from giveaways in **{guild.name}** and can't enter.")
+                await user.send(embed=make_embed(f"You're blacklisted from giveaways in **{guild.name}** and can't enter.",
+                                                   title="⛔ Blacklisted", color=discord.Color.red()))
             except discord.Forbidden:
                 pass
             return
@@ -4907,6 +5610,8 @@ async def userinfo_cmd(ctx: commands.Context, member: discord.Member = None):
     member = member or ctx.author
     data   = await bot.db.get_level_data(member.id, ctx.guild.id)
     warns  = await bot.db.get_warns(ctx.guild.id, member.id)
+    config = await get_config(ctx.guild.id, bot.db)
+    decay_days = config.get("warn_decay_days", 0)
     invite = await bot.db.invites.find_one(
         {"guild_id": ctx.guild.id, "inviter_id": member.id, "invite_code": "__total__"}
     ) or {}
@@ -4936,7 +5641,12 @@ async def userinfo_cmd(ctx: commands.Context, member: discord.Member = None):
     embed.add_field(name="Account Age", value=f"{account_age}d old\n<t:{int(created_at.timestamp())}:D>", inline=True)
     embed.add_field(name="Joined Server", value=f"{join_age}d ago\n<t:{int(joined_at.timestamp())}:D>" if joined_at else "?", inline=True)
     embed.add_field(name="Level",       value=str(level), inline=True)
-    embed.add_field(name="Warns",       value=str(len(warns)), inline=True)
+    if decay_days:
+        active = await bot.db.get_active_warns(ctx.guild.id, member.id, decay_days)
+        warns_display = f"{active} active / {len(warns)} total"
+    else:
+        warns_display = str(len(warns))
+    embed.add_field(name="Warns",       value=warns_display, inline=True)
     embed.add_field(name="Invites",     value=str(invite.get("total_invites", 0)), inline=True)
     embed.add_field(name="Messages",    value=str(data.get("messages", 0) if data else 0), inline=True)
     if top_roles:
@@ -4981,7 +5691,7 @@ async def serverinfo_cmd(ctx: commands.Context):
 @commands.has_permissions(administrator=True)
 async def restart_cmd(ctx: commands.Context):
     """Gracefully shut down. Requires a process manager (systemd/pm2/supervisor) to auto-restart."""
-    await ctx.send("🔄 Restarting...")
+    await send_reply(ctx, "🔄 Restarting...")
     logger.info("Restart triggered by %s (%s)", ctx.author, ctx.author.id)
     await bot.close()
     import sys
