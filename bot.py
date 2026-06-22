@@ -2025,7 +2025,7 @@ class AjsCrib(commands.Bot):
             # "@everyone ..." and ping the whole server the next time anyone
             # @'d them. Explicit @user pings (level-ups, warns, etc.) still work
             # fine since `users` stays allowed.
-            allowed_mentions=discord.AllowedMentions(everyone=False, here=False, roles=False, users=True),
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
         )
         self.db: Optional[Database] = None
         self._xp_cooldowns: dict[tuple[int, int], float] = {}
