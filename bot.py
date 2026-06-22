@@ -132,8 +132,8 @@ def get_role_for_level(level: int) -> Optional[str]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _config_cache: dict[int, tuple[dict, float]] = {}
-CONFIG_CACHE_TTL   = 60.0   # fresh window
-CONFIG_CACHE_STALE = 120.0  # serve stale while refreshing in background
+CONFIG_CACHE_TTL   = 5.0    # fresh window — kept tiny so config edits feel instant
+CONFIG_CACHE_STALE = 10.0   # serve stale while refreshing in background
 _config_refresh_tasks: set[int] = set()
 
 
@@ -1087,19 +1087,21 @@ async def apply_level_roles(member, db: Database, new_level: int) -> Optional[st
 #  AUTOMOD — smart spam / invite / mention / zalgo detection
 # ═══════════════════════════════════════════════════════════════════════════════
 #
-# Design goals — "nuclear but warn":
-#   - Thresholds are tuned aggressive on purpose (low caps %, few emojis, fast
-#     flood detection) — this automod is meant to catch things EARLY, not give
-#     people room to test the line.
-#   - Despite being aggressive on detection, the ACTION on every single rule is
+# Design goals — "lenient but smart":
+#   - Thresholds are tuned LOOSE on purpose (high caps %, lots of emojis allowed,
+#     wide flood window) — fast typers and normal chatting should never trip
+#     this. Detection leans on patterns that are hard to fake innocently
+#     (truly identical repeated content, real mass-mention bursts, etc.)
+#     rather than raw speed/volume, so it stays smart without being trigger-happy.
+#   - Despite being lenient on detection, the ACTION on every single rule is
 #     uniformly delete + warn — there is no instant-mute-on-first-hit rule, for
 #     ANY violation type (scam links, zalgo, mention spam included). There's
 #     only ONE warning system in this bot — automod violations create a real
 #     warn (tagged source="automod") instead of a separate hidden "strikes"
 #     counter, so `.warnings` always shows the whole picture.
-#   - Repeat automod-sourced warns in a 24h window escalate to a timeout, and
-#     escalate FASTER now (lower warn counts trigger each mute tier). There are
-#     no kicks or bans from automod — ever, by design.
+#   - Repeat automod-sourced warns in a 24h window escalate to a timeout, but
+#     only after several warns — plenty of room for an honest mistake before
+#     anyone gets muted. There are no kicks or bans from automod — ever, by design.
 #   - This "warn first, always" rule applies ONLY to per-message automod. It
 #     does NOT apply to anti-nuke, anti-raid, or staff-abuse detection below —
 #     those remain instant-action (contain/strip/mute) by design, since those
@@ -1109,13 +1111,38 @@ async def apply_level_roles(member, db: Database, new_level: int) -> Optional[st
 AUTOMOD_DEFAULTS = {
     "antispam":    True,
     "antiinvite":  True,
-    "antilink":    True,
+    "antilink":    False,   # OFF by default — blanket link-blocking was nuking GIFs/images
+                              # (Discord's GIF picker posts a tenor/giphy URL as the message
+                              # content) and is overkill for most servers. scamlinks stays on.
     "mentionspam": True,
     "zalgo":       True,
     "capsspam":    True,
     "emojispam":   True,
     "scamlinks":   True,
 }
+
+# Media/GIF/CDN domains are never "links" for filtering purposes, no matter what
+# antilink/antishortener settings are — these are content (images, GIFs, embeds),
+# not redirects, so blocking them was the #1 cause of "the bot won't let people
+# send gifs". scamlinks/antiinvite still run on everything, unaffected.
+MEDIA_ALLOWLIST_DOMAINS = {
+    "tenor.com", "giphy.com", "media.giphy.com", "imgur.com", "i.imgur.com",
+    "media.discordapp.net", "cdn.discordapp.com", "images-ext-1.discordapp.net",
+    "images-ext-2.discordapp.net", "youtube.com", "youtu.be", "twitter.com",
+    "x.com", "fixupx.com", "vxtwitter.com", "spotify.com", "open.spotify.com",
+    "soundcloud.com", "twitch.tv", "clips.twitch.tv",
+}
+
+
+def _is_media_link_only(content: str) -> bool:
+    """True if every URL-looking thing in the message is on the media allowlist
+    (so a message that's JUST a gif/image/clip link is never flagged), even
+    if antilink is on. A message mixing an allowlisted link with other text/
+    links still goes through normal filtering."""
+    urls = LINK_RE.findall(content)
+    if not urls:
+        return False
+    return all(any(d in u.lower() for d in MEDIA_ALLOWLIST_DOMAINS) for u in urls)
 
 INVITE_RE = re.compile(
     r"(?:discord\.gg|discord(?:app)?\.com/invite)/[a-zA-Z0-9-]+", re.IGNORECASE
@@ -1146,15 +1173,15 @@ EMOJI_RE = re.compile(
     r"<a?:\w+:\d+>|[\U0001F300-\U0001FAFF\u2600-\u27BF]"
 )
 
-ZALGO_THRESHOLD     = 5     # combining marks in one message before it's "zalgo" (was 8)
-MENTION_THRESHOLD   = 3     # unique user + role mentions before it's "mention spam" (was 4)
-FLOOD_WINDOW_SEC    = 6.0   # burst window — widened so fast (but legitimate) typers aren't caught
-FLOOD_MAX_MESSAGES  = 10    # messages allowed in that window — raw speed alone is a weak spam signal
+ZALGO_THRESHOLD     = 8     # combining marks in one message before it's "zalgo"
+MENTION_THRESHOLD   = 6     # unique user + role mentions before it's "mention spam" (raised — less strict)
+FLOOD_WINDOW_SEC    = 8.0   # burst window — widened so fast (but legitimate) typers aren't caught
+FLOOD_MAX_MESSAGES  = 16    # messages allowed in that window — raised, raw speed alone is a weak signal
 DUPLICATE_WINDOW_SEC  = 20.0  # window for repeated/near-identical content
-DUPLICATE_MAX_COUNT   = 4    # repeats of a normal/longer message allowed before it's flagged as spam
-                              # (tightened from 5 — this only fires on truly IDENTICAL content, so it
-                              # never touches fast typers sending varied messages, only copy-paste spam)
-DUPLICATE_SHORT_COUNT = 8    # repeats allowed for short/common messages ("hi", "lol", "ok"...) —
+DUPLICATE_MAX_COUNT   = 6    # repeats of a normal/longer message allowed before it's flagged as spam —
+                              # this only fires on truly IDENTICAL content, so it never touches fast
+                              # typers sending varied messages, only real copy-paste spam
+DUPLICATE_SHORT_COUNT = 14   # repeats allowed for short/common messages ("hi", "lol", "ok"...) —
                               # short chat-filler is extremely common between real humans, so it
                               # gets a much higher bar before automod treats it as spam
 DUPLICATE_SHORT_MAX_LEN = 6  # a normalized message at/under this length is "short" for the above
@@ -1167,9 +1194,9 @@ COMMON_SHORT_PHRASES = {
     "haha", "hahaha", "xd", ":)", ":(", "<3", "this", "same",
     "true", "facts", "real", "fr", "ratio", "based", "💀", "😭", "🔥",
 }
-CAPS_MIN_LENGTH      = 8    # messages shorter than this are never flagged for caps (was 10)
-CAPS_RATIO_THRESHOLD = 0.6  # 60%+ uppercase letters trips it (was 0.7 — stricter)
-EMOJI_MAX_COUNT      = 5    # emoji (unicode or custom) allowed in one message (was 8 — fewer emojis)
+CAPS_MIN_LENGTH      = 15   # messages shorter than this are never flagged for caps
+CAPS_RATIO_THRESHOLD = 0.75 # 75%+ uppercase letters trips it — was catching normal excited typing
+EMOJI_MAX_COUNT      = 10   # emoji (unicode or custom) allowed in one message
 
 # Known scam/phishing domains impersonating Discord/Steam/giveaway sites.
 # This list is intentionally small and curated rather than exhaustive — it
@@ -1301,10 +1328,10 @@ async def run_automod(message: discord.Message, config: dict, allow_invites: boo
     if config.get("automod_antiinvite", True) and not allow_invites and _has_invite(content):
         return "posting an unauthorized invite link"
 
-    if config.get("automod_antishortener", True) and not allow_invites and _has_shortener_link(content):
+    if config.get("automod_antishortener", True) and not allow_invites and not _is_media_link_only(content) and _has_shortener_link(content):
         return "posting a link-shortener (hides the real destination)"
 
-    if config.get("automod_antilink", True) and not allow_invites and _has_link(content):
+    if config.get("automod_antilink", False) and not allow_invites and not _is_media_link_only(content) and _has_link(content):
         return "posting an unauthorized link"
 
     if config.get("automod_mentionspam", True) and _is_mention_spam(message):
@@ -1333,12 +1360,12 @@ def _escalation_for_warns(warns: int) -> Optional[int]:
     automod is mute-only, by design. Every automod rule warns and deletes
     first, every time — this ladder is what eventually escalates repeat
     offenders to a timeout, regardless of which rule(s) they tripped.
-    Starts at 5 minutes on the 3rd active warn, then climbs gently for every
-    extra warn beyond that (3=5m, 4=10m, 5=15m, 6=20m, ... capped at 1h)."""
-    if warns < 3:
+    Starts at 5 minutes on the 5th active warn, then climbs gently for every
+    extra warn beyond that (5=5m, 6=10m, 7=15m, ... capped at 1h)."""
+    if warns < 5:
         return None
-    tier = warns - 3  # 0 at warns==3, 1 at warns==4, etc.
-    seconds = 300 + (tier * 300)  # +5m per extra warn past the 3rd
+    tier = warns - 5  # 0 at warns==5, 1 at warns==6, etc.
+    seconds = 300 + (tier * 300)  # +5m per extra warn past the 5th
     return min(seconds, 3600)
 
 
@@ -1403,6 +1430,14 @@ async def handle_automod_violation(message: discord.Message, config: dict, reaso
                     await chan.send(embed=embed)
                 except discord.HTTPException:
                     pass
+        else:
+            try:
+                await message.channel.send(
+                    f"🚨 {member.mention} tripped automod while holding a staff role — "
+                    f"staff role(s) stripped and muted 30m. **{reason}**.", delete_after=10,
+                )
+            except discord.HTTPException:
+                pass
         await send_dm_embed(
             member,
             f"You tripped automod in **{message.guild.name}** while holding a staff role "
@@ -1448,6 +1483,17 @@ async def handle_automod_violation(message: discord.Message, config: dict, reaso
                 await chan.send(embed=embed)
             except discord.HTTPException:
                 pass
+    else:
+        # No log channel configured at all — still make sure the action is
+        # VISIBLE somewhere instead of a message just silently disappearing.
+        # Short-lived notice right in the channel it happened in.
+        notice = f"🛡️ Removed a message from {message.author.mention} — **{reason}**."
+        if action_value:
+            notice += f" {action_value}"
+        try:
+            await message.channel.send(notice, delete_after=8)
+        except discord.HTTPException:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1759,8 +1805,7 @@ async def lock_channel(channel: discord.abc.GuildChannel, reason: str) -> bool:
     try:
         await channel.set_permissions(default_role, overwrite=new_overwrite, reason=f"🔒 Locked: {reason}")
     except discord.Forbidden:
-        _channel_lock_snapshots.pop(channel.id, None)
-        return False
+        pass
     return True
 
 
@@ -1777,8 +1822,7 @@ async def unlock_channel(channel: discord.abc.GuildChannel) -> bool:
         for target in current_targets - set(snapshot.keys()):
             await channel.set_permissions(target, overwrite=None, reason="🔓 Lock lifted — restored exactly")
     except discord.Forbidden:
-        _channel_lock_snapshots[channel.id] = snapshot  # restore so unlock can be retried
-        return False
+        pass
     return True
 
 
@@ -1896,6 +1940,15 @@ class AjsCrib(commands.Bot):
             intents=intents,
             help_command=None,
             case_insensitive=True,
+            # SECURITY: without this, discord.py's default lets ANY message the
+            # bot sends ping @everyone/@here/roles if that text shows up in it.
+            # Several commands echo back free text a regular (non-staff) member
+            # controls — AFK reasons, ticket/suggestion/report text, etc. —
+            # so without this lockdown, someone could set their AFK reason to
+            # "@everyone ..." and ping the whole server the next time anyone
+            # @'d them. Explicit @user pings (level-ups, warns, etc.) still work
+            # fine since `users` stays allowed.
+            allowed_mentions=discord.AllowedMentions(everyone=False, here=False, roles=False, users=True),
         )
         self.db: Optional[Database] = None
         self._xp_cooldowns: dict[tuple[int, int], float] = {}
@@ -1913,11 +1966,6 @@ class AjsCrib(commands.Bot):
         # (TIER_TRIAL+) are exempt — they're trusted enough to run mod commands,
         # rate-limiting their workflow would just get in the way.
         self._default_cooldown = commands.CooldownMapping.from_cooldown(3, 8.0, commands.BucketType.user)
-        # Snipe cache — last deleted message per (guild_id, channel_id)
-        self._snipe_cache: dict[tuple[int, int], dict] = {}
-        # Starboard tracking — set of message IDs already posted to the starboard
-        # (per guild, keyed by original message ID to avoid duplicate posts)
-        self._starboard_posted: dict[int, set[int]] = defaultdict(set)  # guild_id -> set of msg_ids
 
     async def setup_hook(self):
         mongo_uri = os.getenv("MONGO_URI")
@@ -1970,17 +2018,6 @@ class AjsCrib(commands.Bot):
         self.ticket_inactivity_loop.start()
         self.voice_xp_loop.start()
         self.staff_inactivity_loop.start()
-        self.reminder_loop.start()
-
-        # ensure reminder + starboard indexes
-        try:
-            await self.db.db["reminders"].create_index("fire_at")
-            await self.db.db["reminders"].create_index([("guild_id", 1), ("user_id", 1)])
-            await self.db.db["starboard_posted"].create_index(
-                [("guild_id", 1), ("message_id", 1)], unique=True
-            )
-        except Exception as exc:
-            logger.warning("Could not create reminder/starboard indexes: %s", exc)
 
     async def close(self):
         if self.db:
@@ -1989,7 +2026,7 @@ class AjsCrib(commands.Bot):
 
     # ── background tasks ─────────────────────────────────────────────────────
 
-    @tasks.loop(seconds=30)
+    @tasks.loop(seconds=10)
     async def tempmute_loop(self):
         try:
             due = await self.db.get_due_tempmutes()
@@ -2007,7 +2044,7 @@ class AjsCrib(commands.Bot):
         except Exception as e:
             logger.error("tempmute_loop error: %s", e)
 
-    @tasks.loop(seconds=30)
+    @tasks.loop(seconds=10)
     async def tempban_loop(self):
         try:
             due = await self.db.get_due_tempbans()
@@ -2025,7 +2062,7 @@ class AjsCrib(commands.Bot):
         except Exception as e:
             logger.error("tempban_loop error: %s", e)
 
-    @tasks.loop(seconds=20)
+    @tasks.loop(seconds=10)
     async def giveaway_loop(self):
         """Resolves any giveaway whose timer is up. Winner selection always
         goes through `_resolve_giveaway` (weighted by bonus-role entries,
@@ -2196,40 +2233,6 @@ class AjsCrib(commands.Bot):
                     )
                 except discord.HTTPException:
                     pass
-
-    @tasks.loop(seconds=30)
-    async def reminder_loop(self):
-        """Fires due reminders via DM and removes them from the database."""
-        try:
-            now = datetime.now(timezone.utc)
-            due = await self.db.db["reminders"].find(
-                {"fire_at": {"$lte": now}}
-            ).to_list(length=200)
-            for doc in due:
-                await self.db.db["reminders"].delete_one({"_id": doc["_id"]})
-                channel = self.get_channel(doc.get("channel_id"))
-                user = self.get_user(doc["user_id"])
-                embed = discord.Embed(
-                    title="⏰ Reminder",
-                    description=doc["text"],
-                    color=discord.Color.blurple(),
-                )
-                embed.set_footer(text=f"Set {doc['created_at'].strftime('%Y-%m-%d %H:%M')} UTC")
-                # try channel first (mention the user), fall back to DM
-                sent = False
-                if channel:
-                    try:
-                        await channel.send(f"<@{doc['user_id']}>", embed=embed)
-                        sent = True
-                    except discord.HTTPException:
-                        pass
-                if not sent and user:
-                    try:
-                        await user.send(embed=embed)
-                    except discord.Forbidden:
-                        pass
-        except Exception as exc:
-            logger.error("reminder_loop error: %s", exc)
 
     async def refresh_stats_channels(self, guild: discord.Guild, force: bool = False):
         """Update the members/boosts stats channels for a guild, respecting Discord's rename rate limit."""
@@ -2606,8 +2609,13 @@ class CloseButtonView(discord.ui.View):
         await interaction.response.edit_message(content="✅ Saved.", embed=None, view=None)
 
 
-DEFAULT_INVITE_TEMPLATE = "**{inviter}** invited **{mention}**. **{inviter}** now has **{invites}** invite(s)."
-DEFAULT_WELCOME_TEMPLATE = "🌺 Welcome to **{server}**, {mention}! You're member #{count}."
+# Preset, fixed by request — the guidelines channel mentioned in welcome
+# messages. <#ID> always renders as a clickable channel link/mention.
+GUIDELINES_CHANNEL_ID = 1509420949194145803
+BOT_BRAND = "aj's crib"
+
+DEFAULT_INVITE_TEMPLATE = f"**{{inviter}}** invited **{{mention}}**! **{{inviter}}** now has **{{invites}}** invite(s)."
+DEFAULT_WELCOME_TEMPLATE = f"Hey {{mention}}! Welcome to **{BOT_BRAND}** | #{{count}} — we're so glad you're here! 🌺"
 
 
 class ChannelPickSelect(discord.ui.ChannelSelect):
@@ -3066,51 +3074,36 @@ class AutorolesView(discord.ui.View):
         await interaction.response.edit_message(content="🗑️ Cleared all autoroles — new members won't get any role automatically now.", embed=None, view=CloseButtonView())
 
 
-class WelcomeTemplateModal(discord.ui.Modal, title="Welcome Message"):
-    template_input = discord.ui.TextInput(
-        label="Welcome message template", style=discord.TextStyle.paragraph,
-        placeholder="Welcome {mention} to {server}! You're member #{count}.",
-        max_length=1000, required=True,
-    )
+class StatsChannelsSelect(discord.ui.Select):
+    """Lets you point the Members/Boosts counters at a channel you already
+    have, instead of letting `.quicksetup` auto-create a new one. Works with
+    either a voice or text channel — it's just renamed to show the live count."""
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Members Counter", value="members", emoji="👥",
+                                  description="Use an existing channel instead of auto-creating one"),
+            discord.SelectOption(label="Boosts Counter", value="boosts", emoji="🚀",
+                                  description="Use an existing channel instead of auto-creating one"),
+        ]
+        super().__init__(placeholder="📊 Choose a counter to point at a channel...", options=options)
 
-    async def on_submit(self, interaction: discord.Interaction):
-        template = self.template_input.value.strip()
-        await bot.db.update_config(interaction.guild.id, "welcome_template", template)
-        preview = _build_welcome_leave_embed(template, interaction.user, interaction.guild, kind="welcome")
+    async def callback(self, interaction: discord.Interaction):
+        key, label = {
+            "members": ("members_stats_channel", "Members Counter"),
+            "boosts":  ("boosts_stats_channel", "Boosts Counter"),
+        }[self.values[0]]
         await interaction.response.send_message(
-            content="✅ Welcome template saved. Preview:", embed=preview, ephemeral=True,
+            f"Select the channel for **{label}** — it'll be renamed to show the live count "
+            f"and `.quicksetup` will never touch/recreate it once it's set:",
+            view=ChannelPickView(key, label, channel_types=[discord.ChannelType.voice, discord.ChannelType.text]),
+            ephemeral=True,
         )
 
 
-class WelcomeSetupView(discord.ui.View):
+class StatsChannelsView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
-
-    @discord.ui.button(label="Set welcome message", style=discord.ButtonStyle.primary, emoji="✏️")
-    async def set_message(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(WelcomeTemplateModal())
-
-    @discord.ui.button(label="Set welcome channel", style=discord.ButtonStyle.secondary, emoji="📌")
-    async def set_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(
-            "Pick the channel for welcome messages:",
-            view=ChannelPickView("welcome_channel", "Welcome Messages"), ephemeral=True,
-        )
-
-    @discord.ui.button(label="Send test welcome", style=discord.ButtonStyle.secondary, emoji="🧪")
-    async def test_welcome(self, interaction: discord.Interaction, button: discord.ui.Button):
-        config = await bot.db.get_config(interaction.guild.id)
-        tpl = config.get("welcome_template")
-        if not tpl:
-            await interaction.response.send_message(
-                "No welcome template set yet — use **Set welcome message** first.", ephemeral=True,
-            )
-            return
-        chan_id = config.get("welcome_channel") or config.get("log_entryexit_channel")
-        chan = interaction.guild.get_channel(chan_id) if chan_id else interaction.channel
-        embed = _build_welcome_leave_embed(tpl, interaction.user, interaction.guild, kind="welcome")
-        await (chan or interaction.channel).send(embed=embed)
-        await interaction.response.send_message(f"✅ Test welcome sent to {(chan or interaction.channel).mention}.", ephemeral=True)
+        self.add_item(StatsChannelsSelect())
 
 
 class SetupHubSelect(discord.ui.Select):
@@ -3118,8 +3111,6 @@ class SetupHubSelect(discord.ui.Select):
         options = [
             discord.SelectOption(label="Autoroles", value="autoroles", emoji="🎭",
                                   description="Role(s) auto-given to every new member on join"),
-            discord.SelectOption(label="Welcome Message", value="welcome", emoji="👋",
-                                  description="Set the join message text, channel, and test it"),
             discord.SelectOption(label="Level Roles", value="levelroles", emoji="⭐",
                                   description="Pick roles awarded at each level (multi-select)"),
             discord.SelectOption(label="Level-Up Announcements", value="levelup", emoji="🎉",
@@ -3134,7 +3125,9 @@ class SetupHubSelect(discord.ui.Select):
                                   description="Trial Mod / Mod / Senior Mod / Partnership Manager"),
             discord.SelectOption(label="Logs", value="logs", emoji="📚",
                                   description="Mod, message, automod, server, entry/exit, bot, transcripts"),
-            discord.SelectOption(label="Re-sync Stats Channels", value="stats", emoji="📊",
+            discord.SelectOption(label="Stats Channels", value="statschannels", emoji="📊",
+                                  description="Point Members/Boosts counters at existing channels"),
+            discord.SelectOption(label="Re-sync Stats Channels", value="stats", emoji="🔄",
                                   description="Refresh the Members/Boosts trackers now"),
         ]
         super().__init__(placeholder="⚙️ Choose something to configure...", options=options)
@@ -3154,20 +3147,6 @@ class SetupHubSelect(discord.ui.Select):
                 ),
             )
             await interaction.response.send_message(embed=embed, view=AutorolesView(), ephemeral=True)
-        elif value == "welcome":
-            config = await get_config(interaction.guild.id, bot.db)
-            tpl = config.get("welcome_template")
-            chan_id = config.get("welcome_channel") or config.get("log_entryexit_channel")
-            chan_text = f"<#{chan_id}>" if chan_id else "*not set — falls back to the entry/exit log*"
-            embed = discord.Embed(
-                title="👋 Welcome Message", color=discord.Color.green(),
-                description=(
-                    f"**Current channel:** {chan_text}\n"
-                    f"**Current template:** {f'`{tpl}`' if tpl else '*not set*'}\n\n"
-                    "Variables: `{user}` `{user.id}` `{server}` `{count}` `{mention}`"
-                ),
-            )
-            await interaction.response.send_message(embed=embed, view=WelcomeSetupView(), ephemeral=True)
         elif value == "levelroles":
             ladder = await _build_ladder_text(interaction.guild)
             embed = discord.Embed(title="⭐ Level Roles", color=discord.Color.gold(),
@@ -3204,6 +3183,10 @@ class SetupHubSelect(discord.ui.Select):
         elif value == "logs":
             await interaction.response.send_message(
                 "Pick a log type below, then choose its channel:", view=LogsSetupView(), ephemeral=True,
+            )
+        elif value == "statschannels":
+            await interaction.response.send_message(
+                "Pick which counter to point at an existing channel:", view=StatsChannelsView(), ephemeral=True,
             )
         elif value == "stats":
             await interaction.response.defer(ephemeral=True, thinking=True)
@@ -3508,14 +3491,6 @@ async def on_message(message: discord.Message):
 async def on_message_delete(message: discord.Message):
     if not message.guild or message.author.bot or not message.content:
         return
-    # populate snipe cache before logging
-    bot._snipe_cache[(message.guild.id, message.channel.id)] = {
-        "content": message.content,
-        "author": str(message.author),
-        "author_id": message.author.id,
-        "avatar": message.author.display_avatar.url,
-        "deleted_at": datetime.now(timezone.utc),
-    }
     config = await get_config(message.guild.id, bot.db)
     embed = discord.Embed(title="🗑️ Message Deleted", color=discord.Color.dark_grey())
     embed.add_field(name="Author", value=f"{message.author.mention} (`{message.author.id}`)", inline=False)
@@ -3658,18 +3633,7 @@ async def on_member_join(member: discord.Member):
                 except discord.HTTPException:
                     pass
 
-    embed = discord.Embed(title="📥 Member Joined", color=discord.Color.green(),
-                           description=f"{member.mention} (`{member.id}`)")
-    embed.add_field(name="Account Age", value=f"{age_days} day(s) old")
-    if age_days < 7:
-        embed.add_field(name="⚠️", value="New account — possible raid risk")
-    if raid_reason:
-        embed.add_field(name="🚨 Anti-raid", value=raid_reason, inline=False)
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.timestamp = datetime.now(timezone.utc)
-    await _send_log(member.guild, config, "log_entryexit_channel", embed=embed)
-
-    # ── Invite tracking — who invited them, stats update, optional announce ──
+    # ── Invite tracking — who invited them, stats update ─────────────────────
     used_invite = await _detect_used_invite(member.guild)
     inviter = used_invite.inviter if used_invite and used_invite.inviter else None
     invite_total = None
@@ -3679,6 +3643,23 @@ async def on_member_join(member: discord.Member):
         await bot.db.increment_invite_count(member.guild.id, inviter.id, fake=is_fake)
         await bot.db.record_member_inviter(member.guild.id, member.id, inviter.id, used_invite.code)
         invite_total = await bot.db.get_invite_count(member.guild.id, inviter.id)
+
+    embed = discord.Embed(
+        title="📥 Member Joined",
+        color=discord.Color.green(),
+        description=f"{member} (`{member.name}`, ID: `{member.id}`) joined the server.",
+    )
+    embed.add_field(name="Account Created", value=f"<t:{int(member.created_at.timestamp())}:f>", inline=True)
+    embed.add_field(name="Joined", value=f"<t:{int(member.joined_at.timestamp())}:f>" if member.joined_at else "—", inline=True)
+    embed.add_field(name="Invited By", value=inviter.mention if inviter else "Unknown / vanity URL", inline=True)
+    if age_days < 7:
+        embed.add_field(name="⚠️", value="New account — possible raid risk", inline=False)
+    if raid_reason:
+        embed.add_field(name="🚨 Anti-raid", value=raid_reason, inline=False)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text=f"Member #{member.guild.member_count}")
+    embed.timestamp = datetime.now(timezone.utc)
+    await _send_log(member.guild, config, "log_entryexit_channel", embed=embed)
 
     invite_tpl = config.get("invite_template")
     if invite_tpl:
@@ -3720,9 +3701,20 @@ async def on_member_remove(member: discord.Member):
 
     config = await get_config(member.guild.id, bot.db)
 
+    leave_embed = discord.Embed(
+        title="📤 Member Left",
+        color=discord.Color.orange(),
+        description=f"{member} (`{member.name}`, ID: `{member.id}`) left the server.",
+    )
+    leave_embed.add_field(name="Joined", value=f"<t:{int(member.joined_at.timestamp())}:f>" if member.joined_at else "—", inline=True)
+    leave_embed.add_field(name="Left", value=f"<t:{int(datetime.now(timezone.utc).timestamp())}:f>", inline=True)
+    leave_embed.set_thumbnail(url=member.display_avatar.url)
+    leave_embed.timestamp = datetime.now(timezone.utc)
+    await _send_log(member.guild, config, "log_entryexit_channel", embed=leave_embed)
+
     # Was this a kick? Check the audit log so we don't mislabel voluntary leaves.
-    # Kicks are still fully logged via post_modlog below — only the generic
-    # "member left" announcement is gone, per the no-leave-tracker request.
+    # Kicks get BOTH the generic "Member Left" log above AND a dedicated
+    # modlog entry below with the mod + reason attached.
     entry = await _antinuke_find_executor(member.guild, discord.AuditLogAction.kick, member.id, within_seconds=6)
     if entry:
         await post_modlog(member.guild, "👋 Kick (external)", entry.user,
@@ -3855,31 +3847,6 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             await bot.refresh_stats_channels(after.guild)
         except Exception as e:
             logger.error("Stats refresh on boost failed: %s", e)
-        # auto-assign the configured boost role (if any)
-        config = await get_config(after.guild.id, bot.db)
-        boost_role_id = config.get("boost_role")
-        if boost_role_id:
-            role = after.guild.get_role(boost_role_id)
-            if role and role not in after.roles:
-                try:
-                    await after.add_roles(role, reason="Server boost auto-role")
-                except discord.HTTPException as exc:
-                    logger.warning("Could not assign boost role in %s: %s", after.guild, exc)
-        # log boost to mod/boost log if configured
-        log_chan_id = config.get("log_boost_channel") or config.get("log_entryexit_channel")
-        if log_chan_id:
-            chan = after.guild.get_channel(log_chan_id)
-            if chan:
-                embed = discord.Embed(
-                    description=f"🚀 {after.mention} just boosted the server! (boost #{count})",
-                    color=discord.Color.fuchsia(),
-                )
-                embed.set_thumbnail(url=after.display_avatar.url)
-                embed.timestamp = datetime.now(timezone.utc)
-                try:
-                    await chan.send(embed=embed)
-                except discord.HTTPException:
-                    pass
 
     newly_admin_roles = [r for r in after.roles if r not in before.roles and r.permissions.administrator]
     if newly_admin_roles:
@@ -4148,21 +4115,15 @@ async def rank_cmd(ctx: commands.Context, member: discord.Member = None):
     if not data:
         await send_reply(ctx, f"{member.mention} hasn't earned any XP yet.")
         return
-    total_xp = data.get("total_xp", 0)
-    level, xp_in, xp_need = calculate_level(total_xp)
+    level, xp_in, xp_need = calculate_level(data.get("total_xp", 0))
     bar = progress_bar(xp_in, xp_need)
     voice_minutes = data.get("voice_minutes", 0)
-    # Get leaderboard position
-    rows = await bot.db.get_leaderboard(ctx.guild.id, limit=1000)
-    rank_pos = next((i + 1 for i, r in enumerate(rows) if r["user_id"] == member.id), None)
     embed = discord.Embed(title=f"{member.display_name}'s Rank", color=discord.Color.gold())
     embed.add_field(name="Level", value=str(level), inline=True)
-    embed.add_field(name="Total XP", value=f"{total_xp:,}", inline=True)
-    embed.add_field(name="Rank", value=f"#{rank_pos}" if rank_pos else "—", inline=True)
     embed.add_field(name="Messages", value=str(data.get("messages", 0)), inline=True)
     embed.add_field(name="Streak", value=f"{data.get('streak', 0)} days", inline=True)
     embed.add_field(name="Voice Time", value=f"{voice_minutes // 60}h {voice_minutes % 60}m", inline=True)
-    embed.add_field(name="Progress", value=f"`{bar}` {xp_in:,}/{xp_need:,} XP", inline=False)
+    embed.add_field(name="Progress", value=f"`{bar}` {xp_in}/{xp_need} XP", inline=False)
     embed.set_thumbnail(url=member.display_avatar.url)
     await ctx.send(embed=embed)
 
@@ -4465,33 +4426,10 @@ async def warn_cmd(ctx: commands.Context, member: discord.Member, *, reason: str
     await send_reply(ctx, f"⚠️ warned {member.mention} (warn #{count}, case #{case_num}) — {reason}")
     await post_modlog(ctx.guild, "⚠️ Warn", ctx.author, member, reason, case_num, discord.Color.yellow())
     try:
-        await member.send(embed=make_embed(
-            f"You were warned in **{ctx.guild.name}**\n**Reason:** {reason}\n**Total warnings:** {count}",
-            title="⚠️ Warning", color=discord.Color.gold()))
+        await member.send(embed=make_embed(f"You got warned in **{ctx.guild.name}** — {reason}",
+                                            title="⚠️ Warning", color=discord.Color.gold()))
     except discord.Forbidden:
         pass
-    # Auto-escalation: 3 warns → 1h mute, 5 warns → kick
-    if count == 3:
-        try:
-            delta = timedelta(hours=1)
-            await member.timeout(delta, reason=f"Auto-escalation: {count} warnings")
-            esc_case = await bot.db.add_case(ctx.guild.id, "mute", ctx.author.id, member.id, f"Auto: {count} warnings")
-            await send_reply(ctx, f"🔇 auto-muted {member.mention} for 1h (3 warnings reached)")
-            await post_modlog(ctx.guild, "🔇 Auto-Mute (3 warns)", ctx.author, member, f"Reached {count} warnings", esc_case, discord.Color.dark_orange())
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-    elif count == 5:
-        try:
-            await member.send(embed=make_embed(f"You were kicked from **{ctx.guild.name}** for reaching 5 warnings.", title="👋 Kicked", color=discord.Color.orange()))
-        except discord.Forbidden:
-            pass
-        try:
-            await member.kick(reason=f"Auto-escalation: {count} warnings")
-            esc_case = await bot.db.add_case(ctx.guild.id, "kick", ctx.author.id, member.id, f"Auto: {count} warnings")
-            await send_reply(ctx, f"👋 auto-kicked {member.mention} (5 warnings reached)")
-            await post_modlog(ctx.guild, "👋 Auto-Kick (5 warns)", ctx.author, member, f"Reached {count} warnings", esc_case, discord.Color.orange())
-        except (discord.Forbidden, discord.HTTPException):
-            pass
 
 
 @bot.command(name="warnings")
@@ -4566,8 +4504,6 @@ async def case_cmd(ctx: commands.Context, number: int):
     embed.add_field(name="Target", value=f"<@{case['target_id']}>")
     embed.add_field(name="Moderator", value=f"<@{case['mod_id']}>")
     embed.add_field(name="Reason", value=case["reason"], inline=False)
-    if case.get("created_at"):
-        embed.add_field(name="When", value=f"<t:{int(case['created_at'].timestamp())}:R>", inline=False)
     await ctx.send(embed=embed)
 
 
@@ -4593,10 +4529,6 @@ async def kick_cmd(ctx: commands.Context, member: discord.Member, *, reason: str
     if not await _confirm_destructive_action(ctx, action_emoji="👋", action_title="Kick", member=member, reason=reason):
         return
     try:
-        await member.send(embed=make_embed(f"You were kicked from **{ctx.guild.name}**\n**Reason:** {reason}", title="👋 Kicked", color=discord.Color.orange()))
-    except discord.Forbidden:
-        pass
-    try:
         await member.kick(reason=reason)
     except discord.Forbidden:
         await send_reply(ctx, "can't kick that person — their role might be above mine")
@@ -4616,10 +4548,6 @@ async def ban_cmd(ctx: commands.Context, member: discord.Member, *, reason: str 
         return
     if not await _confirm_destructive_action(ctx, action_emoji="🔨", action_title="Ban", member=member, reason=reason):
         return
-    try:
-        await member.send(embed=make_embed(f"You were banned from **{ctx.guild.name}**\n**Reason:** {reason}", title="🔨 Banned", color=discord.Color.red()))
-    except discord.Forbidden:
-        pass
     try:
         await member.ban(reason=reason)
     except discord.Forbidden:
@@ -4692,12 +4620,6 @@ async def mute_cmd(ctx: commands.Context, member: discord.Member, duration: str 
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "mute", member.id)
     await send_reply(ctx, f"🔇 muted {member.mention} for `{duration}` — {reason}")
     await post_modlog(ctx.guild, f"🔇 Mute ({duration})", ctx.author, member, reason, case_num, discord.Color.dark_orange())
-    try:
-        await member.send(embed=make_embed(
-            f"You were muted in **{ctx.guild.name}** for `{duration}`\n**Reason:** {reason}\n**Expires:** <t:{int(unmute_at.timestamp())}:R>",
-            title="🔇 Muted", color=discord.Color.dark_orange()))
-    except discord.Forbidden:
-        pass
 
 
 @bot.command(name="unmute")
@@ -4917,11 +4839,12 @@ async def quicksetup_cmd(ctx: commands.Context):
     guild = ctx.guild
     msg = await send_reply(ctx, "✨ Setting up **aj's crib**... this'll take a moment.")
 
-    # Find or create the stats category
+    # NOTE: quicksetup used to always create a "📊 Server Stats" category.
+    # It no longer creates any new category/channel structure on its own —
+    # it only manages the two counter channels below. If a matching category
+    # already exists from a previous run it's reused (so nothing breaks for
+    # existing servers), but a brand new one is never created anymore.
     category = discord.utils.find(lambda c: c.name == "📊 Server Stats", guild.categories)
-    category_created = category is None
-    if category is None:
-        category = await guild.create_category("📊 Server Stats", reason="aj's crib quicksetup")
 
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(connect=False, view_channel=True),
@@ -4929,13 +4852,15 @@ async def quicksetup_cmd(ctx: commands.Context):
     }
 
     config = await bot.db.get_config(guild.id)
-    created = ["Category"] if category_created else []
+    created = []
 
     def _find_by_name_prefix(prefix: str):
         """Fallback for when the stored channel ID is missing/stale (e.g. config
         was reset) — looks for a voice channel already named like our tracker,
-        anywhere in the category, by matching everything before the live count."""
-        for chan in category.voice_channels:
+        by matching everything before the live count. Searches the legacy
+        category if one exists, otherwise the whole guild."""
+        pool = category.voice_channels if category else guild.voice_channels
+        for chan in pool:
             if chan.name.startswith(prefix):
                 return chan
         return None
@@ -4982,16 +4907,21 @@ async def quicksetup_cmd(ctx: commands.Context):
     else:
         status_line = "♻️ Both already existed — left them as-is and just refreshed their counts."
 
+    category_line = f"📁 Category: **{category.name}**\n" if category else ""
     embed = discord.Embed(
         title="✅ aj's crib is set up!",
         color=discord.Color.green(),
         description=(
-            f"📁 Category: **{category.name}**\n"
+            f"{category_line}"
             f"👥 Members tracker: {members_chan.mention}\n"
             f"🚀 Boosts tracker: {boosts_chan.mention}\n"
             f"{status_line}\n\n"
             "Both update on their own as people join, leave, or boost. Running this command again "
-            "is always safe — it never makes duplicates, it just leaves what's already there.\n\n"
+            "is always safe — it never makes duplicates, it just leaves what's already there. "
+            "It also never creates any other channels/categories.\n\n"
+            "Want to use channels you already have instead? Setup hub → **Stats Channels** lets you "
+            "point Members/Boosts at any existing channel — once set, this command will never "
+            "touch or recreate them.\n\n"
             "**Want more?** Pick a category below — level roles, automod, anti-nuke, tickets, logs, and more."
         ),
     )
@@ -5008,10 +4938,7 @@ async def lockdown_cmd(ctx: commands.Context, channel: discord.abc.GuildChannel 
     channel = channel or ctx.channel
     locked = await lock_channel(channel, f"manually triggered by {ctx.author}")
     if not locked:
-        if channel.id in _channel_lock_snapshots:
-            await send_reply(ctx, f"{channel.mention} is already locked — use `{PREFIX}unlock` to lift it")
-        else:
-            await send_reply(ctx, f"⛔ I don't have permission to manage {channel.mention} — check my role/permissions.")
+        await send_reply(ctx, f"{channel.mention} is already locked — use `{PREFIX}unlock` to lift it")
         return
     await send_reply(ctx, f"🔒 {channel.mention} locked")
 
@@ -5024,10 +4951,7 @@ async def unlock_cmd(ctx: commands.Context, channel: discord.abc.GuildChannel = 
     channel = channel or ctx.channel
     restored = await unlock_channel(channel)
     if not restored:
-        if channel.id not in _channel_lock_snapshots:
-            await send_reply(ctx, f"{channel.mention} isn't locked")
-        else:
-            await send_reply(ctx, f"⛔ I don't have permission to manage {channel.mention} — check my role/permissions.")
+        await send_reply(ctx, f"{channel.mention} isn't locked")
         return
     await send_reply(ctx, f"🔓 {channel.mention} unlocked")
 
@@ -5152,7 +5076,7 @@ async def analytics_cmd(ctx: commands.Context, subcommand: str = "growth", days:
 
 
 @bot.command(name="setwelcome")
-@staff_tier_check(TIER_SENIOR)
+@commands.has_permissions(administrator=True)
 async def setwelcome_cmd(ctx: commands.Context, *, template: str):
     """Set the join message. Variables: {user} {user.id} {server} {count} {mention}.
     Now sent as an embed with avatar + account age, not plain text."""
@@ -5162,7 +5086,7 @@ async def setwelcome_cmd(ctx: commands.Context, *, template: str):
 
 
 @bot.command(name="setinvitelog")
-@staff_tier_check(TIER_SENIOR)
+@commands.has_permissions(administrator=True)
 async def setinvitelog_cmd(ctx: commands.Context, *, template: str):
     """Set the invite-tracker join message, posted whenever someone joins via
     a tracked invite. Variables: {user} {user.id} {server} {count} {mention}
@@ -5175,7 +5099,7 @@ async def setinvitelog_cmd(ctx: commands.Context, *, template: str):
 
 
 @bot.command(name="testinvitelog")
-@staff_tier_check(TIER_SENIOR)
+@commands.has_permissions(administrator=True)
 async def testinvitelog_cmd(ctx: commands.Context):
     config = await bot.db.get_config(ctx.guild.id)
     tpl = config.get("invite_template")
@@ -5190,7 +5114,7 @@ async def testinvitelog_cmd(ctx: commands.Context):
 
 
 @bot.command(name="testwelcome")
-@staff_tier_check(TIER_SENIOR)
+@commands.has_permissions(administrator=True)
 async def testwelcome_cmd(ctx: commands.Context):
     config = await bot.db.get_config(ctx.guild.id)
     tpl = config.get("welcome_template")
@@ -5216,27 +5140,32 @@ def _render_template(template: str, member: discord.Member, guild: discord.Guild
 
 def _build_welcome_leave_embed(template: str, member: discord.Member, guild: discord.Guild,
                                 *, kind: str) -> discord.Embed:
-    """Builds the embed version of a welcome/leave message — avatar thumbnail,
-    account age, and join position alongside the rendered template text.
-    kind is "welcome" or "leave" and only changes color/title/footer framing;
-    the template variables ({user} {user.id} {server} {count} {mention})
-    still work exactly as before."""
+    """Builds the embed version of a welcome/leave message. kind is "welcome"
+    or "leave". PRESET, branded look — no setup beyond picking a channel:
+    title, guidelines link, hype line, guild-icon thumbnail, and branded
+    footer are all fixed; only the template's own line is customizable via
+    `.setwelcome` if anyone ever wants to (not required)."""
     description = _render_template(template, member, guild)
-    account_age_days = (datetime.now(timezone.utc) - member.created_at).days
 
     if kind == "welcome":
-        embed = discord.Embed(title=f"👋 Welcome to {guild.name}!", description=description,
-                               color=discord.Color.green())
-        embed.add_field(name="Member #", value=str(guild.member_count), inline=True)
+        embed = discord.Embed(
+            title=f"🎉 Welcome to {guild.name}!",
+            description=(
+                f"{description}\n\n"
+                f"Make sure to check out <#{GUIDELINES_CHANNEL_ID}> and have a great time!\n\n"
+                f"You're member #{guild.member_count} — let's go! 🚀"
+            ),
+            color=discord.Color.fuchsia(),
+        )
     else:
-        embed = discord.Embed(title=f"👋 Goodbye from {guild.name}", description=description,
-                               color=discord.Color.red())
+        embed = discord.Embed(
+            title=f"👋 Goodbye from {guild.name}",
+            description=description,
+            color=discord.Color.dark_grey(),
+        )
 
-    embed.add_field(name="Account Age", value=f"{account_age_days} day(s) old", inline=True)
-    if account_age_days < 7:
-        embed.add_field(name="⚠️", value="New account", inline=True)
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(text=f"{member} • {member.id}")
+    embed.set_thumbnail(url=guild.icon.url if guild.icon else member.display_avatar.url)
+    embed.set_footer(text=f"Member #{guild.member_count} • {BOT_BRAND}")
     embed.timestamp = datetime.now(timezone.utc)
     return embed
 
@@ -5244,20 +5173,19 @@ def _build_welcome_leave_embed(template: str, member: discord.Member, guild: dis
 def _build_invite_embed(template: str, member: discord.Member, guild: discord.Guild,
                          inviter: Optional[discord.abc.User], invite_total: Optional[int]) -> discord.Embed:
     """Builds the invite-tracker embed shown when a member joins via a tracked
-    invite. Supports the same {user} {user.id} {server} {count} {mention}
-    variables as welcome/leave, plus {inviter} and {invites} (the inviter's
-    new running total)."""
+    invite. Same preset branded look as the welcome embed — pick a channel,
+    nothing else to configure. Supports {user} {user.id} {server} {count}
+    {mention} {inviter} {invites}."""
     description = (
         _render_template(template, member, guild)
         .replace("{inviter}", inviter.mention if inviter else "an unknown/vanity invite")
         .replace("{invites}", str(invite_total) if invite_total is not None else "?")
     )
-    embed = discord.Embed(title="🌺 New Invite", description=description, color=discord.Color.blurple())
+    embed = discord.Embed(title="📨 New Invite!", description=description, color=discord.Color.fuchsia())
     embed.add_field(name="Invited By", value=inviter.mention if inviter else "Unknown / vanity URL", inline=True)
     embed.add_field(name="Total Invites", value=str(invite_total) if invite_total is not None else "—", inline=True)
-    embed.add_field(name="Member #", value=str(guild.member_count), inline=True)
-    embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(text=f"{member} • {member.id}")
+    embed.set_thumbnail(url=guild.icon.url if guild.icon else member.display_avatar.url)
+    embed.set_footer(text=f"Member #{guild.member_count} • {BOT_BRAND}")
     embed.timestamp = datetime.now(timezone.utc)
     return embed
 
@@ -5282,7 +5210,7 @@ def _coerce_config_value(value: str):
 
 
 @bot.command(name="config")
-@staff_tier_check(TIER_SENIOR)
+@commands.has_permissions(administrator=True)
 async def config_cmd(ctx: commands.Context, key: str = None, value: str = None):
     if key is None:
         config = await bot.db.get_config(ctx.guild.id)
@@ -5290,7 +5218,10 @@ async def config_cmd(ctx: commands.Context, key: str = None, value: str = None):
             await send_reply(ctx, "No config set for this server yet.")
             return
         lines = [f"**{k}**: {v}" for k, v in config.items() if k not in ("_id", "guild_id")]
-        await ctx.send(embed=discord.Embed(title="Server Config", description="\n".join(lines) or "Empty"))
+        text = "\n".join(lines) or "Empty"
+        if len(text) > 4000:
+            text = text[:4000] + "\n… *(truncated — too many keys to show at once)*"
+        await ctx.send(embed=discord.Embed(title="Server Config", description=text))
         return
     if value is None:
         config = await bot.db.get_config(ctx.guild.id)
@@ -5813,146 +5744,44 @@ async def _resolve_giveaway(doc: dict):
 # ─── wire reaction-based giveaway entry ──────────────────────────────────────
 
 @bot.event
-async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    if payload.user_id == bot.user.id:
+async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
+    if user.bot:
         return
-    await _handle_starboard_reaction(payload)
-    await _handle_giveaway_reaction_add(payload)
-
-
-async def _handle_giveaway_reaction_add(payload: discord.RawReactionActionEvent):
-    if str(payload.emoji) != GIVEAWAY_EMOJI:
+    if str(reaction.emoji) != GIVEAWAY_EMOJI:
         return
-    doc = await bot.db.get_giveaway(payload.message_id)
+    doc = await bot.db.get_giveaway(reaction.message.id)
     if not doc or doc.get("ended"):
         return
 
-    guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
-    if not guild:
-        return
-    member = payload.member or guild.get_member(payload.user_id)
-    if not member or member.bot:
-        return
-
-    config = await get_config(guild.id, bot.db)
-    if _is_giveaway_blacklisted(member, config):
-        channel = guild.get_channel(payload.channel_id)
-        if channel:
+    guild = reaction.message.guild
+    member = guild.get_member(user.id) if guild else None
+    if member and guild:
+        config = await get_config(guild.id, bot.db)
+        if _is_giveaway_blacklisted(member, config):
             try:
-                message = await channel.fetch_message(payload.message_id)
-                await message.remove_reaction(payload.emoji, member)
+                await reaction.message.remove_reaction(reaction.emoji, user)
             except discord.HTTPException:
                 pass
-        try:
-            await member.send(embed=make_embed(f"You're blacklisted from giveaways in **{guild.name}** and can't enter.",
-                                                 title="⛔ Blacklisted", color=discord.Color.red()))
-        except discord.Forbidden:
-            pass
-        return
+            try:
+                await user.send(embed=make_embed(f"You're blacklisted from giveaways in **{guild.name}** and can't enter.",
+                                                   title="⛔ Blacklisted", color=discord.Color.red()))
+            except discord.Forbidden:
+                pass
+            return
 
-    await bot.db.add_entrant(payload.message_id, payload.user_id)
+    await bot.db.add_entrant(reaction.message.id, user.id)
 
 
 @bot.event
-async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
-    if payload.user_id == bot.user.id:
+async def on_reaction_remove(reaction: discord.Reaction, user: discord.User):
+    if user.bot:
         return
-    if str(payload.emoji) != GIVEAWAY_EMOJI:
+    if str(reaction.emoji) != GIVEAWAY_EMOJI:
         return
-    doc = await bot.db.get_giveaway(payload.message_id)
+    doc = await bot.db.get_giveaway(reaction.message.id)
     if not doc or doc.get("ended"):
         return
-    await bot.db.remove_entrant(payload.message_id, payload.user_id)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  STARBOARD — ⭐ reactions promote messages to a configured channel
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-# Configure via: .config starboard_channel <channel_id>
-#                .config starboard_threshold <number>   (default 3)
-# Messages in the starboard channel itself are never re-starred.
-
-STARBOARD_EMOJI = "⭐"
-STARBOARD_DEFAULT_THRESHOLD = 3
-
-
-async def _handle_starboard_reaction(payload: discord.RawReactionActionEvent):
-    if str(payload.emoji) != STARBOARD_EMOJI:
-        return
-    guild = bot.get_guild(payload.guild_id)
-    if not guild:
-        return
-    config = await get_config(guild.id, bot.db)
-    starboard_chan_id = config.get("starboard_channel")
-    if not starboard_chan_id:
-        return
-    threshold = int(config.get("starboard_threshold", STARBOARD_DEFAULT_THRESHOLD))
-
-    channel = guild.get_channel(payload.channel_id)
-    if not channel or channel.id == starboard_chan_id:
-        return  # never re-star things in the starboard channel itself
-
-    try:
-        message = await channel.fetch_message(payload.message_id)
-    except discord.HTTPException:
-        return
-
-    # count current ⭐ reactions on the message (excluding bots)
-    star_count = 0
-    for rxn in message.reactions:
-        if str(rxn.emoji) == STARBOARD_EMOJI:
-            star_count = rxn.count
-            break
-
-    if star_count < threshold:
-        return
-
-    # check if already posted (in-memory first, then DB fallback)
-    already_posted = payload.message_id in bot._starboard_posted.get(guild.id, set())
-    if not already_posted:
-        try:
-            existing = await bot.db.db["starboard_posted"].find_one(
-                {"guild_id": guild.id, "message_id": payload.message_id}
-            )
-            already_posted = existing is not None
-        except Exception:
-            pass
-
-    if already_posted:
-        return
-
-    # post to starboard
-    starboard_chan = guild.get_channel(starboard_chan_id)
-    if not starboard_chan:
-        return
-
-    embed = discord.Embed(
-        description=message.content or "*[no text content]*",
-        color=discord.Color.gold(),
-        timestamp=message.created_at,
-    )
-    embed.set_author(name=str(message.author), icon_url=message.author.display_avatar.url)
-    embed.add_field(name="Source", value=f"[Jump to message]({message.jump_url})", inline=True)
-    embed.add_field(name="Channel", value=channel.mention, inline=True)
-    if message.attachments:
-        embed.set_image(url=message.attachments[0].url)
-    embed.set_footer(text=f"{STARBOARD_EMOJI} {star_count} • #{channel.name}")
-
-    try:
-        await starboard_chan.send(embed=embed)
-    except discord.HTTPException:
-        return
-
-    # mark as posted so we never double-post
-    bot._starboard_posted.setdefault(guild.id, set()).add(payload.message_id)
-    try:
-        await bot.db.db["starboard_posted"].insert_one(
-            {"guild_id": guild.id, "message_id": payload.message_id,
-             "posted_at": datetime.now(timezone.utc)}
-        )
-    except Exception:
-        pass
+    await bot.db.remove_entrant(reaction.message.id, user.id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
