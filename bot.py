@@ -1452,6 +1452,21 @@ async def _persist_automod_event(guild_id: int, user_id: int, reason: str):
         logger.debug("automod_events persist failed (non-critical): %s", exc)
 
 
+async def _purge_user_messages(channel: discord.TextChannel, user: discord.abc.User, limit: int = 15):
+    """Bulk-delete the last `limit` messages from `user` in `channel`.
+    Scans up to 200 recent messages to find them (Discord bulk-delete only
+    works on messages ≤14 days old — anything older is silently skipped).
+    Failures are non-fatal and logged at debug level."""
+    try:
+        def is_target(m: discord.Message) -> bool:
+            return m.author.id == user.id
+
+        to_delete = await channel.purge(limit=limit, check=is_target, bulk=True)
+        logger.debug("_purge_user_messages: deleted %d message(s) from %s in #%s", len(to_delete), user, channel)
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        logger.debug("_purge_user_messages failed: %s", exc)
+
+
 async def handle_automod_violation(message: discord.Message, config: dict, reason: str):
     """Deletes the offending message, issues a real warn (source=automod), and
     escalates to a mute (never a kick/ban) once active automod-warns in the last
@@ -1468,6 +1483,11 @@ async def handle_automod_violation(message: discord.Message, config: dict, reaso
         await message.delete()
     except discord.HTTPException:
         pass
+
+    # Purge the last 15 messages from this user in the channel where they tripped
+    # automod — the offending message is already gone, so this cleans up their
+    # recent history regardless of which path (staff-abuse or normal) we take.
+    await _purge_user_messages(message.channel, message.author)
 
     member = message.author
     tier = await get_staff_tier(member, config)
@@ -4660,6 +4680,7 @@ async def warn_cmd(ctx: commands.Context, member: discord.Member, *, reason: str
     count = await bot.db.add_warn(ctx.guild.id, member.id, ctx.author.id, reason, source="manual")
     case_num = await bot.db.add_case(ctx.guild.id, "warn", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "warn", member.id)
+    await _purge_user_messages(ctx.channel, member)
     await send_reply(ctx, f"⚠️ warned {member.mention} (warn #{count}, case #{case_num}) — {reason}")
     await post_modlog(ctx.guild, "⚠️ Warn", ctx.author, member, reason, case_num, discord.Color.yellow())
     try:
@@ -4852,6 +4873,7 @@ async def mute_cmd(ctx: commands.Context, member: discord.Member, duration: str 
     except discord.Forbidden:
         await send_reply(ctx, "i don't have permission to timeout that person")
         return
+    await _purge_user_messages(ctx.channel, member)
     await bot.db.add_tempmute(ctx.guild.id, member.id, ctx.author.id, reason, unmute_at)
     case_num = await bot.db.add_case(ctx.guild.id, "mute", ctx.author.id, member.id, reason)
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "mute", member.id)
