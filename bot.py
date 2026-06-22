@@ -1759,7 +1759,8 @@ async def lock_channel(channel: discord.abc.GuildChannel, reason: str) -> bool:
     try:
         await channel.set_permissions(default_role, overwrite=new_overwrite, reason=f"🔒 Locked: {reason}")
     except discord.Forbidden:
-        pass
+        _channel_lock_snapshots.pop(channel.id, None)
+        return False
     return True
 
 
@@ -1776,7 +1777,8 @@ async def unlock_channel(channel: discord.abc.GuildChannel) -> bool:
         for target in current_targets - set(snapshot.keys()):
             await channel.set_permissions(target, overwrite=None, reason="🔓 Lock lifted — restored exactly")
     except discord.Forbidden:
-        pass
+        _channel_lock_snapshots[channel.id] = snapshot  # restore so unlock can be retried
+        return False
     return True
 
 
@@ -4146,15 +4148,21 @@ async def rank_cmd(ctx: commands.Context, member: discord.Member = None):
     if not data:
         await send_reply(ctx, f"{member.mention} hasn't earned any XP yet.")
         return
-    level, xp_in, xp_need = calculate_level(data.get("total_xp", 0))
+    total_xp = data.get("total_xp", 0)
+    level, xp_in, xp_need = calculate_level(total_xp)
     bar = progress_bar(xp_in, xp_need)
     voice_minutes = data.get("voice_minutes", 0)
+    # Get leaderboard position
+    rows = await bot.db.get_leaderboard(ctx.guild.id, limit=1000)
+    rank_pos = next((i + 1 for i, r in enumerate(rows) if r["user_id"] == member.id), None)
     embed = discord.Embed(title=f"{member.display_name}'s Rank", color=discord.Color.gold())
     embed.add_field(name="Level", value=str(level), inline=True)
+    embed.add_field(name="Total XP", value=f"{total_xp:,}", inline=True)
+    embed.add_field(name="Rank", value=f"#{rank_pos}" if rank_pos else "—", inline=True)
     embed.add_field(name="Messages", value=str(data.get("messages", 0)), inline=True)
     embed.add_field(name="Streak", value=f"{data.get('streak', 0)} days", inline=True)
     embed.add_field(name="Voice Time", value=f"{voice_minutes // 60}h {voice_minutes % 60}m", inline=True)
-    embed.add_field(name="Progress", value=f"`{bar}` {xp_in}/{xp_need} XP", inline=False)
+    embed.add_field(name="Progress", value=f"`{bar}` {xp_in:,}/{xp_need:,} XP", inline=False)
     embed.set_thumbnail(url=member.display_avatar.url)
     await ctx.send(embed=embed)
 
@@ -4457,10 +4465,33 @@ async def warn_cmd(ctx: commands.Context, member: discord.Member, *, reason: str
     await send_reply(ctx, f"⚠️ warned {member.mention} (warn #{count}, case #{case_num}) — {reason}")
     await post_modlog(ctx.guild, "⚠️ Warn", ctx.author, member, reason, case_num, discord.Color.yellow())
     try:
-        await member.send(embed=make_embed(f"You got warned in **{ctx.guild.name}** — {reason}",
-                                            title="⚠️ Warning", color=discord.Color.gold()))
+        await member.send(embed=make_embed(
+            f"You were warned in **{ctx.guild.name}**\n**Reason:** {reason}\n**Total warnings:** {count}",
+            title="⚠️ Warning", color=discord.Color.gold()))
     except discord.Forbidden:
         pass
+    # Auto-escalation: 3 warns → 1h mute, 5 warns → kick
+    if count == 3:
+        try:
+            delta = timedelta(hours=1)
+            await member.timeout(delta, reason=f"Auto-escalation: {count} warnings")
+            esc_case = await bot.db.add_case(ctx.guild.id, "mute", ctx.author.id, member.id, f"Auto: {count} warnings")
+            await send_reply(ctx, f"🔇 auto-muted {member.mention} for 1h (3 warnings reached)")
+            await post_modlog(ctx.guild, "🔇 Auto-Mute (3 warns)", ctx.author, member, f"Reached {count} warnings", esc_case, discord.Color.dark_orange())
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+    elif count == 5:
+        try:
+            await member.send(embed=make_embed(f"You were kicked from **{ctx.guild.name}** for reaching 5 warnings.", title="👋 Kicked", color=discord.Color.orange()))
+        except discord.Forbidden:
+            pass
+        try:
+            await member.kick(reason=f"Auto-escalation: {count} warnings")
+            esc_case = await bot.db.add_case(ctx.guild.id, "kick", ctx.author.id, member.id, f"Auto: {count} warnings")
+            await send_reply(ctx, f"👋 auto-kicked {member.mention} (5 warnings reached)")
+            await post_modlog(ctx.guild, "👋 Auto-Kick (5 warns)", ctx.author, member, f"Reached {count} warnings", esc_case, discord.Color.orange())
+        except (discord.Forbidden, discord.HTTPException):
+            pass
 
 
 @bot.command(name="warnings")
@@ -4535,6 +4566,8 @@ async def case_cmd(ctx: commands.Context, number: int):
     embed.add_field(name="Target", value=f"<@{case['target_id']}>")
     embed.add_field(name="Moderator", value=f"<@{case['mod_id']}>")
     embed.add_field(name="Reason", value=case["reason"], inline=False)
+    if case.get("created_at"):
+        embed.add_field(name="When", value=f"<t:{int(case['created_at'].timestamp())}:R>", inline=False)
     await ctx.send(embed=embed)
 
 
@@ -4560,6 +4593,10 @@ async def kick_cmd(ctx: commands.Context, member: discord.Member, *, reason: str
     if not await _confirm_destructive_action(ctx, action_emoji="👋", action_title="Kick", member=member, reason=reason):
         return
     try:
+        await member.send(embed=make_embed(f"You were kicked from **{ctx.guild.name}**\n**Reason:** {reason}", title="👋 Kicked", color=discord.Color.orange()))
+    except discord.Forbidden:
+        pass
+    try:
         await member.kick(reason=reason)
     except discord.Forbidden:
         await send_reply(ctx, "can't kick that person — their role might be above mine")
@@ -4579,6 +4616,10 @@ async def ban_cmd(ctx: commands.Context, member: discord.Member, *, reason: str 
         return
     if not await _confirm_destructive_action(ctx, action_emoji="🔨", action_title="Ban", member=member, reason=reason):
         return
+    try:
+        await member.send(embed=make_embed(f"You were banned from **{ctx.guild.name}**\n**Reason:** {reason}", title="🔨 Banned", color=discord.Color.red()))
+    except discord.Forbidden:
+        pass
     try:
         await member.ban(reason=reason)
     except discord.Forbidden:
@@ -4651,6 +4692,12 @@ async def mute_cmd(ctx: commands.Context, member: discord.Member, duration: str 
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "mute", member.id)
     await send_reply(ctx, f"🔇 muted {member.mention} for `{duration}` — {reason}")
     await post_modlog(ctx.guild, f"🔇 Mute ({duration})", ctx.author, member, reason, case_num, discord.Color.dark_orange())
+    try:
+        await member.send(embed=make_embed(
+            f"You were muted in **{ctx.guild.name}** for `{duration}`\n**Reason:** {reason}\n**Expires:** <t:{int(unmute_at.timestamp())}:R>",
+            title="🔇 Muted", color=discord.Color.dark_orange()))
+    except discord.Forbidden:
+        pass
 
 
 @bot.command(name="unmute")
@@ -4961,7 +5008,10 @@ async def lockdown_cmd(ctx: commands.Context, channel: discord.abc.GuildChannel 
     channel = channel or ctx.channel
     locked = await lock_channel(channel, f"manually triggered by {ctx.author}")
     if not locked:
-        await send_reply(ctx, f"{channel.mention} is already locked — use `{PREFIX}unlock` to lift it")
+        if channel.id in _channel_lock_snapshots:
+            await send_reply(ctx, f"{channel.mention} is already locked — use `{PREFIX}unlock` to lift it")
+        else:
+            await send_reply(ctx, f"⛔ I don't have permission to manage {channel.mention} — check my role/permissions.")
         return
     await send_reply(ctx, f"🔒 {channel.mention} locked")
 
@@ -4974,7 +5024,10 @@ async def unlock_cmd(ctx: commands.Context, channel: discord.abc.GuildChannel = 
     channel = channel or ctx.channel
     restored = await unlock_channel(channel)
     if not restored:
-        await send_reply(ctx, f"{channel.mention} isn't locked")
+        if channel.id not in _channel_lock_snapshots:
+            await send_reply(ctx, f"{channel.mention} isn't locked")
+        else:
+            await send_reply(ctx, f"⛔ I don't have permission to manage {channel.mention} — check my role/permissions.")
         return
     await send_reply(ctx, f"🔓 {channel.mention} unlocked")
 
