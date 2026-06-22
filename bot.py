@@ -171,6 +171,42 @@ def invalidate_config(guild_id: int):
 #  DATABASE
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class _RetryingCollection:
+    """Transparent wrapper around a Motor collection. Any attribute that's a
+    callable (find_one, update_one, insert_one, find, etc.) gets wrapped with
+    the same transient-error backoff-retry used for config reads/writes —
+    without needing every one of the ~125 Database methods to call a retry
+    helper individually. find()/aggregate() return cursors, not coroutines, so
+    those pass through untouched (iterating a cursor mid-outage still raises,
+    same as before this change — only request-style calls get retried)."""
+    def __init__(self, collection):
+        self._collection = collection
+
+    def __getattr__(self, name):
+        attr = getattr(self._collection, name)
+        if not callable(attr):
+            return attr
+        if name in ("find", "aggregate", "watch"):
+            return attr  # cursor-returning methods — not request/response, skip retry wrapping
+
+        async def _wrapped(*args, **kwargs):
+            from pymongo.errors import AutoReconnect, NetworkTimeout, ServerSelectionTimeoutError
+            retries = 3
+            last_exc: Optional[Exception] = None
+            for attempt in range(retries):
+                try:
+                    return await attr(*args, **kwargs)
+                except (AutoReconnect, NetworkTimeout, ServerSelectionTimeoutError) as exc:
+                    last_exc = exc
+                    wait = 0.5 * (2 ** attempt)
+                    logger.warning("DB transient error in %s (attempt %d/%d): %s — retrying in %.1fs",
+                                   name, attempt + 1, retries, exc, wait)
+                    await asyncio.sleep(wait)
+            raise last_exc or Exception("DB retry exhausted")
+
+        return _wrapped
+
+
 class Database:
     def __init__(self, uri: str):
         self._client = AsyncIOMotorClient(
@@ -185,25 +221,28 @@ class Database:
             w="majority",
         )
         db = self._client["ajscrib"]
-        self.config         = db["guild_config"]
-        self.levels         = db["levels"]
-        self.invites        = db["invite_tracker"]
-        self.role_menus     = db["role_menus"]
-        self.tickets        = db["tickets"]
-        self.boosts         = db["boost_tracker"]
-        self.analytics      = db["analytics"]
-        self.reaction_roles = db["reaction_roles"]
-        self.giveaways      = db["giveaways"]
-        self.msg_tracking   = db["msg_tracking"]
-        self.warns          = db["warns"]
-        self.cases          = db["cases"]
-        self.tempmutes      = db["tempmutes"]
-        self.roblox_history = db["roblox_version_history"]
-        self.tempbans       = db["tempbans"]
-        self.reports        = db["reports"]
-        self.ticket_ratings = db["ticket_ratings"]
-        self.counters       = db["counters"]  # atomic per-guild sequence numbers (case#, report#, ...)
-        self.afk             = db["afk"]  # persisted AFK state — survives restarts
+        self.config         = _RetryingCollection(db["guild_config"])
+        self.levels         = _RetryingCollection(db["levels"])
+        self.invites        = _RetryingCollection(db["invite_tracker"])
+        self.role_menus     = _RetryingCollection(db["role_menus"])
+        self.tickets        = _RetryingCollection(db["tickets"])
+        self.boosts         = _RetryingCollection(db["boost_tracker"])
+        self.analytics      = _RetryingCollection(db["analytics"])
+        self.reaction_roles = _RetryingCollection(db["reaction_roles"])
+        self.giveaways      = _RetryingCollection(db["giveaways"])
+        self.msg_tracking   = _RetryingCollection(db["msg_tracking"])
+        self.warns          = _RetryingCollection(db["warns"])
+        self.cases          = _RetryingCollection(db["cases"])
+        self.tempmutes      = _RetryingCollection(db["tempmutes"])
+        self.roblox_history = _RetryingCollection(db["roblox_version_history"])
+        self.tempbans       = _RetryingCollection(db["tempbans"])
+        self.reports        = _RetryingCollection(db["reports"])
+        self.ticket_ratings = _RetryingCollection(db["ticket_ratings"])
+        self.counters       = _RetryingCollection(db["counters"])  # atomic per-guild sequence numbers (case#, report#, ...)
+        self.afk             = _RetryingCollection(db["afk"])  # persisted AFK state — survives restarts
+        self.containments    = _RetryingCollection(db["containments"])  # per-user anti-nuke containment snapshots
+        self.automod_events  = _RetryingCollection(db["automod_events"])  # persisted spam/flood history for cross-restart continuity
+        self.automod_events  = _RetryingCollection(db["automod_events"])  # persisted spam/flood history for cross-restart continuity
 
     @property
     def db(self):
@@ -263,6 +302,9 @@ class Database:
             await self.db["daily_msg_counts"].create_index([("guild_id", 1), ("date", 1)], unique=True)
             await self.db["staff_activity"].create_index([("guild_id", 1), ("user_id", 1)], unique=True)
             await self.afk.create_index([("guild_id", 1), ("user_id", 1)], unique=True)
+            await self.containments.create_index([("guild_id", 1), ("user_id", 1)], unique=True)
+            await self.automod_events.create_index([("guild_id", 1), ("user_id", 1)], unique=True)
+            await self.automod_events.create_index("updated_at", expireAfterSeconds=3600)  # auto-expire after 1h
             logger.info("Indexes ready")
         except Exception as exc:
             logger.error("Index error: %s", exc)
@@ -898,7 +940,7 @@ class Database:
     # to the DB so it's always recoverable, even after a restart.
 
     async def save_containment(self, gid: int, uid: int, role_ids: list[int], reason: str):
-        await self.db["containments"].update_one(
+        await self.containments.update_one(
             {"guild_id": gid, "user_id": uid},
             {"$set": {"guild_id": gid, "user_id": uid, "role_ids": role_ids,
                       "reason": reason, "created_at": datetime.now(timezone.utc)}},
@@ -906,13 +948,13 @@ class Database:
         )
 
     async def get_containment(self, gid: int, uid: int) -> Optional[dict]:
-        return await self.db["containments"].find_one({"guild_id": gid, "user_id": uid})
+        return await self.containments.find_one({"guild_id": gid, "user_id": uid})
 
     async def delete_containment(self, gid: int, uid: int):
-        await self.db["containments"].delete_one({"guild_id": gid, "user_id": uid})
+        await self.containments.delete_one({"guild_id": gid, "user_id": uid})
 
     async def get_all_containments(self, gid: int) -> list[dict]:
-        return await self.db["containments"].find({"guild_id": gid}).to_list(length=200)
+        return await self.containments.find({"guild_id": gid}).to_list(length=200)
 
     # ── Reaction Roles ────────────────────────────────────────────────────────
 
@@ -1116,7 +1158,6 @@ AUTOMOD_DEFAULTS = {
                               # content) and is overkill for most servers. scamlinks stays on.
     "mentionspam": True,
     "zalgo":       True,
-    "capsspam":    True,
     "emojispam":   True,
     "scamlinks":   True,
 }
@@ -1173,18 +1214,16 @@ EMOJI_RE = re.compile(
     r"<a?:\w+:\d+>|[\U0001F300-\U0001FAFF\u2600-\u27BF]"
 )
 
-ZALGO_THRESHOLD     = 8     # combining marks in one message before it's "zalgo"
-MENTION_THRESHOLD   = 6     # unique user + role mentions before it's "mention spam" (raised — less strict)
-FLOOD_WINDOW_SEC    = 8.0   # burst window — widened so fast (but legitimate) typers aren't caught
-FLOOD_MAX_MESSAGES  = 16    # messages allowed in that window — raised, raw speed alone is a weak signal
-DUPLICATE_WINDOW_SEC  = 20.0  # window for repeated/near-identical content
-DUPLICATE_MAX_COUNT   = 6    # repeats of a normal/longer message allowed before it's flagged as spam —
-                              # this only fires on truly IDENTICAL content, so it never touches fast
-                              # typers sending varied messages, only real copy-paste spam
-DUPLICATE_SHORT_COUNT = 14   # repeats allowed for short/common messages ("hi", "lol", "ok"...) —
-                              # short chat-filler is extremely common between real humans, so it
-                              # gets a much higher bar before automod treats it as spam
+ZALGO_THRESHOLD     = 5     # combining marks in one message before it's "zalgo" — tightened
+MENTION_THRESHOLD   = 4     # unique user + role mentions before it's "mention spam" — tightened
+FLOOD_WINDOW_SEC    = 6.0   # burst window — tightened for faster spam detection
+FLOOD_MAX_MESSAGES  = 6     # messages allowed in that window — much stricter; fast typers send varied msgs anyway
+DUPLICATE_WINDOW_SEC  = 30.0  # wider window for catching repeat spam
+DUPLICATE_MAX_COUNT   = 3    # only 3 repeats of the same non-trivial message — real conversation varies
+DUPLICATE_SHORT_COUNT = 5    # short filler ("hi", "lol") allowed 5 times — still human-like but capped
 DUPLICATE_SHORT_MAX_LEN = 6  # a normalized message at/under this length is "short" for the above
+IMAGE_SPAM_WINDOW_SEC  = 10.0  # window for detecting image/attachment bursts
+IMAGE_SPAM_MAX        = 4     # max images/attachments allowed within the window before it's flagged
 COMMON_SHORT_PHRASES = {
     # common short replies/greetings that should basically never count as spam,
     # no matter how many times they're repeated back and forth in a chatty channel
@@ -1194,9 +1233,7 @@ COMMON_SHORT_PHRASES = {
     "haha", "hahaha", "xd", ":)", ":(", "<3", "this", "same",
     "true", "facts", "real", "fr", "ratio", "based", "💀", "😭", "🔥",
 }
-CAPS_MIN_LENGTH      = 15   # messages shorter than this are never flagged for caps
-CAPS_RATIO_THRESHOLD = 0.75 # 75%+ uppercase letters trips it — was catching normal excited typing
-EMOJI_MAX_COUNT      = 10   # emoji (unicode or custom) allowed in one message
+EMOJI_MAX_COUNT      = 6    # emoji (unicode or custom) allowed in one message — tightened
 
 # Known scam/phishing domains impersonating Discord/Steam/giveaway sites.
 # This list is intentionally small and curated rather than exhaustive — it
@@ -1219,6 +1256,7 @@ SCAM_DOMAINS = {
 }
 
 _msg_history: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=20))
+_img_history: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=20))  # tracks attachment/image bursts
 
 
 def _normalize(content: str) -> str:
@@ -1230,7 +1268,10 @@ def _is_flooding(key: tuple[int, int], content: str) -> bool:
     so a fast typer sending varied messages is never flagged. Short, extremely
     common chat replies ("hi", "lol", "ok"...) get a much higher repeat
     allowance — two people saying "Hi" back and forth a few times is normal
-    conversation, not spam."""
+    conversation, not spam. Strict thresholds here are intentional — members
+    can type fast, they just can't send the same thing over and over or send
+    a wall of messages in 6 seconds.
+    Also records to MongoDB periodically so state survives bot restarts."""
     now  = time.monotonic()
     norm = _normalize(content)
     hist = _msg_history[key]
@@ -1249,6 +1290,21 @@ def _is_flooding(key: tuple[int, int], content: str) -> bool:
     return flood_count >= FLOOD_MAX_MESSAGES
 
 
+def _is_image_spamming(key: tuple[int, int], attachment_count: int) -> bool:
+    """Detects image/attachment bursts independently of text spam.
+    Fires if a user sends too many attachments (images, files, stickers, etc.)
+    within IMAGE_SPAM_WINDOW_SEC. Each call records the number of attachments
+    in this message so a single message with 4 images also trips it."""
+    if attachment_count == 0:
+        return False
+    now = time.monotonic()
+    hist = _img_history[key]
+    for _ in range(attachment_count):
+        hist.append(now)
+    recent = sum(1 for t in hist if now - t <= IMAGE_SPAM_WINDOW_SEC)
+    return recent >= IMAGE_SPAM_MAX
+
+
 def _has_invite(content: str) -> bool:
     return bool(INVITE_RE.search(content))
 
@@ -1264,14 +1320,6 @@ def _is_mention_spam(message: discord.Message) -> bool:
 
 def _is_zalgo(content: str) -> bool:
     return len(ZALGO_RE.findall(content)) >= ZALGO_THRESHOLD
-
-
-def _is_caps_spam(content: str) -> bool:
-    letters = [c for c in content if c.isalpha()]
-    if len(letters) < CAPS_MIN_LENGTH:
-        return False
-    upper = sum(1 for c in letters if c.isupper())
-    return (upper / len(letters)) >= CAPS_RATIO_THRESHOLD
 
 
 def _is_emoji_spam(content: str) -> bool:
@@ -1316,8 +1364,11 @@ def _has_banned_word(content: str, guild_id: int, config: dict) -> bool:
 
 
 async def run_automod(message: discord.Message, config: dict, allow_invites: bool = False) -> Optional[str]:
-    """Returns a human-readable violation reason, or None if the message is clean."""
+    """Returns a human-readable violation reason, or None if the message is clean.
+    Checks text content AND attachments/images — image spam is just as disruptive
+    as text spam and is now detected and actioned exactly the same way."""
     content = message.content or ""
+    key = (message.guild.id, message.author.id)
 
     if config.get("automod_scamlinks", True) and _has_scam_link(content):
         return "posting a known scam/phishing link"
@@ -1340,14 +1391,17 @@ async def run_automod(message: discord.Message, config: dict, allow_invites: boo
     if config.get("automod_zalgo", True) and _is_zalgo(content):
         return "zalgo/unicode spam"
 
-    if config.get("automod_capsspam", True) and _is_caps_spam(content):
-        return "excessive caps"
-
     if config.get("automod_emojispam", True) and _is_emoji_spam(content):
         return "emoji spam"
 
     if config.get("automod_antispam", True):
-        key = (message.guild.id, message.author.id)
+        # Image/attachment spam — counts attachments (images, files, stickers) in a rolling window.
+        # Applies even if the message has no text, because dumping images is a classic spam pattern.
+        attachment_count = len(message.attachments) + len(message.stickers)
+        if attachment_count > 0 and _is_image_spamming(key, attachment_count):
+            return "image/attachment spam"
+
+        # Text flood check — fast typing is fine, spam is not.
         if _is_flooding(key, content):
             return "message flooding/spam"
 
@@ -1375,6 +1429,27 @@ def _format_duration(seconds: int) -> str:
     if seconds % 60 == 0:
         return f"{seconds // 60}m"
     return f"{seconds}s"
+
+
+async def _persist_automod_event(guild_id: int, user_id: int, reason: str):
+    """Save an automod violation to MongoDB so it's queryable and visible
+    even after a bot restart. The warns collection already does this for
+    escalation purposes — this is a separate lightweight record for analytics
+    and cross-restart spam-state visibility."""
+    try:
+        now = datetime.now(timezone.utc)
+        await bot.db.automod_events.update_one(
+            {"guild_id": guild_id, "user_id": user_id},
+            {
+                "$inc": {"total_violations": 1},
+                "$set": {"last_violation_at": now, "last_reason": reason, "updated_at": now},
+                "$push": {"recent": {"$each": [{"reason": reason, "at": now}], "$slice": -20}},
+                "$setOnInsert": {"guild_id": guild_id, "user_id": user_id, "first_violation_at": now},
+            },
+            upsert=True,
+        )
+    except Exception as exc:
+        logger.debug("automod_events persist failed (non-critical): %s", exc)
 
 
 async def handle_automod_violation(message: discord.Message, config: dict, reason: str):
@@ -1434,7 +1509,7 @@ async def handle_automod_violation(message: discord.Message, config: dict, reaso
             try:
                 await message.channel.send(
                     f"🚨 {member.mention} tripped automod while holding a staff role — "
-                    f"staff role(s) stripped and muted 30m. **{reason}**.", delete_after=10,
+                    f"staff role(s) stripped and muted 30m. **{reason}**.", delete_after=30,
                 )
             except discord.HTTPException:
                 pass
@@ -1447,9 +1522,11 @@ async def handle_automod_violation(message: discord.Message, config: dict, reaso
             title="🚨 Staff Abuse Detected", color=discord.Color.dark_red(),
         )
         await bot.db.add_warn(message.guild.id, member.id, bot.user.id, f"STAFF ABUSE — Automod: {reason}", source="automod")
+        await _persist_automod_event(message.guild.id, member.id, f"STAFF ABUSE: {reason}")
         return
 
     await bot.db.add_warn(message.guild.id, message.author.id, bot.user.id, f"Automod: {reason}", source="automod")
+    await _persist_automod_event(message.guild.id, message.author.id, reason)  # persist to MongoDB for cross-restart visibility
     active = await bot.db.get_active_automod_warns(message.guild.id, message.author.id)
     mute_seconds = _escalation_for_warns(active)
 
@@ -1491,7 +1568,7 @@ async def handle_automod_violation(message: discord.Message, config: dict, reaso
         if action_value:
             notice += f" {action_value}"
         try:
-            await message.channel.send(notice, delete_after=8)
+            await message.channel.send(notice, delete_after=30)
         except discord.HTTPException:
             pass
 
@@ -1948,11 +2025,14 @@ class AjsCrib(commands.Bot):
             # "@everyone ..." and ping the whole server the next time anyone
             # @'d them. Explicit @user pings (level-ups, warns, etc.) still work
             # fine since `users` stays allowed.
-            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
+            allowed_mentions=discord.AllowedMentions(everyone=False, here=False, roles=False, users=True),
         )
         self.db: Optional[Database] = None
         self._xp_cooldowns: dict[tuple[int, int], float] = {}
         self._stats_last_update: dict[int, float] = {}  # channel_id -> monotonic time
+        self._stats_pending: dict[int, asyncio.Task] = {}  # channel_id -> scheduled retry task
+        self.start_time = time.time()  # for .botinfo uptime
+        self._loop_last_error: dict[str, str] = {}  # loop name -> last error message, if any
         self.invite_cache: dict[int, dict[str, int]] = {}  # guild_id -> {code: uses}
         self._voice_sessions: dict[tuple[int, int], float] = {}  # (guild_id, user_id) -> monotonic join time
         # AFK system — purely in-memory (resets on restart, which is fine: it's a
@@ -2009,6 +2089,24 @@ class AjsCrib(commands.Bot):
         except Exception as exc:
             logger.warning("Could not warm AFK cache from DB: %s", exc)
 
+        # Warm the in-memory spam-history cache from recent MongoDB automod events.
+        # This means members who were spamming before a bot restart don't get a
+        # "clean slate" just because the bot rebooted — their recent violation
+        # history is restored so the escalation ladder picks up where it left off.
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+            async for doc in self.db.automod_events.find({"last_violation_at": {"$gte": cutoff}}):
+                key = (doc["guild_id"], doc["user_id"])
+                for ev in doc.get("recent", []):
+                    ev_at = ev.get("at")
+                    if ev_at and (datetime.now(timezone.utc) - ev_at).total_seconds() <= FLOOD_WINDOW_SEC * 4:
+                        # Inject a synthetic history entry so the in-memory deque reflects recent activity
+                        norm = _normalize(ev.get("reason", ""))
+                        _msg_history[key].append((time.monotonic() - 1.0, norm))
+            logger.info("Warmed in-memory spam state from recent automod events")
+        except Exception as exc:
+            logger.warning("Could not warm spam state from DB (non-critical): %s", exc)
+
         # background loops
         self.tempmute_loop.start()
         self.tempban_loop.start()
@@ -2019,7 +2117,49 @@ class AjsCrib(commands.Bot):
         self.voice_xp_loop.start()
         self.staff_inactivity_loop.start()
 
+        # Watchdog: tasks.loop already retries its NEXT iteration on most
+        # errors, but if an exception somehow escapes a loop's own try/except
+        # (e.g. a bug outside the guarded block, or something raised while
+        # handling another exception), the loop stops dead and silently —
+        # nothing in Discord or the logs flags it again. This attaches a
+        # shared .error handler to every loop: it logs loudly, records the
+        # failure for `.botinfo`, and restarts the loop so a single bad tick
+        # doesn't permanently disable a whole feature.
+        for loop_name in ("tempmute_loop", "tempban_loop", "giveaway_loop", "stats_loop",
+                           "analytics_loop", "ticket_inactivity_loop", "voice_xp_loop",
+                           "staff_inactivity_loop"):
+            loop_obj = getattr(self, loop_name)
+
+            def _make_handler(name):
+                async def _on_loop_error(exc: Exception):
+                    logger.error("UNHANDLED error in %s — restarting it: %s", name, exc, exc_info=exc)
+                    self._loop_last_error[name] = f"{type(exc).__name__}: {exc}"
+                    try:
+                        getattr(self, name).restart()
+                    except Exception as restart_exc:
+                        logger.error("Failed to restart %s after error: %s", name, restart_exc)
+                return _on_loop_error
+
+            loop_obj.error(_make_handler(loop_name))
+
+    def loop_health(self) -> dict[str, bool]:
+        """Returns {loop_name: is_running} for every background loop — used by
+        `.botinfo` to show which ones are alive."""
+        names = ("tempmute_loop", "tempban_loop", "giveaway_loop", "stats_loop",
+                  "analytics_loop", "ticket_inactivity_loop", "voice_xp_loop",
+                  "staff_inactivity_loop")
+        return {name: getattr(self, name).is_running() for name in names}
+
     async def close(self):
+        if self.db and self.is_ready() and not getattr(self, "_shutdown_logged", False):
+            for guild in self.guilds:
+                try:
+                    config = await get_config(guild.id, self.db)
+                    await _send_log(guild, config, "log_bot_channel",
+                                     embed=discord.Embed(description="🔴 **aj's crib** is shutting down.",
+                                                          color=discord.Color.red()))
+                except Exception as e:
+                    logger.warning("Failed to send shutdown log for guild %s: %s", guild.id, e)
         if self.db:
             await self.db.close()
         await super().close()
@@ -2182,60 +2322,69 @@ class AjsCrib(commands.Bot):
         if a tick is occasionally late or the bot briefly hiccups."""
         now = time.monotonic()
         for (gid, uid), joined_at in list(self._voice_sessions.items()):
-            guild = self.get_guild(gid)
-            if not guild:
-                continue
-            member = guild.get_member(uid)
-            if not member or not member.voice or not member.voice.channel:
-                self._voice_sessions.pop((gid, uid), None)
-                continue
-            if not _voice_member_eligible(member, member.voice.channel):
-                continue
-            elapsed = now - joined_at
-            if elapsed < VOICE_XP_INTERVAL:
-                continue
-            minutes = int(elapsed // 60)
-            if minutes < 1:
-                continue
             try:
-                result = await self.db.add_voice_xp(uid, gid, VOICE_XP_PER_TICK * minutes, minutes)
-            except Exception as e:
-                logger.error("voice_xp_loop award error for %s in %s: %s", uid, gid, e)
-                continue
-            self._voice_sessions[(gid, uid)] = now  # reset the clock for this member
-
-            if result["leveled"]:
-                reward = await apply_level_roles(member, self.db, result["level"])
-                config = await get_config(gid, self.db)
-                levelup_channel_id = config.get("levelup_channel")
-                chan = guild.get_channel(levelup_channel_id) if levelup_channel_id else None
-                if chan:
-                    text = f"🎉 {member.mention} hit **level {result['level']}** from voice!"
-                    if reward:
-                        text += f" earned **{reward}** 🏅"
-                    try:
-                        await chan.send(text)
-                    except discord.HTTPException:
-                        pass
-
-            newly = await check_achievements(member, self.db, result)
-            for a in newly:
-                config = await get_config(gid, self.db)
-                levelup_channel_id = config.get("levelup_channel")
-                chan = guild.get_channel(levelup_channel_id) if levelup_channel_id else None
-                if chan is None and member.voice and member.voice.channel:
-                    chan = member.voice.channel
-                if chan is None:
+                guild = self.get_guild(gid)
+                if not guild:
+                    continue
+                member = guild.get_member(uid)
+                if not member or not member.voice or not member.voice.channel:
+                    self._voice_sessions.pop((gid, uid), None)
+                    continue
+                if not _voice_member_eligible(member, member.voice.channel):
+                    continue
+                elapsed = now - joined_at
+                if elapsed < VOICE_XP_INTERVAL:
+                    continue
+                minutes = int(elapsed // 60)
+                if minutes < 1:
                     continue
                 try:
-                    await chan.send(
-                        f"{a['emoji']} {member.mention} unlocked **{a['name']}** — {a['desc']}"
-                    )
-                except discord.HTTPException:
-                    pass
+                    result = await self.db.add_voice_xp(uid, gid, VOICE_XP_PER_TICK * minutes, minutes)
+                except Exception as e:
+                    logger.error("voice_xp_loop award error for %s in %s: %s", uid, gid, e)
+                    continue
+                self._voice_sessions[(gid, uid)] = now  # reset the clock for this member
+
+                if result["leveled"]:
+                    reward = await apply_level_roles(member, self.db, result["level"])
+                    config = await get_config(gid, self.db)
+                    levelup_channel_id = config.get("levelup_channel")
+                    chan = guild.get_channel(levelup_channel_id) if levelup_channel_id else None
+                    if chan:
+                        text = f"🎉 {member.mention} hit **level {result['level']}** from voice!"
+                        if reward:
+                            text += f" earned **{reward}** 🏅"
+                        try:
+                            await chan.send(text)
+                        except discord.HTTPException:
+                            pass
+
+                newly = await check_achievements(member, self.db, result)
+                for a in newly:
+                    config = await get_config(gid, self.db)
+                    levelup_channel_id = config.get("levelup_channel")
+                    chan = guild.get_channel(levelup_channel_id) if levelup_channel_id else None
+                    if chan is None and member.voice and member.voice.channel:
+                        chan = member.voice.channel
+                    if chan is None:
+                        continue
+                    try:
+                        await chan.send(
+                            f"{a['emoji']} {member.mention} unlocked **{a['name']}** — {a['desc']}"
+                        )
+                    except discord.HTTPException:
+                        pass
+            except Exception as e:
+                logger.error("voice_xp_loop error for %s in guild %s: %s", uid, gid, e)
+                continue
 
     async def refresh_stats_channels(self, guild: discord.Guild, force: bool = False):
-        """Update the members/boosts stats channels for a guild, respecting Discord's rename rate limit."""
+        """Update the members/boosts stats channels for a guild, respecting Discord's
+        rename rate limit (~2 renames per 10 min per channel). If a join/leave/boost
+        happens while a channel is on cooldown, the latest count isn't dropped — a
+        retry is scheduled for the exact moment the cooldown clears, so the channel
+        reflects reality the instant Discord allows the rename, not on the next
+        10-minute safety-net sweep."""
         if not self.db:
             return
         config = await get_config(guild.id, self.db)
@@ -2245,32 +2394,79 @@ class AjsCrib(commands.Bot):
         if members_chan_id:
             channel = guild.get_channel(members_chan_id)
             if channel:
-                last = self._stats_last_update.get(channel.id, 0)
-                if force or now - last >= STATS_UPDATE_COOLDOWN:
-                    new_name = MEMBERS_CHANNEL_FORMAT.format(count=guild.member_count)
-                    if channel.name != new_name:
-                        try:
-                            await channel.edit(name=new_name)
-                            self._stats_last_update[channel.id] = now
-                        except discord.HTTPException as e:
-                            logger.warning("Failed to update members stats channel: %s", e)
+                await self._update_stats_channel(
+                    channel, MEMBERS_CHANNEL_FORMAT.format(count=guild.member_count), now, force,
+                    lambda: MEMBERS_CHANNEL_FORMAT.format(count=guild.member_count),
+                )
 
         boosts_chan_id = config.get("boosts_stats_channel")
         if boosts_chan_id:
             channel = guild.get_channel(boosts_chan_id)
             if channel:
-                last = self._stats_last_update.get(channel.id, 0)
-                if force or now - last >= STATS_UPDATE_COOLDOWN:
-                    new_name = BOOSTS_CHANNEL_FORMAT.format(count=guild.premium_subscription_count)
-                    if channel.name != new_name:
-                        try:
-                            await channel.edit(name=new_name)
-                            self._stats_last_update[channel.id] = now
-                        except discord.HTTPException as e:
-                            logger.warning("Failed to update boosts stats channel: %s", e)
+                await self._update_stats_channel(
+                    channel, BOOSTS_CHANNEL_FORMAT.format(count=guild.premium_subscription_count), now, force,
+                    lambda: BOOSTS_CHANNEL_FORMAT.format(count=guild.premium_subscription_count),
+                )
+
+    async def _update_stats_channel(self, channel: discord.abc.GuildChannel, new_name: str,
+                                     now: float, force: bool, recompute):
+        """Renames immediately if the cooldown allows it; otherwise schedules a
+        one-shot retry for the moment it clears, replacing any previously queued
+        retry for this channel so only the latest count ever wins."""
+        last = self._stats_last_update.get(channel.id, 0)
+        remaining = STATS_UPDATE_COOLDOWN - (now - last)
+
+        if force or remaining <= 0:
+            if channel.name != new_name:
+                try:
+                    await channel.edit(name=new_name)
+                    self._stats_last_update[channel.id] = time.monotonic()
+                except discord.HTTPException as e:
+                    logger.warning("Failed to update stats channel %s: %s", channel.id, e)
+            return
+
+        # On cooldown — (re)schedule a retry for exactly when it clears, using the
+        # freshest count at fire-time (recompute) in case more joins/leaves happen
+        # before then.
+        existing = self._stats_pending.get(channel.id)
+        if existing and not existing.done():
+            return  # a retry is already queued; it'll pick up the latest count itself
+
+        async def _retry():
+            try:
+                await asyncio.sleep(remaining)
+                fresh_name = recompute()
+                if channel.name != fresh_name:
+                    await channel.edit(name=fresh_name)
+                self._stats_last_update[channel.id] = time.monotonic()
+            except discord.HTTPException as e:
+                logger.warning("Failed to update stats channel %s (queued retry): %s", channel.id, e)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                self._stats_pending.pop(channel.id, None)
+
+        self._stats_pending[channel.id] = asyncio.create_task(_retry())
 
 
 bot = AjsCrib()
+
+
+def owner_or_guild_owner():
+    """Restricts a command to the bot's owner (the Discord application/dev
+    account, via Discord's built-in is_owner check) OR the guild's owner.
+    Plain server admins — including co-owners, trusted friends, or a
+    compromised admin account — are NOT enough for commands gated by this:
+    full config rewrites (.quicksetup, .config) and killing the running
+    process (.restart) are dangerous enough that "administrator" alone is
+    too wide a net."""
+    async def predicate(ctx: commands.Context) -> bool:
+        if await ctx.bot.is_owner(ctx.author):
+            return True
+        if ctx.guild and ctx.guild.owner_id == ctx.author.id:
+            return True
+        raise commands.CheckFailure("This command is restricted to the bot owner or server owner.")
+    return commands.check(predicate)
 
 
 @bot.before_invoke
@@ -2638,17 +2834,9 @@ class ChannelPickSelect(discord.ui.ChannelSelect):
 
         extra = ""
         if self.config_key == "invite_log_channel":
-            config = await get_config(interaction.guild.id, bot.db)
-            if not config.get("invite_template"):
-                await bot.db.update_config(interaction.guild.id, "invite_template", DEFAULT_INVITE_TEMPLATE)
-                extra = (f"\n📨 A default message is now active here, e.g. *\"{DEFAULT_INVITE_TEMPLATE}\"* "
-                         f"— customize anytime with `{PREFIX}setinvitelog <message>`.")
+            extra = "\n📨 Invite tracking is now live — every join will show who invited them and their total invite count."
         elif self.config_key == "welcome_channel":
-            config = await get_config(interaction.guild.id, bot.db)
-            if not config.get("welcome_template"):
-                await bot.db.update_config(interaction.guild.id, "welcome_template", DEFAULT_WELCOME_TEMPLATE)
-                extra = (f"\n👋 A default welcome message is now active here — customize anytime with "
-                         f"`{PREFIX}setwelcome <message>`.")
+            extra = "\n👋 Welcome messages are now live here (using the fixed template)."
 
         await interaction.response.edit_message(
             content=f"✅ **{self.label_text}** set to <#{channel.id}>.{extra}", view=CloseButtonView(),
@@ -2828,7 +3016,6 @@ AUTOMOD_FEATURES = [
     ("antishortener", "Anti-Link-Shortener",    "🔀"),
     ("mentionspam", "Mass Mention Spam",        "📣"),
     ("zalgo",       "Zalgo / Unicode Spam",     "👹"),
-    ("capsspam",    "Excessive Caps",           "🔠"),
     ("emojispam",   "Emoji Spam",               "🤡"),
     ("scamlinks",   "Scam/Phishing Domains",    "🎣"),
     ("bannedwords", "Custom Word Filter",       "🚷"),
@@ -3123,6 +3310,10 @@ class SetupHubSelect(discord.ui.Select):
                                   description="Ticket category & support role"),
             discord.SelectOption(label="Staff Roles", value="staffroles", emoji="🪪",
                                   description="Trial Mod / Mod / Senior Mod / Partnership Manager"),
+            discord.SelectOption(label="Welcome Channel", value="welcome_channel", emoji="👋",
+                                  description="Channel where welcome messages are posted on join"),
+            discord.SelectOption(label="Invite Tracker", value="invite_tracker", emoji="📨",
+                                  description="Channel that shows who invited each new member"),
             discord.SelectOption(label="Logs", value="logs", emoji="📚",
                                   description="Mod, message, automod, server, entry/exit, bot, transcripts"),
             discord.SelectOption(label="Stats Channels", value="statschannels", emoji="📊",
@@ -3180,6 +3371,14 @@ class SetupHubSelect(discord.ui.Select):
                 ),
             )
             await interaction.response.send_message(embed=embed, view=StaffRolesView(), ephemeral=True)
+        elif value == "welcome_channel":
+            await interaction.response.send_message(
+                "Pick the channel where welcome messages will be posted:", view=ChannelPickView("welcome_channel", "Welcome Channel"), ephemeral=True,
+            )
+        elif value == "invite_tracker":
+            await interaction.response.send_message(
+                "Pick the channel for invite tracking — shows who invited each new member:", view=ChannelPickView("invite_log_channel", "Invite Tracker"), ephemeral=True,
+            )
         elif value == "logs":
             await interaction.response.send_message(
                 "Pick a log type below, then choose its channel:", view=LogsSetupView(), ephemeral=True,
@@ -3661,29 +3860,25 @@ async def on_member_join(member: discord.Member):
     embed.timestamp = datetime.now(timezone.utc)
     await _send_log(member.guild, config, "log_entryexit_channel", embed=embed)
 
-    invite_tpl = config.get("invite_template")
-    if invite_tpl:
-        chan_id = config.get("invite_log_channel")
-        chan = member.guild.get_channel(chan_id) if chan_id else None
-        if chan:
-            try:
-                invite_embed = _build_invite_embed(invite_tpl, member, member.guild, inviter, invite_total)
-                await chan.send(embed=invite_embed)
-            except discord.HTTPException:
-                pass
+    # Invite tracker — fires whenever invite_log_channel is set, no template needed.
+    invite_chan_id = config.get("invite_log_channel")
+    invite_chan = member.guild.get_channel(invite_chan_id) if invite_chan_id else None
+    if invite_chan:
+        try:
+            await invite_chan.send(embed=_build_invite_embed(member, member.guild, inviter, invite_total))
+        except discord.HTTPException:
+            pass
 
-    # Welcome message — now sent as an embed (avatar + account age) instead
-    # of plain text, but the template variables still work the same way.
-    welcome_tpl = config.get("welcome_template")
-    if welcome_tpl:
-        chan_id = config.get("welcome_channel") or config.get("log_entryexit_channel")
-        chan = member.guild.get_channel(chan_id) if chan_id else None
-        if chan:
-            try:
-                welcome_embed = _build_welcome_leave_embed(welcome_tpl, member, member.guild, kind="welcome")
-                await chan.send(embed=welcome_embed)
-            except discord.HTTPException:
-                pass
+    # Welcome message — template is fixed (DEFAULT_WELCOME_TEMPLATE), only
+    # the channel is configurable.
+    chan_id = config.get("welcome_channel") or config.get("log_entryexit_channel")
+    chan = member.guild.get_channel(chan_id) if chan_id else None
+    if chan:
+        try:
+            welcome_embed = _build_welcome_leave_embed(DEFAULT_WELCOME_TEMPLATE, member, member.guild, kind="welcome")
+            await chan.send(embed=welcome_embed)
+        except discord.HTTPException:
+            pass
 
 
 @bot.event
@@ -3867,8 +4062,16 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.TooManyArguments):
         await send_reply(ctx, f"⚠️ Too many arguments for that command. Check `{PREFIX}help`.")
         return
-    if isinstance(error, (commands.MissingPermissions, commands.CheckFailure)):
+    if isinstance(error, commands.MissingPermissions):
         return  # staff_tier_check() and friends already message the user themselves
+    if isinstance(error, commands.CheckFailure):
+        # Generic checks like staff_tier_check() already message the user
+        # themselves and raise a bare CheckFailure with no text — only show
+        # a message here if the check actually attached one (e.g. our
+        # owner_or_guild_owner()), so we don't double-message for those.
+        if str(error) and str(error) != "The check functions for command failed.":
+            await send_reply(ctx, f"⛔ {error}")
+        return
     if isinstance(error, commands.BotMissingPermissions):
         await send_reply(ctx, "⛔ I'm missing the permissions needed to do that.")
         return
@@ -3929,6 +4132,40 @@ async def on_error(event_method: str, *args, **kwargs):
 @bot.command(name="ping")
 async def ping_cmd(ctx: commands.Context):
     await send_reply(ctx, f"🏓 Pong! `{round(bot.latency * 1000)}ms`")
+
+
+@bot.command(name="botinfo", aliases=["uptime", "status"])
+async def botinfo_cmd(ctx: commands.Context):
+    """Shows uptime, Discord latency, MongoDB health, and the live/dead
+    status of every background loop — at a glance, instead of digging
+    through logs to check if something quietly died."""
+    uptime_seconds = int(time.time() - bot.start_time)
+    days, rem = divmod(uptime_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    uptime_str = f"{days}d {hours}h {minutes}m" if days else f"{hours}h {minutes}m"
+
+    mongo_ok = await bot.db.ping() if bot.db else False
+
+    health = bot.loop_health()
+    loop_lines = []
+    for name, running in health.items():
+        label = name.replace("_loop", "").replace("_", " ").title()
+        if running:
+            loop_lines.append(f"🟢 {label}")
+        else:
+            err = bot._loop_last_error.get(name)
+            loop_lines.append(f"🔴 {label}" + (f" — `{err}`" if err else ""))
+
+    embed = discord.Embed(title="🤖 aj's crib — Status", color=discord.Color.blurple(),
+                           timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="Uptime", value=uptime_str, inline=True)
+    embed.add_field(name="Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
+    embed.add_field(name="MongoDB", value="🟢 Connected" if mongo_ok else "🔴 Unreachable", inline=True)
+    embed.add_field(name="Guilds", value=str(len(bot.guilds)), inline=True)
+    embed.add_field(name="Background Loops", value="\n".join(loop_lines), inline=False)
+    embed.set_footer(text=f"Requested by {ctx.author}")
+    await ctx.send(embed=embed)
 
 
 @bot.command(name="help")
@@ -4669,9 +4906,32 @@ async def tempban_cmd(ctx: commands.Context, member: discord.Member, duration: s
 @bot.command(name="strikes")
 @staff_tier_check(TIER_TRIAL)
 async def strikes_cmd(ctx: commands.Context, member: discord.Member):
-    """Show a member's active automod strikes (decay after 24h)."""
+    """Show a member's active automod strikes (decay after 24h) plus lifetime
+    violation history stored in MongoDB — persists across bot restarts."""
     count = await bot.db.get_active_strikes(ctx.guild.id, member.id)
-    await send_reply(ctx, f"{member.mention} has **{count}** active automod strike(s) (resets after 24h)")
+    # Also pull from the persisted automod_events collection
+    event_doc = await bot.db.automod_events.find_one({"guild_id": ctx.guild.id, "user_id": member.id})
+    total_lifetime = (event_doc or {}).get("total_violations", 0)
+    last_reason = (event_doc or {}).get("last_reason", "—")
+    recent_events = (event_doc or {}).get("recent", [])[-5:]  # last 5
+
+    embed = discord.Embed(
+        title=f"🛡️ Automod Strikes — {member.display_name}",
+        color=discord.Color.orange() if count > 0 else discord.Color.green(),
+    )
+    embed.add_field(name="Active (24h)", value=f"**{count}** strike(s)", inline=True)
+    embed.add_field(name="Lifetime Total", value=str(total_lifetime) if total_lifetime else "0", inline=True)
+    embed.add_field(name="Last Reason", value=last_reason[:100], inline=False)
+    if recent_events:
+        lines = []
+        for ev in reversed(recent_events):
+            ev_at = ev.get("at")
+            ts = f"<t:{int(ev_at.timestamp())}:R>" if ev_at else "?"
+            lines.append(f"{ts} — {ev.get('reason', '?')[:80]}")
+        embed.add_field(name="Recent (up to 5)", value="\n".join(lines), inline=False)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text="Active strikes decay after 24h • lifetime history is permanent")
+    await ctx.send(embed=embed)
 
 
 @bot.command(name="clearstrikes")
@@ -4690,7 +4950,6 @@ AUTOMOD_RULES = {
     "bannedwords": "automod_bannedwords",
     "mentionspam": "automod_mentionspam",
     "zalgo":       "automod_zalgo",
-    "capsspam":    "automod_capsspam",
     "emojispam":   "automod_emojispam",
     "antispam":    "automod_antispam",
 }
@@ -4702,7 +4961,7 @@ async def automod_cmd(ctx: commands.Context, rule: str = None, setting: str = No
     """.automod — view every rule's on/off state.
     .automod <rule> <on|off> — toggle one rule.
     Rules: scamlinks, antiinvite, antilink, antishortener, bannedwords,
-    mentionspam, zalgo, capsspam, emojispam, antispam."""
+    mentionspam, zalgo, emojispam, antispam."""
     config = await get_config(ctx.guild.id, bot.db)
     if rule is None:
         lines = [f"{'🟢' if config.get(key, True) else '🔴'} `{name}` — "
@@ -4833,7 +5092,7 @@ async def raidmode_cmd(ctx: commands.Context, setting: str = None, action: str =
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @bot.command(name="quicksetup", aliases=["setup"])
-@commands.has_permissions(administrator=True)
+@owner_or_guild_owner()
 async def quicksetup_cmd(ctx: commands.Context):
     """One-command setup: creates live Members/Boosts counter channels and saves config."""
     guild = ctx.guild
@@ -5077,39 +5336,28 @@ async def analytics_cmd(ctx: commands.Context, subcommand: str = "growth", days:
 
 @bot.command(name="setwelcome")
 @commands.has_permissions(administrator=True)
-async def setwelcome_cmd(ctx: commands.Context, *, template: str):
-    """Set the join message. Variables: {user} {user.id} {server} {count} {mention}.
-    Now sent as an embed with avatar + account age, not plain text."""
-    await bot.db.update_config(ctx.guild.id, "welcome_template", template)
-    preview = _build_welcome_leave_embed(template, ctx.author, ctx.guild, kind="welcome")
-    await ctx.send(content="✅ Welcome template saved. Preview:", embed=preview)
+async def setwelcome_cmd(ctx: commands.Context, *, template: str = None):
+    """Welcome message is fixed and can't be customized. Pick the channel
+    via .quicksetup instead."""
+    await send_reply(ctx, "⚠️ The welcome message is fixed and can't be changed — only the channel is configurable (use `.quicksetup`).")
 
 
 @bot.command(name="setinvitelog")
 @commands.has_permissions(administrator=True)
-async def setinvitelog_cmd(ctx: commands.Context, *, template: str):
-    """Set the invite-tracker join message, posted whenever someone joins via
-    a tracked invite. Variables: {user} {user.id} {server} {count} {mention}
-    {inviter} {invites}. Point it at a channel with the setup wizard's
-    'Invite Tracker' log, or `.config invite_log_channel <channel_id>`."""
-    await bot.db.update_config(ctx.guild.id, "invite_template", template)
-    sample_total = await bot.db.get_invite_count(ctx.guild.id, ctx.author.id)
-    preview = _build_invite_embed(template, ctx.author, ctx.guild, ctx.author, sample_total)
-    await ctx.send(content="✅ Invite tracker template saved. Preview:", embed=preview)
+async def setinvitelog_cmd(ctx: commands.Context, *, template: str = None):
+    """Invite-tracker message is fixed and can't be customized. Pick the
+    channel via .quicksetup instead."""
+    await send_reply(ctx, "⚠️ The invite tracker message is fixed and can't be changed — only the channel is configurable (use `.quicksetup`).")
 
 
 @bot.command(name="testinvitelog")
 @commands.has_permissions(administrator=True)
 async def testinvitelog_cmd(ctx: commands.Context):
     config = await bot.db.get_config(ctx.guild.id)
-    tpl = config.get("invite_template")
-    if not tpl:
-        await send_reply(ctx, f"No invite tracker template set. Use `{PREFIX}setinvitelog <message>`.")
-        return
     chan_id = config.get("invite_log_channel")
     chan = ctx.guild.get_channel(chan_id) if chan_id else ctx.channel
     sample_total = await bot.db.get_invite_count(ctx.guild.id, ctx.author.id)
-    embed = _build_invite_embed(tpl, ctx.author, ctx.guild, ctx.author, sample_total)
+    embed = _build_invite_embed(ctx.author, ctx.guild, ctx.author, sample_total)
     await (chan or ctx.channel).send(embed=embed)
 
 
@@ -5117,13 +5365,9 @@ async def testinvitelog_cmd(ctx: commands.Context):
 @commands.has_permissions(administrator=True)
 async def testwelcome_cmd(ctx: commands.Context):
     config = await bot.db.get_config(ctx.guild.id)
-    tpl = config.get("welcome_template")
-    if not tpl:
-        await send_reply(ctx, f"No welcome template set. Use `{PREFIX}setwelcome <message>`.")
-        return
     chan_id = config.get("welcome_channel") or config.get("log_entryexit_channel")
     chan = ctx.guild.get_channel(chan_id) if chan_id else ctx.channel
-    embed = _build_welcome_leave_embed(tpl, ctx.author, ctx.guild, kind="welcome")
+    embed = _build_welcome_leave_embed(DEFAULT_WELCOME_TEMPLATE, ctx.author, ctx.guild, kind="welcome")
     await (chan or ctx.channel).send(embed=embed)
 
 
@@ -5170,21 +5414,26 @@ def _build_welcome_leave_embed(template: str, member: discord.Member, guild: dis
     return embed
 
 
-def _build_invite_embed(template: str, member: discord.Member, guild: discord.Guild,
+def _build_invite_embed(member: discord.Member, guild: discord.Guild,
                          inviter: Optional[discord.abc.User], invite_total: Optional[int]) -> discord.Embed:
-    """Builds the invite-tracker embed shown when a member joins via a tracked
-    invite. Same preset branded look as the welcome embed — pick a channel,
-    nothing else to configure. Supports {user} {user.id} {server} {count}
-    {mention} {inviter} {invites}."""
-    description = (
-        _render_template(template, member, guild)
-        .replace("{inviter}", inviter.mention if inviter else "an unknown/vanity invite")
-        .replace("{invites}", str(invite_total) if invite_total is not None else "?")
+    """Hardcoded invite-tracker embed — no template needed. Just set the channel
+    via .setup → Logs → Invite Tracker and it works immediately."""
+    inviter_str = inviter.mention if inviter else "Unknown / vanity URL"
+    invites_str = str(invite_total) if invite_total is not None else "?"
+    embed = discord.Embed(
+        title="📨 New Member Joined!",
+        description=(
+            f"{member.mention} just joined **{guild.name}**!\n\n"
+            f"Invited by {inviter_str} — they now have **{invites_str}** invite(s). 🎉"
+        ),
+        color=discord.Color.fuchsia(),
     )
-    embed = discord.Embed(title="📨 New Invite!", description=description, color=discord.Color.fuchsia())
-    embed.add_field(name="Invited By", value=inviter.mention if inviter else "Unknown / vanity URL", inline=True)
-    embed.add_field(name="Total Invites", value=str(invite_total) if invite_total is not None else "—", inline=True)
-    embed.set_thumbnail(url=guild.icon.url if guild.icon else member.display_avatar.url)
+    embed.add_field(name="👤 Member", value=f"{member} (`{member.id}`)", inline=True)
+    embed.add_field(name="📩 Invited By", value=inviter_str, inline=True)
+    embed.add_field(name="🔢 Total Invites", value=invites_str, inline=True)
+    embed.add_field(name="📅 Account Age", value=f"<t:{int(member.created_at.timestamp())}:R>", inline=True)
+    embed.add_field(name="👥 Server Size", value=f"#{guild.member_count}", inline=True)
+    embed.set_thumbnail(url=member.display_avatar.url)
     embed.set_footer(text=f"Member #{guild.member_count} • {BOT_BRAND}")
     embed.timestamp = datetime.now(timezone.utc)
     return embed
@@ -5192,9 +5441,9 @@ def _build_invite_embed(template: str, member: discord.Member, guild: discord.Gu
 
 def _coerce_config_value(value: str):
     """Raw `.config` input always arrives as a string, but most config reads
-    expect a real bool or int (e.g. `config.get("automod_capsspam", True)`,
+    expect a real bool or int (e.g. `config.get("automod_mentionspam", True)`,
     `guild.get_channel(config.get("modlog_channel"))`). Without this, setting
-    `.config automod_capsspam false` stored the literal string "false" —
+    `.config automod_mentionspam false` stored the literal string "false" —
     which Python treats as truthy — so the toggle silently did nothing, and
     `.config modlog_channel 123456` stored a string channel ID that
     `get_channel()` can never match. This makes `.config` behave identically
@@ -5210,7 +5459,7 @@ def _coerce_config_value(value: str):
 
 
 @bot.command(name="config")
-@commands.has_permissions(administrator=True)
+@owner_or_guild_owner()
 async def config_cmd(ctx: commands.Context, key: str = None, value: str = None):
     if key is None:
         config = await bot.db.get_config(ctx.guild.id)
@@ -5872,11 +6121,16 @@ async def serverinfo_cmd(ctx: commands.Context):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @bot.command(name="restart", aliases=["reboot"])
-@commands.has_permissions(administrator=True)
+@owner_or_guild_owner()
 async def restart_cmd(ctx: commands.Context):
     """Gracefully shut down. Requires a process manager (systemd/pm2/supervisor) to auto-restart."""
     await send_reply(ctx, "🔄 Restarting...")
     logger.info("Restart triggered by %s (%s)", ctx.author, ctx.author.id)
+    config = await get_config(ctx.guild.id, bot.db)
+    await _send_log(ctx.guild, config, "log_bot_channel",
+                     embed=discord.Embed(description=f"🔄 **aj's crib** is restarting (triggered by {ctx.author.mention}).",
+                                          color=discord.Color.orange()))
+    bot._shutdown_logged = True
     await bot.close()
     import sys
     sys.exit(0)
