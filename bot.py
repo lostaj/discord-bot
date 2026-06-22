@@ -5760,44 +5760,56 @@ async def _resolve_giveaway(doc: dict):
 # ─── wire reaction-based giveaway entry ──────────────────────────────────────
 
 @bot.event
-async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
-    if user.bot:
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if payload.user_id == bot.user.id:
         return
-    if str(reaction.emoji) != GIVEAWAY_EMOJI:
+    await _handle_starboard_reaction(payload)
+    await _handle_giveaway_reaction_add(payload)
+
+
+async def _handle_giveaway_reaction_add(payload: discord.RawReactionActionEvent):
+    if str(payload.emoji) != GIVEAWAY_EMOJI:
         return
-    doc = await bot.db.get_giveaway(reaction.message.id)
+    doc = await bot.db.get_giveaway(payload.message_id)
     if not doc or doc.get("ended"):
         return
 
-    guild = reaction.message.guild
-    member = guild.get_member(user.id) if guild else None
-    if member and guild:
-        config = await get_config(guild.id, bot.db)
-        if _is_giveaway_blacklisted(member, config):
+    guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
+    if not guild:
+        return
+    member = payload.member or guild.get_member(payload.user_id)
+    if not member or member.bot:
+        return
+
+    config = await get_config(guild.id, bot.db)
+    if _is_giveaway_blacklisted(member, config):
+        channel = guild.get_channel(payload.channel_id)
+        if channel:
             try:
-                await reaction.message.remove_reaction(reaction.emoji, user)
+                message = await channel.fetch_message(payload.message_id)
+                await message.remove_reaction(payload.emoji, member)
             except discord.HTTPException:
                 pass
-            try:
-                await user.send(embed=make_embed(f"You're blacklisted from giveaways in **{guild.name}** and can't enter.",
-                                                   title="⛔ Blacklisted", color=discord.Color.red()))
-            except discord.Forbidden:
-                pass
-            return
+        try:
+            await member.send(embed=make_embed(f"You're blacklisted from giveaways in **{guild.name}** and can't enter.",
+                                                 title="⛔ Blacklisted", color=discord.Color.red()))
+        except discord.Forbidden:
+            pass
+        return
 
-    await bot.db.add_entrant(reaction.message.id, user.id)
+    await bot.db.add_entrant(payload.message_id, payload.user_id)
 
 
 @bot.event
-async def on_reaction_remove(reaction: discord.Reaction, user: discord.User):
-    if user.bot:
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    if payload.user_id == bot.user.id:
         return
-    if str(reaction.emoji) != GIVEAWAY_EMOJI:
+    if str(payload.emoji) != GIVEAWAY_EMOJI:
         return
-    doc = await bot.db.get_giveaway(reaction.message.id)
+    doc = await bot.db.get_giveaway(payload.message_id)
     if not doc or doc.get("ended"):
         return
-    await bot.db.remove_entrant(reaction.message.id, user.id)
+    await bot.db.remove_entrant(payload.message_id, payload.user_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5812,8 +5824,7 @@ STARBOARD_EMOJI = "⭐"
 STARBOARD_DEFAULT_THRESHOLD = 3
 
 
-@bot.event
-async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+async def _handle_starboard_reaction(payload: discord.RawReactionActionEvent):
     if str(payload.emoji) != STARBOARD_EMOJI:
         return
     guild = bot.get_guild(payload.guild_id)
