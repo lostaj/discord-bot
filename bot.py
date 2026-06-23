@@ -128,43 +128,101 @@ def get_role_for_level(level: int) -> Optional[str]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  GENERIC TTL CACHE  (stale-while-revalidate)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TTLCache:
+    """Generic async stale-while-revalidate cache, keyed by any hashable key.
+
+    - age < ttl    -> serve cached value, no DB hit at all.
+    - ttl <= age < stale -> serve the (slightly stale) cached value immediately,
+      and kick off exactly one background refresh for that key (subsequent
+      callers during the refresh just get the same stale value, never a
+      second redundant fetch).
+    - age >= stale (or no entry yet) -> fetch fresh, blocking the caller.
+
+    This is the same pattern the old bespoke `_config_cache` used, generalized
+    so any expensive/frequent read (config, leaderboards, etc.) can share it
+    instead of every call site reimplementing its own cache+refresh-task bookkeeping.
+    """
+    def __init__(self, ttl: float, stale: float):
+        self.ttl = ttl
+        self.stale = stale
+        self._data: dict = {}
+        self._refreshing: set = set()
+
+    async def get(self, key, fetch_fn):
+        cached = self._data.get(key)
+        now = time.monotonic()
+        if cached:
+            value, ts_cached = cached
+            age = now - ts_cached
+            if age < self.ttl:
+                return value
+            if age < self.stale:
+                if key not in self._refreshing:
+                    self._refreshing.add(key)
+
+                    async def _bg_refresh(k=key):
+                        try:
+                            fresh = await fetch_fn()
+                            self._data[k] = (fresh, time.monotonic())
+                        except Exception as exc:
+                            logger.debug("TTLCache background refresh failed for %r: %s", k, exc)
+                        finally:
+                            self._refreshing.discard(k)
+
+                    asyncio.create_task(_bg_refresh())
+                return value
+        value = await fetch_fn()
+        self._data[key] = (value, now)
+        return value
+
+    def invalidate(self, key):
+        self._data.pop(key, None)
+
+    def stats(self) -> dict:
+        """Lightweight introspection for ops/health commands."""
+        return {"entries": len(self._data), "refreshing": len(self._refreshing)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  CONFIG CACHE  (stale-while-revalidate)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_config_cache: dict[int, tuple[dict, float]] = {}
 CONFIG_CACHE_TTL   = 5.0    # fresh window — kept tiny so config edits feel instant
 CONFIG_CACHE_STALE = 10.0   # serve stale while refreshing in background
-_config_refresh_tasks: set[int] = set()
+_config_cache = TTLCache(ttl=CONFIG_CACHE_TTL, stale=CONFIG_CACHE_STALE)
 
 
 async def get_config(guild_id: int, db: "Database") -> dict:
-    cached = _config_cache.get(guild_id)
-    now    = time.monotonic()
-    if cached:
-        data, ts_cached = cached
-        age = now - ts_cached
-        if age < CONFIG_CACHE_TTL:
-            return data
-        if age < CONFIG_CACHE_STALE:
-            if guild_id not in _config_refresh_tasks:
-                _config_refresh_tasks.add(guild_id)
-                async def _bg_refresh(gid: int):
-                    try:
-                        fresh = await db.get_config(gid)
-                        _config_cache[gid] = (fresh, time.monotonic())
-                    except Exception as exc:
-                        logger.debug("Config background refresh failed for %d: %s", gid, exc)
-                    finally:
-                        _config_refresh_tasks.discard(gid)
-                asyncio.create_task(_bg_refresh(guild_id))
-            return data
-    config = await db.get_config(guild_id)
-    _config_cache[guild_id] = (config, now)
-    return config
+    return await _config_cache.get(guild_id, lambda: db.get_config(guild_id))
 
 
 def invalidate_config(guild_id: int):
-    _config_cache.pop(guild_id, None)
+    _config_cache.invalidate(guild_id)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  LEADERBOARD CACHE  (stale-while-revalidate)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Leaderboards are sorted, potentially-large reads that get hammered by the
+# `.top` button-switcher (4 categories, every click re-queries) and repeated
+# `.leaderboard`/`.invitelb`/etc. calls. Freshness to the second doesn't matter
+# for a top-10 ranking, so a short cache meaningfully cuts DB load with no
+# visible staleness.
+
+LEADERBOARD_CACHE_TTL   = 15.0
+LEADERBOARD_CACHE_STALE = 45.0
+_leaderboard_cache = TTLCache(ttl=LEADERBOARD_CACHE_TTL, stale=LEADERBOARD_CACHE_STALE)
+
+
+async def get_cached_leaderboard(kind: str, gid: int, limit: int, fetch_fn) -> list[dict]:
+    """`kind` is just a cache-namespace label ('xp', 'voice', 'messages', 'invites')
+    so the same gid+limit pair across different leaderboard types doesn't collide."""
+    return await _leaderboard_cache.get((kind, gid, limit), fetch_fn)
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -241,7 +299,6 @@ class Database:
         self.counters       = _RetryingCollection(db["counters"])  # atomic per-guild sequence numbers (case#, report#, ...)
         self.afk             = _RetryingCollection(db["afk"])  # persisted AFK state — survives restarts
         self.containments    = _RetryingCollection(db["containments"])  # per-user anti-nuke containment snapshots
-        self.automod_events  = _RetryingCollection(db["automod_events"])  # persisted spam/flood history for cross-restart continuity
         self.automod_events  = _RetryingCollection(db["automod_events"])  # persisted spam/flood history for cross-restart continuity
 
     @property
@@ -1055,7 +1112,8 @@ async def check_achievements(member, db: Database, data: dict) -> list[dict]:
 
     is_top = False
     if "top_leaderboard" not in badges:
-        top_row = await db.get_leaderboard(member.guild.id, limit=1)
+        top_row = await get_cached_leaderboard("xp", member.guild.id, 1,
+                                                lambda: db.get_leaderboard(member.guild.id, limit=1))
         is_top = bool(top_row) and top_row[0].get("user_id") == member.id
 
     checks = [
@@ -1216,8 +1274,11 @@ EMOJI_RE = re.compile(
 
 ZALGO_THRESHOLD     = 5     # combining marks in one message before it's "zalgo" — tightened
 MENTION_THRESHOLD   = 4     # unique user + role mentions before it's "mention spam" — tightened
-FLOOD_WINDOW_SEC    = 6.0   # burst window — tightened for faster spam detection
-FLOOD_MAX_MESSAGES  = 6     # messages allowed in that window — much stricter; fast typers send varied msgs anyway
+FLOOD_WINDOW_SEC    = 7.0   # burst window — slightly widened to give fast typers more breathing room
+FLOOD_MAX_MESSAGES  = 9     # messages allowed in that window — eased up from 6; still strict, but a
+                            # fast typer firing off several varied, legit messages in a row no longer
+                            # trips it. Real spam (the same content repeated) is still caught hard by
+                            # the duplicate-content check below, which is untouched.
 DUPLICATE_WINDOW_SEC  = 30.0  # wider window for catching repeat spam
 DUPLICATE_MAX_COUNT   = 3    # only 3 repeats of the same non-trivial message — real conversation varies
 DUPLICATE_SHORT_COUNT = 5    # short filler ("hi", "lol") allowed 5 times — still human-like but capped
@@ -1265,12 +1326,12 @@ def _normalize(content: str) -> str:
 
 def _is_flooding(key: tuple[int, int], content: str) -> bool:
     """Smart spam check: weighs duplicate content much more heavily than raw speed,
-    so a fast typer sending varied messages is never flagged. Short, extremely
+    so a fast typer sending varied messages is rarely flagged. Short, extremely
     common chat replies ("hi", "lol", "ok"...) get a much higher repeat
     allowance — two people saying "Hi" back and forth a few times is normal
-    conversation, not spam. Strict thresholds here are intentional — members
-    can type fast, they just can't send the same thing over and over or send
-    a wall of messages in 6 seconds.
+    conversation, not spam. The raw-rate (flood) threshold was eased up to give
+    fast typers more room — repeating the same thing over and over, or a true
+    wall-of-messages burst, still gets caught hard either way.
     Also records to MongoDB periodically so state survives bot restarts."""
     now  = time.monotonic()
     norm = _normalize(content)
@@ -2190,7 +2251,11 @@ class AjsCrib(commands.Bot):
     async def tempmute_loop(self):
         try:
             due = await self.db.get_due_tempmutes()
-            for doc in due:
+        except Exception as e:
+            logger.error("tempmute_loop fetch error: %s", e)
+            return
+        for doc in due:
+            try:
                 guild = self.get_guild(doc["guild_id"])
                 if not guild:
                     continue
@@ -2201,14 +2266,20 @@ class AjsCrib(commands.Bot):
                         await member.timeout(None, reason="Tempmute expired")
                     except Exception as e:
                         logger.warning("Failed to lift tempmute for %s: %s", doc["user_id"], e)
-        except Exception as e:
-            logger.error("tempmute_loop error: %s", e)
+            except Exception as e:
+                # Isolated per-item — one bad/malformed doc must never block the
+                # rest of this tick's due tempmutes, nor repeat-block them forever.
+                logger.error("tempmute_loop item error for doc %r: %s", doc, e)
 
     @tasks.loop(seconds=10)
     async def tempban_loop(self):
         try:
             due = await self.db.get_due_tempbans()
-            for doc in due:
+        except Exception as e:
+            logger.error("tempban_loop fetch error: %s", e)
+            return
+        for doc in due:
+            try:
                 guild = self.get_guild(doc["guild_id"])
                 if not guild:
                     continue
@@ -2219,8 +2290,8 @@ class AjsCrib(commands.Bot):
                 except Exception as e:
                     logger.warning("Failed to lift tempban for %s: %s", doc["user_id"], e)
                 await self.db.remove_tempban(doc["guild_id"], doc["user_id"])
-        except Exception as e:
-            logger.error("tempban_loop error: %s", e)
+            except Exception as e:
+                logger.error("tempban_loop item error for doc %r: %s", doc, e)
 
     @tasks.loop(seconds=10)
     async def giveaway_loop(self):
@@ -2231,17 +2302,27 @@ class AjsCrib(commands.Bot):
         Reroll button attached."""
         try:
             due = await self.db.get_due_giveaways()
-            for doc in due:
-                await _resolve_giveaway(doc)
         except Exception as e:
-            logger.error("giveaway_loop error: %s", e)
+            logger.error("giveaway_loop fetch error: %s", e)
+            return
+        for doc in due:
+            try:
+                await _resolve_giveaway(doc)
+            except Exception as e:
+                logger.error("giveaway_loop item error for giveaway %r: %s", doc.get("message_id"), e)
 
-    @tasks.loop(minutes=10)
+    @tasks.loop(seconds=30)
     async def stats_loop(self):
-        """Periodic safety-net refresh of all configured stats channels."""
+        """Frequent safety-net check of all configured stats channels — runs
+        every 30s so member/boost-count changes show up almost immediately.
+        Deliberately NOT force=True: actual renames still go through
+        `_update_stats_channel`'s cooldown/retry-queue, which respects
+        Discord's ~2-renames-per-10-min-per-channel limit. Checking often is
+        free (it's just a string comparison); it's the actual edit() calls
+        that are rate-limited, and those are already throttled correctly."""
         for guild in self.guilds:
             try:
-                await self.refresh_stats_channels(guild, force=True)
+                await self.refresh_stats_channels(guild)
             except Exception as e:
                 logger.error("stats_loop error for guild %s: %s", guild.id, e)
 
@@ -2269,37 +2350,40 @@ class AjsCrib(commands.Bot):
 
         now = datetime.now(timezone.utc)
         for doc in open_tickets:
-            channel = self.get_channel(doc.get("channel_id"))
-            if not channel:
-                continue
-            last_activity = doc.get("last_activity_at") or doc.get("opened_at")
-            if not last_activity:
-                continue
-            if last_activity.tzinfo is None:
-                last_activity = last_activity.replace(tzinfo=timezone.utc)
-            idle_hours = (now - last_activity).total_seconds() / 3600
+            try:
+                channel = self.get_channel(doc.get("channel_id"))
+                if not channel:
+                    continue
+                last_activity = doc.get("last_activity_at") or doc.get("opened_at")
+                if not last_activity:
+                    continue
+                if last_activity.tzinfo is None:
+                    last_activity = last_activity.replace(tzinfo=timezone.utc)
+                idle_hours = (now - last_activity).total_seconds() / 3600
 
-            if idle_hours >= TICKET_INACTIVITY_CLOSE_HOURS:
-                try:
-                    await channel.send(
-                        f"⏳ auto-closing — no activity for over {TICKET_INACTIVITY_CLOSE_HOURS}h"
-                    )
-                except discord.HTTPException:
-                    pass
-                try:
-                    await _build_ticket_transcript_and_close(channel, self.user, channel.guild, delay=3)
-                except Exception as e:
-                    logger.error("Auto-close failed for ticket %s: %s", channel.id, e)
-                continue
+                if idle_hours >= TICKET_INACTIVITY_CLOSE_HOURS:
+                    try:
+                        await channel.send(
+                            f"⏳ auto-closing — no activity for over {TICKET_INACTIVITY_CLOSE_HOURS}h"
+                        )
+                    except discord.HTTPException:
+                        pass
+                    try:
+                        await _build_ticket_transcript_and_close(channel, self.user, channel.guild, delay=3)
+                    except Exception as e:
+                        logger.error("Auto-close failed for ticket %s: %s", channel.id, e)
+                    continue
 
-            if idle_hours >= TICKET_INACTIVITY_WARN_HOURS and not doc.get("inactivity_warned_at"):
-                try:
-                    await channel.send(
-                        f"⏳ this ticket's been quiet for {int(idle_hours)}h — it'll close at {TICKET_INACTIVITY_CLOSE_HOURS}h if nobody replies"
-                    )
-                    await self.db.mark_ticket_warned_inactive(channel.id)
-                except discord.HTTPException:
-                    pass
+                if idle_hours >= TICKET_INACTIVITY_WARN_HOURS and not doc.get("inactivity_warned_at"):
+                    try:
+                        await channel.send(
+                            f"⏳ this ticket's been quiet for {int(idle_hours)}h — it'll close at {TICKET_INACTIVITY_CLOSE_HOURS}h if nobody replies"
+                        )
+                        await self.db.mark_ticket_warned_inactive(channel.id)
+                    except discord.HTTPException:
+                        pass
+            except Exception as e:
+                logger.error("ticket_inactivity_loop item error for ticket %r: %s", doc.get("channel_id"), e)
 
     @tasks.loop(hours=1)
     async def staff_inactivity_loop(self):
@@ -2319,18 +2403,22 @@ class AjsCrib(commands.Bot):
                 cutoff = datetime.now(timezone.utc) - timedelta(days=days)
                 stale = await self.db.get_stale_staff_activity(guild.id, cutoff)
                 for doc in stale:
-                    member = guild.get_member(doc.get("user_id"))
-                    if not member:
-                        continue
-                    last_at = doc.get("last_action_at")
-                    idle_days = (datetime.now(timezone.utc) - last_at).days if last_at else days
-                    await send_dm_embed(
-                        member,
-                        f"You haven't logged any staff actions in **{guild.name}** for **{idle_days}d** "
-                        f"(threshold: {days}d). Just a heads up, not a punishment — any mod action resets this.",
-                        title="👀 Staff Activity Reminder", color=discord.Color.gold(),
-                    )
-                    await self.db.mark_staff_alerted(guild.id, doc.get("user_id"))
+                    try:
+                        member = guild.get_member(doc.get("user_id"))
+                        if not member:
+                            continue
+                        last_at = doc.get("last_action_at")
+                        idle_days = (datetime.now(timezone.utc) - last_at).days if last_at else days
+                        await send_dm_embed(
+                            member,
+                            f"You haven't logged any staff actions in **{guild.name}** for **{idle_days}d** "
+                            f"(threshold: {days}d). Just a heads up, not a punishment — any mod action resets this.",
+                            title="👀 Staff Activity Reminder", color=discord.Color.gold(),
+                        )
+                        await self.db.mark_staff_alerted(guild.id, doc.get("user_id"))
+                    except Exception as e:
+                        logger.error("staff_inactivity_loop item error for user %r in guild %s: %s",
+                                     doc.get("user_id"), guild.id, e)
             except Exception as e:
                 logger.error("staff_inactivity_loop error for guild %s: %s", guild.id, e)
 
@@ -2652,6 +2740,71 @@ async def _confirm_destructive_action(ctx: commands.Context, *, action_emoji: st
     except discord.HTTPException:
         pass
     return True
+
+
+class PaginatorView(discord.ui.View):
+    """Generic Previous/Next paginator for any long list of pre-formatted
+    lines. Splits into pages of `per_page` so commands with unbounded
+    history (warnings, case history, etc.) can never overflow Discord's
+    4096-char embed description limit or dump an unreadable wall of text —
+    and gives every list-style command the same clean, interactive feel.
+    Buttons auto-disable at the ends and the whole view locks itself down
+    (no dangling live buttons) once it times out."""
+
+    def __init__(self, ctx: commands.Context, *, title: str, lines: list[str],
+                 per_page: int = 8, color: Optional[discord.Color] = None, footer_extra: str = ""):
+        super().__init__(timeout=120)
+        self.ctx = ctx
+        self.title = title
+        self.lines = lines or ["—"]
+        self.per_page = per_page
+        self.color = color or discord.Color.blurple()
+        self.footer_extra = footer_extra
+        self.page = 0
+        self.max_page = max(0, (len(self.lines) - 1) // per_page)
+        self._sync_buttons()
+
+    def _sync_buttons(self):
+        self.prev_page.disabled = self.page <= 0
+        self.next_page.disabled = self.page >= self.max_page
+
+    def build_embed(self) -> discord.Embed:
+        start = self.page * self.per_page
+        chunk = self.lines[start:start + self.per_page]
+        embed = discord.Embed(title=self.title, description="\n".join(chunk), color=self.color)
+        footer = f"Page {self.page + 1}/{self.max_page + 1}"
+        if self.footer_extra:
+            footer += f" • {self.footer_extra}"
+        embed.set_footer(text=footer)
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message("this isn't your list to page through", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = max(0, self.page - 1)
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = min(self.max_page, self.page + 1)
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def send(self):
+        if self.max_page == 0:
+            await self.ctx.send(embed=self.build_embed())
+        else:
+            await self.ctx.send(embed=self.build_embed(), view=self)
 
 
 class TicketCloseView(discord.ui.View):
@@ -3951,6 +4104,15 @@ async def on_member_ban(guild: discord.Guild, user: discord.abc.User):
     mod = entry.user if entry else guild.me
     reason = entry.reason if entry else "No reason provided"
     await post_modlog(guild, "🔨 Ban (external)", mod, user, reason or "No reason provided", color=discord.Color.red())
+    ban_embed = discord.Embed(
+        title="🔨 Member Banned",
+        color=discord.Color.red(),
+        description=f"{user} (`{user.name}`, ID: `{user.id}`) was banned from the server.",
+    )
+    ban_embed.add_field(name="Moderator", value=mod.mention if hasattr(mod, "mention") else str(mod), inline=True)
+    ban_embed.add_field(name="Reason", value=reason or "No reason provided", inline=True)
+    ban_embed.timestamp = datetime.now(timezone.utc)
+    await _send_log(guild, config, "log_entryexit_channel", embed=ban_embed)
     await antinuke_check(guild, "antinuke_bans", "ban", discord.AuditLogAction.ban, user.id, "mass banning members")
 
 
@@ -4062,6 +4224,33 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             await bot.refresh_stats_channels(after.guild)
         except Exception as e:
             logger.error("Stats refresh on boost failed: %s", e)
+
+        if result["leveled"]:
+            reward = await apply_level_roles(after, bot.db, result["level"])
+            text = f"🎉 {after.mention} just hit **level {result['level']}**!"
+            if reward:
+                text += f" you got **{reward}** 🏅"
+            try:
+                config = await get_config(after.guild.id, bot.db)
+                target_channel = None
+                levelup_channel_id = config.get("levelup_channel")
+                if levelup_channel_id:
+                    target_channel = after.guild.get_channel(levelup_channel_id)
+                if not target_channel:
+                    target_channel = after.guild.system_channel
+                if target_channel:
+                    await target_channel.send(text)
+            except discord.HTTPException:
+                pass
+
+        newly = await check_achievements(after, bot.db, result)
+        for a in newly:
+            try:
+                chan = after.guild.system_channel
+                if chan:
+                    await chan.send(f"{a['emoji']} {after.mention} unlocked **{a['name']}** — {a['desc']}")
+            except discord.HTTPException:
+                pass
 
     newly_admin_roles = [r for r in after.roles if r not in before.roles and r.permissions.administrator]
     if newly_admin_roles:
@@ -4183,6 +4372,9 @@ async def botinfo_cmd(ctx: commands.Context):
     embed.add_field(name="Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
     embed.add_field(name="MongoDB", value="🟢 Connected" if mongo_ok else "🔴 Unreachable", inline=True)
     embed.add_field(name="Guilds", value=str(len(bot.guilds)), inline=True)
+    cfg_stats = _config_cache.stats()
+    lb_stats = _leaderboard_cache.stats()
+    embed.add_field(name="Cache", value=f"config: {cfg_stats['entries']} entries\nleaderboard: {lb_stats['entries']} entries", inline=True)
     embed.add_field(name="Background Loops", value="\n".join(loop_lines), inline=False)
     embed.set_footer(text=f"Requested by {ctx.author}")
     await ctx.send(embed=embed)
@@ -4410,7 +4602,8 @@ async def achievements_cmd(ctx: commands.Context, member: discord.Member = None)
 async def leaderboard_cmd(ctx: commands.Context):
     """The classic single-stat XP leaderboard. For voice/messages/invites all
     in one place, use `.top`."""
-    rows = await bot.db.get_leaderboard(ctx.guild.id, limit=10)
+    rows = await get_cached_leaderboard("xp", ctx.guild.id, 10,
+                                         lambda: bot.db.get_leaderboard(ctx.guild.id, limit=10))
     if not rows:
         await send_reply(ctx, "No leveling data yet for this server.")
         return
@@ -4444,7 +4637,8 @@ class TopLeaderboardView(discord.ui.View):
     async def _build_embed(self, category: str) -> discord.Embed:
         guild = self.ctx.guild
         if category == "xp":
-            rows = await bot.db.get_leaderboard(guild.id, limit=10)
+            rows = await get_cached_leaderboard("xp", guild.id, 10,
+                                                 lambda: bot.db.get_leaderboard(guild.id, limit=10))
             lines = []
             for i, row in enumerate(rows, start=1):
                 member = guild.get_member(row["user_id"])
@@ -4453,7 +4647,8 @@ class TopLeaderboardView(discord.ui.View):
                 lines.append(f"**#{i}** {name} — Level {level} ({row.get('total_xp', 0)} XP)")
             title, color = "🏆 Top — XP / Level", discord.Color.gold()
         elif category == "voice":
-            rows = await bot.db.get_voice_leaderboard(guild.id, limit=10)
+            rows = await get_cached_leaderboard("voice", guild.id, 10,
+                                                 lambda: bot.db.get_voice_leaderboard(guild.id, limit=10))
             lines = []
             for i, row in enumerate(rows, start=1):
                 member = guild.get_member(row["user_id"])
@@ -4461,7 +4656,8 @@ class TopLeaderboardView(discord.ui.View):
                 lines.append(f"**#{i}** {name} — {_format_voice_duration(row.get('voice_minutes', 0))}")
             title, color = "🔊 Top — Voice Time", discord.Color.blurple()
         elif category == "messages":
-            rows = await bot.db.get_msg_leaderboard(guild.id, limit=10)
+            rows = await get_cached_leaderboard("messages", guild.id, 10,
+                                                 lambda: bot.db.get_msg_leaderboard(guild.id, limit=10))
             lines = []
             for i, row in enumerate(rows, start=1):
                 member = guild.get_member(row["user_id"])
@@ -4469,7 +4665,8 @@ class TopLeaderboardView(discord.ui.View):
                 lines.append(f"**#{i}** {name} — {row.get('total_messages', 0)} messages")
             title, color = "💬 Top — Messages", discord.Color.green()
         else:  # invites
-            rows = await bot.db.get_invite_leaderboard(guild.id, limit=10)
+            rows = await get_cached_leaderboard("invites", guild.id, 10,
+                                                 lambda: bot.db.get_invite_leaderboard(guild.id, limit=10))
             lines = []
             for i, row in enumerate(rows, start=1):
                 member = guild.get_member(row["inviter_id"])
@@ -4709,12 +4906,11 @@ async def warnings_cmd(ctx: commands.Context, member: discord.Member):
             active_count += 1
         status = " *(expired)*" if expired else ""
         lines.append(f"`{w['created_at']:%Y-%m-%d}` — {w['reason']} ({tag}){status}")
-    embed = discord.Embed(title=f"Warnings for {member.display_name}", description="\n".join(lines))
     footer = f"{len(warns)} total"
     if decay_days:
         footer += f" • {active_count} active (decay: {decay_days}d)"
-    embed.set_footer(text=footer)
-    await ctx.send(embed=embed)
+    view = PaginatorView(ctx, title=f"Warnings for {member.display_name}", lines=lines, footer_extra=footer)
+    await view.send()
 
 
 @bot.command(name="clearwarns")
@@ -4773,8 +4969,8 @@ async def cases_cmd(ctx: commands.Context, member: discord.Member):
         await send_reply(ctx, f"{member.mention} has no cases.")
         return
     lines = [f"`#{c['case_number']}` {c['action']} — {c['reason']}" for c in cases]
-    embed = discord.Embed(title=f"Cases for {member.display_name}", description="\n".join(lines))
-    await ctx.send(embed=embed)
+    view = PaginatorView(ctx, title=f"Cases for {member.display_name}", lines=lines, footer_extra=f"{len(cases)} total")
+    await view.send()
 
 
 @bot.command(name="kick")
@@ -5353,7 +5549,7 @@ async def analytics_cmd(ctx: commands.Context, subcommand: str = "growth", days:
         await ctx.send(embed=embed)
 
     else:
-        await send_reply(ctx, f"⚠️ Unknown subcommand. Options: `growth`, `joins`, `activity`")
+        await send_reply(ctx, "⚠️ Unknown subcommand. Options: `growth`, `joins`, `activity`")
 
 
 @bot.command(name="setwelcome")
@@ -5620,11 +5816,13 @@ async def invites_cmd(ctx: commands.Context, member: discord.Member = None):
     fake    = doc.get("fake", 0)
     left    = doc.get("left", 0)
     bonus   = doc.get("bonus", 0)
+    net     = max(0, total - left)
     embed = discord.Embed(
         title=f"📨 {member.display_name}'s Invites",
         color=discord.Color.blurple(),
     )
     embed.add_field(name="Total",   value=str(total),   inline=True)
+    embed.add_field(name="Net",     value=str(net),     inline=True)
     embed.add_field(name="Regular", value=str(regular), inline=True)
     embed.add_field(name="Left",    value=str(left),    inline=True)
     embed.add_field(name="Fake",    value=str(fake),    inline=True)
@@ -5637,7 +5835,8 @@ async def invites_cmd(ctx: commands.Context, member: discord.Member = None):
 @staff_tier_check(TIER_TRIAL)
 async def invitelb_cmd(ctx: commands.Context):
     """Top 10 inviters in this server."""
-    rows = await bot.db.get_invite_leaderboard(ctx.guild.id, limit=10)
+    rows = await get_cached_leaderboard("invites", ctx.guild.id, 10,
+                                         lambda: bot.db.get_invite_leaderboard(ctx.guild.id, limit=10))
     if not rows:
         await send_reply(ctx, "No invite data yet.")
         return
@@ -5866,7 +6065,7 @@ async def gstart_cmd(ctx: commands.Context, duration: str, winners: int, *, priz
             f"**Hosted by:** {ctx.author.mention}"
         ),
     )
-    embed.set_footer(text=f"Ends at")
+    embed.set_footer(text="Ends at")
     embed.timestamp = ends_at
     msg = await ctx.send(embed=embed)
     await msg.add_reaction(GIVEAWAY_EMOJI)
@@ -6063,13 +6262,14 @@ async def on_reaction_remove(reaction: discord.Reaction, user: discord.User):
 @staff_tier_check(TIER_TRIAL)
 async def userinfo_cmd(ctx: commands.Context, member: discord.Member = None):
     member = member or ctx.author
-    data   = await bot.db.get_level_data(member.id, ctx.guild.id)
-    warns  = await bot.db.get_warns(ctx.guild.id, member.id)
-    config = await get_config(ctx.guild.id, bot.db)
+    data, warns, config, invite = await asyncio.gather(
+        bot.db.get_level_data(member.id, ctx.guild.id),
+        bot.db.get_warns(ctx.guild.id, member.id),
+        get_config(ctx.guild.id, bot.db),
+        bot.db.invites.find_one({"guild_id": ctx.guild.id, "inviter_id": member.id, "invite_code": "__total__"}),
+    )
+    invite = invite or {}
     decay_days = config.get("warn_decay_days", 0)
-    invite = await bot.db.invites.find_one(
-        {"guild_id": ctx.guild.id, "inviter_id": member.id, "invite_code": "__total__"}
-    ) or {}
 
     level  = calculate_level(data.get("total_xp", 0))[0] if data else 0
     joined_at = member.joined_at
