@@ -426,21 +426,25 @@ class Database:
             lambda: self.levels.find_one({"user_id": uid, "guild_id": gid})
         ) or {}
 
-    async def add_xp(self, uid: int, gid: int, xp: int) -> dict:
+    async def add_xp(self, uid: int, gid: int, xp: int, is_message: bool = False) -> dict:
         """
         Award XP to a user. Handles streak logic and returns a result dict:
           {total_xp, level, messages, xp_in, xp_need, leveled, old_level, streak, streak_bonus}
+
+        Pass is_message=True only when XP comes from an actual chat message — this
+        is the flag that gates the 'first_message' / message-count achievements so
+        they don't fire on join, boost, or voice XP.
         """
         doc = await self.levels.find_one({"user_id": uid, "guild_id": gid})
         now = datetime.now(timezone.utc)
         if doc:
             total_xp  = doc.get("total_xp", 0) + xp
-            messages  = doc.get("messages", 0) + 1
+            messages  = doc.get("messages", 0) + (1 if is_message else 0)
             old_level = calculate_level(doc.get("total_xp", 0))[0]
             lmd       = doc.get("last_message_date")
             streak    = doc.get("streak", 0)
             sb        = False
-            if lmd:
+            if is_message and lmd:
                 if lmd.tzinfo is None:
                     lmd = lmd.replace(tzinfo=timezone.utc)
                 diff = (now.date() - lmd.date()).days
@@ -450,20 +454,24 @@ class Database:
                     streak = 1
                 else:
                     streak = doc.get("streak", 1)
+            elif not is_message:
+                streak = doc.get("streak", 0)
             else:
                 streak = 1
         else:
-            total_xp = xp; messages = 1; old_level = 0; streak = 1; sb = False
+            total_xp = xp; messages = 1 if is_message else 0; old_level = 0; streak = 1 if is_message else 0; sb = False
 
         if sb:
             total_xp += STREAK_BONUS_XP
         new_level, xp_in, xp_need = calculate_level(total_xp)
+        fields = {"total_xp": total_xp, "level": new_level, "last_xp_time": now}
+        if is_message:
+            fields["messages"] = messages
+            fields["last_message_date"] = now
+            fields["streak"] = streak
         await self.levels.update_one(
             {"user_id": uid, "guild_id": gid},
-            {"$set": {
-                "total_xp": total_xp, "level": new_level, "messages": messages,
-                "last_xp_time": now, "last_message_date": now, "streak": streak,
-            }},
+            {"$set": fields},
             upsert=True,
         )
         return {
@@ -1608,6 +1616,7 @@ async def handle_automod_violation(message: discord.Message, config: dict, reaso
 
     await bot.db.add_warn(message.guild.id, message.author.id, bot.user.id, f"Automod: {reason}", source="automod")
     await _persist_automod_event(message.guild.id, message.author.id, reason)  # persist to MongoDB for cross-restart visibility
+
     active = await bot.db.get_active_automod_warns(message.guild.id, message.author.id)
     mute_seconds = _escalation_for_warns(active)
 
@@ -1622,6 +1631,24 @@ async def handle_automod_violation(message: discord.Message, config: dict, reaso
         except discord.Forbidden:
             action_value = "⚠️ Tried to mute — missing permissions"
 
+    # Always post a public notice in the channel so the user (and others) see why.
+    public_notice = f"🛡️ {message.author.mention} — your message was removed: **{reason}**."
+    if action_value:
+        public_notice += f"\n{action_value} (automod warn #{active} in 24h)"
+    else:
+        public_notice += f" (automod warn #{active} in 24h)"
+    try:
+        await message.channel.send(public_notice, delete_after=30)
+    except discord.HTTPException:
+        pass
+
+    # DM the user so they know even if they missed the channel notice.
+    dm_text = f"Your message in **#{message.channel.name}** ({message.guild.name}) was removed — **{reason}**."
+    if action_value:
+        dm_text += f"\nYou were also muted for **{_format_duration(mute_seconds)}** as a result. (Automod warn #{active} in 24h)"
+    await send_dm_embed(message.author, dm_text, title="🛡️ Automod Action", color=discord.Color.dark_orange())
+
+    # Send the staff log embed if a log channel is configured.
     log_chan_id = config.get("automod_log_channel") or config.get("modlog_channel")
     if log_chan_id:
         chan = message.guild.get_channel(log_chan_id)
@@ -1641,17 +1668,6 @@ async def handle_automod_violation(message: discord.Message, config: dict, reaso
                 await chan.send(embed=embed)
             except discord.HTTPException:
                 pass
-    else:
-        # No log channel configured at all — still make sure the action is
-        # VISIBLE somewhere instead of a message just silently disappearing.
-        # Short-lived notice right in the channel it happened in.
-        notice = f"🛡️ Removed a message from {message.author.mention} — **{reason}**."
-        if action_value:
-            notice += f" {action_value}"
-        try:
-            await message.channel.send(notice, delete_after=30)
-        except discord.HTTPException:
-            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3808,7 +3824,7 @@ async def on_message(message: discord.Message):
     if now - last >= XP_COOLDOWN_SEC:
         bot._xp_cooldowns[key] = now
         xp = xp_from_length(message.content)
-        result = await bot.db.add_xp(message.author.id, message.guild.id, xp)
+        result = await bot.db.add_xp(message.author.id, message.guild.id, xp, is_message=True)
         await bot.db.track_message(message.author.id, message.guild.id, message.channel.id)
 
         if result["leveled"]:
@@ -4016,6 +4032,16 @@ async def on_member_join(member: discord.Member):
         await bot.db.record_member_inviter(member.guild.id, member.id, inviter.id, used_invite.code)
         invite_total = await bot.db.get_invite_count(member.guild.id, inviter.id)
 
+    # Persist join event so .analytics joins can query historical data.
+    try:
+        await bot.db._client["ajscrib"]["join_log"].insert_one({
+            "guild_id": member.guild.id,
+            "user_id": member.id,
+            "joined_at": datetime.now(timezone.utc),
+        })
+    except Exception as e:
+        logger.warning("Failed to write join_log for %s: %s", member.id, e)
+
     embed = discord.Embed(
         title="📥 Member Joined",
         color=discord.Color.green(),
@@ -4068,6 +4094,16 @@ async def on_member_remove(member: discord.Member):
         logger.error("Stats refresh on remove failed: %s", e)
 
     config = await get_config(member.guild.id, bot.db)
+
+    # Persist leave event so .analytics joins can query historical data.
+    try:
+        await bot.db._client["ajscrib"]["leave_log"].insert_one({
+            "guild_id": member.guild.id,
+            "user_id": member.id,
+            "left_at": datetime.now(timezone.utc),
+        })
+    except Exception as e:
+        logger.warning("Failed to write leave_log for %s: %s", member.id, e)
 
     leave_embed = discord.Embed(
         title="📤 Member Left",
@@ -4492,8 +4528,7 @@ async def help_cmd(ctx: commands.Context, category: str = None):
                 f"`{PREFIX}afk [reason]` — mark yourself away (persists across restarts)\n"
                 f"Clears automatically the moment you send another message\n"
                 f"Anyone who @mentions you while you're AFK gets a heads-up\n"
-                f"`{PREFIX}userinfo [@user]` / `{PREFIX}serverinfo`\n"
-                f"`{PREFIX}snipe` — last deleted message in this channel"
+                f"`{PREFIX}userinfo [@user]` / `{PREFIX}serverinfo`"
             ),
         },
     }
@@ -4982,6 +5017,10 @@ async def kick_cmd(ctx: commands.Context, member: discord.Member, *, reason: str
         return
     if not await _confirm_destructive_action(ctx, action_emoji="👋", action_title="Kick", member=member, reason=reason):
         return
+    # DM before kicking so the message can be delivered while they're still in the server.
+    await send_dm_embed(member,
+        f"You have been kicked from **{ctx.guild.name}** — {reason}",
+        title="👋 Kicked", color=discord.Color.orange())
     try:
         await member.kick(reason=reason)
     except discord.Forbidden:
@@ -5002,6 +5041,10 @@ async def ban_cmd(ctx: commands.Context, member: discord.Member, *, reason: str 
         return
     if not await _confirm_destructive_action(ctx, action_emoji="🔨", action_title="Ban", member=member, reason=reason):
         return
+    # DM before banning so the message can be delivered while they're still in the server.
+    await send_dm_embed(member,
+        f"You have been banned from **{ctx.guild.name}** — {reason}",
+        title="🔨 Banned", color=discord.Color.red())
     try:
         await member.ban(reason=reason)
     except discord.Forbidden:
@@ -5075,6 +5118,9 @@ async def mute_cmd(ctx: commands.Context, member: discord.Member, duration: str 
     await bot.db.log_staff_action(ctx.guild.id, ctx.author.id, "mute", member.id)
     await send_reply(ctx, f"🔇 muted {member.mention} for `{duration}` — {reason}")
     await post_modlog(ctx.guild, f"🔇 Mute ({duration})", ctx.author, member, reason, case_num, discord.Color.dark_orange())
+    await send_dm_embed(member,
+        f"You have been muted in **{ctx.guild.name}** for `{duration}` — {reason}",
+        title="🔇 Muted", color=discord.Color.dark_orange())
 
 
 @bot.command(name="unmute")
@@ -5090,6 +5136,9 @@ async def unmute_cmd(ctx: commands.Context, member: discord.Member, *, reason: s
     case_num = await bot.db.add_case(ctx.guild.id, "unmute", ctx.author.id, member.id, reason)
     await send_reply(ctx, f"🔊 unmuted {member.mention} — {reason}")
     await post_modlog(ctx.guild, "🔊 Unmute", ctx.author, member, reason, case_num, discord.Color.green())
+    await send_dm_embed(member,
+        f"Your mute in **{ctx.guild.name}** has been lifted — {reason}",
+        title="🔊 Unmuted", color=discord.Color.green())
 
 
 @bot.command(name="tempban")
@@ -5109,6 +5158,10 @@ async def tempban_cmd(ctx: commands.Context, member: discord.Member, duration: s
         extra=f"\n**Duration:** `{duration}` (unbans <t:{int(unban_at.timestamp())}:R>)",
     ):
         return
+    # DM before banning so the message can be delivered while they're still in the server.
+    await send_dm_embed(member,
+        f"You have been temporarily banned from **{ctx.guild.name}** for `{duration}` — {reason}\nYou will be unbanned <t:{int(unban_at.timestamp())}:R>.",
+        title="⛔ Tempbanned", color=discord.Color.dark_red())
     try:
         await member.ban(reason=reason)
     except discord.Forbidden:
@@ -5524,12 +5577,49 @@ async def analytics_cmd(ctx: commands.Context, subcommand: str = "growth", days:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         join_col = bot.db._client["ajscrib"]["join_log"]
         leave_col = bot.db._client["ajscrib"]["leave_log"]
-        join_count = await join_col.count_documents({"guild_id": ctx.guild.id, "joined_at": {"$gte": cutoff}})
-        leave_count = await leave_col.count_documents({"guild_id": ctx.guild.id, "left_at": {"$gte": cutoff}})
-        net = join_count - leave_count
-        embed = discord.Embed(title=f"📥 Join/Leave Trends (last {days}d)", color=discord.Color.blurple())
-        embed.add_field(name="Joins", value=str(join_count), inline=True)
-        embed.add_field(name="Leaves", value=str(leave_count), inline=True)
+
+        # Aggregate joins per day.
+        join_pipeline = [
+            {"$match": {"guild_id": ctx.guild.id, "joined_at": {"$gte": cutoff}}},
+            {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$joined_at"}}, "count": {"$sum": 1}}},
+            {"$sort": {"_id": 1}},
+        ]
+        # Aggregate leaves per day.
+        leave_pipeline = [
+            {"$match": {"guild_id": ctx.guild.id, "left_at": {"$gte": cutoff}}},
+            {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$left_at"}}, "count": {"$sum": 1}}},
+            {"$sort": {"_id": 1}},
+        ]
+        join_rows  = await join_col.aggregate(join_pipeline).to_list(length=days)
+        leave_rows = await leave_col.aggregate(leave_pipeline).to_list(length=days)
+
+        joins_by_day  = {r["_id"]: r["count"] for r in join_rows}
+        leaves_by_day = {r["_id"]: r["count"] for r in leave_rows}
+        all_days = sorted(set(joins_by_day) | set(leaves_by_day))
+
+        total_joins  = sum(joins_by_day.values())
+        total_leaves = sum(leaves_by_day.values())
+        net = total_joins - total_leaves
+
+        if not all_days:
+            await send_reply(ctx, f"📊 No join/leave data for the last {days}d yet — data is recorded from now on.")
+            return
+
+        lines = []
+        for day in all_days[-25:]:  # cap at 25 lines to stay within embed limits
+            j = joins_by_day.get(day, 0)
+            l = leaves_by_day.get(day, 0)
+            n = j - l
+            n_str = f"+{n}" if n > 0 else str(n)
+            lines.append(f"`{day}` ➔ 📥 {j} in  📤 {l} out  ({n_str})")
+
+        embed = discord.Embed(
+            title=f"📥 Join/Leave Trends (last {days}d)",
+            color=discord.Color.blurple(),
+            description="\n".join(lines),
+        )
+        embed.add_field(name="Total Joins",  value=str(total_joins),  inline=True)
+        embed.add_field(name="Total Leaves", value=str(total_leaves), inline=True)
         embed.add_field(name="Net", value=f"{'+' if net >= 0 else ''}{net}", inline=True)
         await ctx.send(embed=embed)
 
@@ -5701,44 +5791,6 @@ async def config_cmd(ctx: commands.Context, key: str = None, value: str = None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  COMMANDS — snipe
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_snipe_cache: dict[int, dict] = {}  # channel_id -> {content, author_id, author_name, avatar, deleted_at}
-
-
-@bot.listen("on_message_delete")
-async def _cache_snipe(message: discord.Message):
-    if message.author.bot or not message.content:
-        return
-    _snipe_cache[message.channel.id] = {
-        "content":     message.content,
-        "author_id":   message.author.id,
-        "author_name": str(message.author),
-        "avatar":      message.author.display_avatar.url,
-        "deleted_at":  datetime.now(timezone.utc),
-    }
-
-
-@bot.command(name="snipe")
-@staff_tier_check(TIER_TRIAL)
-async def snipe_cmd(ctx: commands.Context):
-    """Show the last deleted message in this channel."""
-    cached = _snipe_cache.get(ctx.channel.id)
-    if not cached:
-        await send_reply(ctx, "Nothing to snipe in this channel.")
-        return
-    embed = discord.Embed(
-        description=cached["content"][:2000],
-        color=discord.Color.dark_grey(),
-        timestamp=cached["deleted_at"],
-    )
-    embed.set_author(name=cached["author_name"], icon_url=cached["avatar"])
-    embed.set_footer(text=f"Deleted • sniped by {ctx.author}")
-    await ctx.send(embed=embed)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 #  COMMANDS — slowmode / softban
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -5782,6 +5834,10 @@ async def softban_cmd(ctx: commands.Context, member: discord.Member, delete_days
         extra=f"\n**Message prune:** {delete_days}d",
     ):
         return
+    # DM before banning so the message can be delivered while they're still in the server.
+    await send_dm_embed(member,
+        f"You have been softbanned from **{ctx.guild.name}** (your recent messages were wiped, but you are not permanently banned) — {reason}",
+        title="🧹 Softbanned", color=discord.Color.orange())
     try:
         # delete_message_seconds is the current discord.py API — delete_message_days
         # is deprecated and not guaranteed to keep working across library versions.
