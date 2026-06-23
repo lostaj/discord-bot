@@ -21,7 +21,7 @@ import time
 import random
 import asyncio
 import logging
-from collections import defaultdict, deque
+from collections import defaultdict, deque, OrderedDict
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -300,6 +300,8 @@ class Database:
         self.afk             = _RetryingCollection(db["afk"])  # persisted AFK state — survives restarts
         self.containments    = _RetryingCollection(db["containments"])  # per-user anti-nuke containment snapshots
         self.automod_events  = _RetryingCollection(db["automod_events"])  # persisted spam/flood history for cross-restart continuity
+        self.channel_locks   = _RetryingCollection(db["channel_locks"])  # per-channel lockdown permission snapshots — survive restarts mid-lockdown
+        self.antinuke_strikes = _RetryingCollection(db["antinuke_strikes"])  # persistent lifetime trip count per user, for escalation
 
     @property
     def db(self):
@@ -362,6 +364,8 @@ class Database:
             await self.containments.create_index([("guild_id", 1), ("user_id", 1)], unique=True)
             await self.automod_events.create_index([("guild_id", 1), ("user_id", 1)], unique=True)
             await self.automod_events.create_index("updated_at", expireAfterSeconds=3600)  # auto-expire after 1h
+            await self.channel_locks.create_index("channel_id", unique=True)
+            await self.antinuke_strikes.create_index([("guild_id", 1), ("user_id", 1)], unique=True)
             logger.info("Indexes ready")
         except Exception as exc:
             logger.error("Index error: %s", exc)
@@ -1020,6 +1024,83 @@ class Database:
 
     async def get_all_containments(self, gid: int) -> list[dict]:
         return await self.containments.find({"guild_id": gid}).to_list(length=200)
+
+    # ── Anti-nuke lifetime strike counter (separate from containment/warns) ──
+    # Containment records get deleted on `.release`, and warns can be cleared
+    # with `.clearwarns` — neither is a reliable place to track "how many
+    # times has this person ever tripped anti-nuke", which is exactly what
+    # escalation needs. This is its own small, permanent counter.
+
+    async def increment_antinuke_strikes(self, gid: int, uid: int) -> int:
+        doc = await self.antinuke_strikes.find_one_and_update(
+            {"guild_id": gid, "user_id": uid},
+            {"$inc": {"count": 1}, "$set": {"last_at": datetime.now(timezone.utc)}},
+            upsert=True, return_document=True,
+        )
+        return doc["count"]
+
+    async def get_antinuke_strikes(self, gid: int, uid: int) -> int:
+        doc = await self.antinuke_strikes.find_one({"guild_id": gid, "user_id": uid})
+        return doc["count"] if doc else 0
+
+    async def reset_antinuke_strikes(self, gid: int, uid: int):
+        await self.antinuke_strikes.delete_one({"guild_id": gid, "user_id": uid})
+
+    # ── Channel lockdown snapshots (survive bot restarts) ───────────────────
+    # `_channel_lock_snapshots` (in-memory) is fast but vanishes on restart,
+    # which used to mean `.unlock` had nothing to restore if the bot redeployed
+    # mid-lockdown — the channel would stay locked forever with no original
+    # overwrites on record. These mirror every lock to the DB so the exact
+    # pre-lock permissions are always recoverable, even after a restart.
+
+    @staticmethod
+    def _serialize_overwrites(snapshot: dict) -> list[dict]:
+        out = []
+        for target, overwrite in snapshot.items():
+            kind = "role" if isinstance(target, discord.Role) else "member"
+            allow, deny = overwrite.pair()
+            out.append({
+                "target_id": target.id,
+                "kind": kind,
+                "allow": allow.value,
+                "deny": deny.value,
+            })
+        return out
+
+    async def save_channel_lock(self, channel_id: int, guild_id: int, snapshot: dict):
+        await self.channel_locks.update_one(
+            {"channel_id": channel_id},
+            {"$set": {"channel_id": channel_id, "guild_id": guild_id,
+                      "overwrites": self._serialize_overwrites(snapshot),
+                      "locked_at": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+
+    async def get_channel_lock(self, channel_id: int) -> Optional[dict]:
+        return await self.channel_locks.find_one({"channel_id": channel_id})
+
+    async def delete_channel_lock(self, channel_id: int):
+        await self.channel_locks.delete_one({"channel_id": channel_id})
+
+    async def get_all_channel_locks(self, guild_id: int) -> list[dict]:
+        return await self.channel_locks.find({"guild_id": guild_id}).to_list(length=500)
+
+    async def set_guild_lockdown_state(self, guild_id: int, channel_ids: list[int]):
+        db = self._client["ajscrib"]
+        await db["guild_lockdown_state"].update_one(
+            {"guild_id": guild_id},
+            {"$set": {"guild_id": guild_id, "channel_ids": channel_ids,
+                      "started_at": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+
+    async def get_guild_lockdown_state(self, guild_id: int) -> Optional[dict]:
+        db = self._client["ajscrib"]
+        return await db["guild_lockdown_state"].find_one({"guild_id": guild_id})
+
+    async def clear_guild_lockdown_state(self, guild_id: int):
+        db = self._client["ajscrib"]
+        await db["guild_lockdown_state"].delete_one({"guild_id": guild_id})
 
     # ── Reaction Roles ────────────────────────────────────────────────────────
 
@@ -1777,13 +1858,13 @@ async def validate_mod_target(ctx: commands.Context, target: discord.Member) -> 
     Sends a clear reason and returns False if the action should be blocked —
     callers should `return` immediately when this returns False. Without this,
     any Trial Mod could `.ban` a Senior Mod or the bot itself with no pushback."""
+    if target.id == bot.user.id:
+        await send_reply(ctx, "bro leave me out of it 💀")
+        return False
     if ctx.author.guild_permissions.administrator:
         return True
     if target.id == ctx.author.id:
         await send_reply(ctx, "you can't do that to yourself lol")
-        return False
-    if target.id == bot.user.id:
-        await send_reply(ctx, "bro leave me out of it 💀")
         return False
     if ctx.guild.owner_id and target.id == ctx.guild.owner_id:
         await send_reply(ctx, "can't touch the owner, not doing that")
@@ -1824,10 +1905,52 @@ ANTINUKE_THRESHOLDS = {
     "webhook":   1,   # zero tolerance — any unrecognized webhook creation trips it
     "permgrant": 1,   # zero tolerance — any single admin-perm grant trips it
 }
-ANTINUKE_SAFETY_MUTE_SECONDS = 3600  # 60 minutes, on top of the role strip
+ANTINUKE_SAFETY_MUTE_SECONDS = 3600  # 60 minutes, on top of the role strip — used for a 1st-time trip
+
+# Escalation ladder: lifetime strike count -> timeout duration on this trip.
+# A "strike" is permanent (survives `.release` and bot restarts) — only an
+# explicit `.antinukereset` clears it. So someone who trips anti-nuke,
+# gets released, then trips it again shortly after gets hit harder, not
+# the same slap on the wrist every time.
+ANTINUKE_ESCALATION = {
+    1: timedelta(hours=1),
+    2: timedelta(hours=12),
+    3: timedelta(days=3),
+}
+ANTINUKE_ESCALATION_MAX = timedelta(days=28)  # Discord's hard cap on timeouts; strike 4+ lands here
+
+
+def _format_escalation_duration(d: timedelta) -> str:
+    total_seconds = int(d.total_seconds())
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes and not days:  # keep it short once we're talking days
+        parts.append(f"{minutes}m")
+    return " ".join(parts) if parts else "0m"
 
 _antinuke_log: dict[tuple[int, int, str], deque] = defaultdict(lambda: deque(maxlen=20))
-_antinuke_recent_targets: set[tuple[int, int]] = set()  # (guild_id, audit_entry_id) dedupe
+_antinuke_recent_targets: "OrderedDict[tuple[int, int], None]" = OrderedDict()  # (guild_id, audit_entry_id) dedupe, oldest-first
+_ANTINUKE_DEDUPE_MAX = 500
+
+
+def _antinuke_seen_recently(dedupe_key: tuple[int, int]) -> bool:
+    """True if this exact audit-log entry was already processed. Evicts only
+    the single oldest entry once the cap is hit, instead of wiping the whole
+    set — clearing everything at once would briefly remove dedupe protection
+    for every guild at the same moment, risking duplicate strikes from one
+    audit-log entry being matched twice in quick succession."""
+    if dedupe_key in _antinuke_recent_targets:
+        return True
+    _antinuke_recent_targets[dedupe_key] = None
+    if len(_antinuke_recent_targets) > _ANTINUKE_DEDUPE_MAX:
+        _antinuke_recent_targets.popitem(last=False)
+    return False
 
 
 def _antinuke_record(gid: int, uid: int, action: str) -> int:
@@ -1859,13 +1982,16 @@ async def _antinuke_find_executor(guild: discord.Guild, action: discord.AuditLog
 _contained_members: dict[tuple[int, int], dict] = {}  # (guild_id, user_id) -> snapshot for restore
 
 
-async def antinuke_contain(member: discord.Member, reason: str) -> list[str]:
+async def antinuke_contain(member: discord.Member, reason: str, duration: timedelta = None) -> list[str]:
     """Instantly strips ALL roles from this one member (snapshotting them
-    first for exact restore later) and times them out. Nothing server-wide is
-    touched — every other member, role, and channel is completely unaffected.
-    Safe to call even if they're already contained (no-op). The snapshot is
-    written to the database (not just kept in memory), so a bot restart while
-    someone is contained can never lose the ability to restore them."""
+    first for exact restore later) and times them out for `duration` (default
+    60 minutes if not given). Nothing server-wide is touched — every other
+    member, role, and channel is completely unaffected. Safe to call even if
+    they're already contained (no-op). The snapshot is written to the
+    database (not just kept in memory), so a bot restart while someone is
+    contained can never lose the ability to restore them."""
+    if duration is None:
+        duration = timedelta(seconds=ANTINUKE_SAFETY_MUTE_SECONDS)
     key = (member.guild.id, member.id)
     if key in _contained_members:
         return []
@@ -1881,7 +2007,7 @@ async def antinuke_contain(member: discord.Member, reason: str) -> list[str]:
         if role_ids:
             await member.remove_roles(*[member.guild.get_role(rid) for rid in role_ids if member.guild.get_role(rid)],
                                        reason=f"Anti-nuke containment: {reason}")
-        await member.timeout(timedelta(seconds=ANTINUKE_SAFETY_MUTE_SECONDS), reason=f"Anti-nuke containment: {reason}")
+        await member.timeout(duration, reason=f"Anti-nuke containment: {reason}")
     except discord.Forbidden:
         pass
     return removed_names
@@ -1923,21 +2049,38 @@ async def antinuke_punish(guild: discord.Guild, executor: discord.abc.User, reas
     config = await get_config(guild.id, bot.db)
     member = guild.get_member(executor.id)
 
+    # Escalation: each trip permanently increments a lifetime strike counter
+    # (independent of containment/warns, which can be released/cleared), and
+    # the timeout duration on THIS trip scales with how many times they've
+    # tripped anti-nuke before. A first-time false-positive gets a light 1h
+    # timeout; someone tripping it repeatedly gets hit progressively harder,
+    # up to Discord's 28-day timeout cap.
+    strikes = await bot.db.increment_antinuke_strikes(guild.id, executor.id)
+    duration = ANTINUKE_ESCALATION.get(strikes, ANTINUKE_ESCALATION_MAX)
+
     stripped = []
     if member:
-        stripped = await antinuke_contain(member, reason)
+        stripped = await antinuke_contain(member, reason, duration=duration)
         await bot.db.add_warn(guild.id, executor.id, bot.user.id, f"Anti-nuke: {reason}", source="antinuke")
 
+    duration_str = _format_escalation_duration(duration)
     alert_id = config.get("log_alerts_channel") or config.get("modlog_channel")
     chan = guild.get_channel(alert_id) if alert_id else None
     if chan:
+        escalation_note = (
+            f"🔺 **Strike #{strikes}** for this user — timeout escalated to **{duration_str}**."
+            if strikes > 1 else
+            f"First strike for this user — standard **{duration_str}** timeout."
+        )
         embed = discord.Embed(
             title="🚨 ANTI-NUKE TRIGGERED", color=discord.Color.dark_red(),
             description=(
                 f"**{executor}** (`{executor.id}`) tripped anti-nuke: **{reason}**.\n\n"
+                f"{escalation_note}\n"
                 f"{'🔒 Roles stripped (snapshotted for restore): ' + ', '.join(stripped) if stripped else '⚠️ No roles to strip, or they already left.'}\n"
-                f"{'🔇 Contained — timed out 60m. Only this account is affected, nothing server-wide.' if member else '⚠️ Not currently in the server — could not contain.'}\n\n"
-                f"**Review immediately.** If this was a false positive, run `{PREFIX}release <user_id>` to restore them exactly as they were."
+                f"{f'🔇 Contained — timed out {duration_str}. Only this account is affected, nothing server-wide.' if member else '⚠️ Not currently in the server — could not contain.'}\n\n"
+                f"**Review immediately.** If this was a false positive, run `{PREFIX}release <user_id>` to restore them exactly as they were "
+                f"and `{PREFIX}antinukereset <user_id>` to clear their strike history so the next trip isn't escalated unfairly."
             ),
         )
         owner_mention = guild.owner.mention if guild.owner else (f"<@{guild.owner_id}>" if guild.owner_id else "")
@@ -1949,11 +2092,12 @@ async def antinuke_punish(guild: discord.Guild, executor: discord.abc.User, reas
         await send_dm_embed(
             member,
             f"Anti-nuke contained your account in **{guild.name}** — your roles were stripped "
-            f"(snapshotted, fully restorable) and you were timed out for safety. Reason: {reason}. "
+            f"(snapshotted, fully restorable) and you were timed out for {duration_str}. Reason: {reason}. "
             f"If this was a mistake, contact a Senior Moderator/Admin to get released.",
             title="🚨 Anti-Nuke Containment", color=discord.Color.dark_red(),
         )
-    logger.warning("ANTI-NUKE: %s tripped '%s' in guild %s", executor, reason, guild.id)
+    logger.warning("ANTI-NUKE: %s tripped '%s' in guild %s (strike #%d, timeout %s)",
+                    executor, reason, guild.id, strikes, duration_str)
 
 
 # ── Manual channel lockdown (snapshot-based, fully reversible) ──────────────
@@ -1965,11 +2109,17 @@ async def lock_channel(channel: discord.abc.GuildChannel, reason: str) -> bool:
     """Snapshots every existing permission overwrite on this channel exactly as
     it is, then denies send_messages/connect for @everyone. `.unlock` restores
     the precise original overwrites afterward — nothing is guessed or reset
-    to defaults."""
+    to defaults. The snapshot is written to the database (not just kept in
+    memory), so a bot restart mid-lockdown can never lose the ability to
+    restore the channel's original permissions."""
     if channel.id in _channel_lock_snapshots:
         return False
+    existing = await bot.db.get_channel_lock(channel.id)
+    if existing:
+        return False  # already locked (e.g. from before a restart) — don't re-snapshot the locked state
     snapshot = {key: overwrite for key, overwrite in channel.overwrites.items()}
     _channel_lock_snapshots[channel.id] = snapshot
+    await bot.db.save_channel_lock(channel.id, channel.guild.id, snapshot)
     default_role = channel.guild.default_role
     new_overwrite = channel.overwrites_for(default_role)
     if isinstance(channel, discord.VoiceChannel):
@@ -1983,11 +2133,29 @@ async def lock_channel(channel: discord.abc.GuildChannel, reason: str) -> bool:
     return True
 
 
+def _deserialize_overwrites(channel: discord.abc.GuildChannel, doc: dict) -> dict:
+    guild = channel.guild
+    snapshot = {}
+    for entry in doc.get("overwrites", []):
+        target = guild.get_role(entry["target_id"]) if entry["kind"] == "role" else guild.get_member(entry["target_id"])
+        if target is None:
+            continue
+        snapshot[target] = discord.PermissionOverwrite.from_pair(
+            discord.Permissions(entry["allow"]), discord.Permissions(entry["deny"])
+        )
+    return snapshot
+
+
 async def unlock_channel(channel: discord.abc.GuildChannel) -> bool:
-    """Restores the exact overwrites a channel had before `lock_channel`."""
+    """Restores the exact overwrites a channel had before `lock_channel`.
+    Checks the database first (not just the in-memory cache), so this still
+    works correctly even if the bot restarted since the channel was locked."""
     snapshot = _channel_lock_snapshots.pop(channel.id, None)
     if snapshot is None:
-        return False
+        doc = await bot.db.get_channel_lock(channel.id)
+        if doc is None:
+            return False
+        snapshot = _deserialize_overwrites(channel, doc)
     try:
         for target, overwrite in snapshot.items():
             await channel.set_permissions(target, overwrite=overwrite, reason="🔓 Lock lifted — restored exactly")
@@ -1997,6 +2165,7 @@ async def unlock_channel(channel: discord.abc.GuildChannel) -> bool:
             await channel.set_permissions(target, overwrite=None, reason="🔓 Lock lifted — restored exactly")
     except discord.Forbidden:
         pass
+    await bot.db.delete_channel_lock(channel.id)
     return True
 
 
@@ -2014,29 +2183,42 @@ _guild_lockdown_state: dict[int, set[int]] = {}  # guild_id -> set of channel_id
 async def serverwide_lockdown(guild: discord.Guild, reason: str) -> int:
     """Locks every text channel not already individually locked. Returns the
     number of channels newly locked. Safe to call repeatedly (won't double
-    snapshot, won't touch channels already locked via `.lockdown`)."""
+    snapshot, won't touch channels already locked via `.lockdown`). The set of
+    channels locked by THIS lockdown is persisted, so `.serverunlock` and
+    `is_in_lockdown` still work correctly even if the bot restarts mid-lockdown."""
     if guild.id in _guild_lockdown_state:
         return 0  # already in server-wide lockdown
+    existing = await bot.db.get_guild_lockdown_state(guild.id)
+    if existing:
+        _guild_lockdown_state[guild.id] = set(existing["channel_ids"])
+        return 0  # already in server-wide lockdown (e.g. from before a restart)
     locked_ids: set[int] = set()
     for channel in guild.text_channels:
         ok = await lock_channel(channel, reason)
         if ok:
             locked_ids.add(channel.id)
     _guild_lockdown_state[guild.id] = locked_ids
+    await bot.db.set_guild_lockdown_state(guild.id, list(locked_ids))
     return len(locked_ids)
 
 
 async def serverwide_unlock(guild: discord.Guild) -> int:
     """Restores every channel that THIS server-wide lockdown locked (and only
-    those — a channel separately `.lockdown`-ed by staff stays locked)."""
+    those — a channel separately `.lockdown`-ed by staff stays locked).
+    Checks the database first (not just the in-memory cache), so this still
+    works correctly even if the bot restarted since the lockdown started."""
     locked_ids = _guild_lockdown_state.pop(guild.id, None)
-    if not locked_ids:
-        return 0
+    if locked_ids is None:
+        doc = await bot.db.get_guild_lockdown_state(guild.id)
+        if not doc:
+            return 0
+        locked_ids = set(doc["channel_ids"])
     restored = 0
     for channel_id in locked_ids:
         channel = guild.get_channel(channel_id)
         if channel and await unlock_channel(channel):
             restored += 1
+    await bot.db.clear_guild_lockdown_state(guild.id)
     return restored
 
 
@@ -2059,11 +2241,8 @@ async def antinuke_check(guild: discord.Guild, config_key: str, action_type: str
     if entry is None:
         return
     dedupe_key = (guild.id, entry.id)
-    if dedupe_key in _antinuke_recent_targets:
+    if _antinuke_seen_recently(dedupe_key):
         return
-    _antinuke_recent_targets.add(dedupe_key)
-    if len(_antinuke_recent_targets) > 500:
-        _antinuke_recent_targets.clear()
 
     count = _antinuke_record(guild.id, entry.user.id, action_type)
     if count >= ANTINUKE_THRESHOLDS[action_type]:
@@ -2185,6 +2364,23 @@ class AjsCrib(commands.Bot):
             logger.info("Restored %d AFK entr%s from the database", len(self._afk), "y" if len(self._afk) == 1 else "ies")
         except Exception as exc:
             logger.warning("Could not warm AFK cache from DB: %s", exc)
+
+        # Warm the in-memory guild-lockdown cache from the DB — without this,
+        # `is_in_lockdown()` and `.serverunlock` would report "not locked down"
+        # right after a restart even while a server-wide lockdown was still
+        # active, even though the per-channel permission snapshots themselves
+        # were already safely persisted.
+        try:
+            restored_lockdowns = 0
+            for guild in self.guilds:
+                doc = await self.db.get_guild_lockdown_state(guild.id)
+                if doc:
+                    _guild_lockdown_state[guild.id] = set(doc["channel_ids"])
+                    restored_lockdowns += 1
+            if restored_lockdowns:
+                logger.info("Restored %d active server-wide lockdown(s) from the database", restored_lockdowns)
+        except Exception as exc:
+            logger.warning("Could not warm lockdown state from DB: %s", exc)
 
         # Warm the in-memory spam-history cache from recent MongoDB automod events.
         # This means members who were spamming before a bot restart don't get a
@@ -3483,34 +3679,44 @@ class StatsChannelsView(discord.ui.View):
 
 
 class SetupHubSelect(discord.ui.Select):
-    def __init__(self):
+    def __init__(self, config: dict = None):
+        config = config or {}
+
+        def mark(key: str) -> str:
+            val = config.get(key)
+            done = bool(val) if not isinstance(val, list) else len(val) > 0
+            return "✅ " if done else ""
+
+        def mark_any(*keys: str) -> str:
+            return "✅ " if any(mark(k) for k in keys) else ""
+
         options = [
-            discord.SelectOption(label="Autoroles", value="autoroles", emoji="🎭",
+            discord.SelectOption(label=f"{mark('autoroles')}Autoroles", value="autoroles", emoji="🎭",
                                   description="Role(s) auto-given to every new member on join"),
             discord.SelectOption(label="Level Roles", value="levelroles", emoji="⭐",
                                   description="Pick roles awarded at each level (multi-select)"),
-            discord.SelectOption(label="Level-Up Announcements", value="levelup", emoji="🎉",
+            discord.SelectOption(label=f"{mark('levelup_channel')}Level-Up Announcements", value="levelup", emoji="🎉",
                                   description="Channel where level-up messages are posted"),
             discord.SelectOption(label="Automod", value="automod", emoji="🛡️",
                                   description="Toggle spam/invite/mention/zalgo filters"),
             discord.SelectOption(label="Anti-Nuke", value="antinuke", emoji="🚨",
                                   description="Mass channel/role/ban/webhook/permgrant protection"),
-            discord.SelectOption(label="Tickets", value="tickets", emoji="🎫",
+            discord.SelectOption(label=f"{mark('ticket_category_id')}Tickets", value="tickets", emoji="🎫",
                                   description="Ticket category & support role"),
-            discord.SelectOption(label="Staff Roles", value="staffroles", emoji="🪪",
+            discord.SelectOption(label=f"{mark_any('staffrole_trial', 'staffrole_mod', 'staffrole_senior')}Staff Roles", value="staffroles", emoji="🪪",
                                   description="Trial Mod / Mod / Senior Mod / Partnership Manager"),
-            discord.SelectOption(label="Welcome Channel", value="welcome_channel", emoji="👋",
+            discord.SelectOption(label=f"{mark('welcome_channel')}Welcome Channel", value="welcome_channel", emoji="👋",
                                   description="Channel where welcome messages are posted on join"),
-            discord.SelectOption(label="Invite Tracker", value="invite_tracker", emoji="📨",
+            discord.SelectOption(label=f"{mark('invite_log_channel')}Invite Tracker", value="invite_tracker", emoji="📨",
                                   description="Channel that shows who invited each new member"),
-            discord.SelectOption(label="Logs", value="logs", emoji="📚",
+            discord.SelectOption(label=f"{mark('modlog_channel')}Logs", value="logs", emoji="📚",
                                   description="Mod, message, automod, server, entry/exit, bot, transcripts"),
             discord.SelectOption(label="Stats Channels", value="statschannels", emoji="📊",
                                   description="Point Members/Boosts counters at existing channels"),
             discord.SelectOption(label="Re-sync Stats Channels", value="stats", emoji="🔄",
                                   description="Refresh the Members/Boosts trackers now"),
         ]
-        super().__init__(placeholder="⚙️ Choose something to configure...", options=options)
+        super().__init__(placeholder="⚙️ Choose something to configure... (✅ = already set)", options=options)
 
     async def callback(self, interaction: discord.Interaction):
         value = self.values[0]
@@ -3583,9 +3789,9 @@ class SetupHubSelect(discord.ui.Select):
 
 
 class SetupHubView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, config: dict = None):
         super().__init__(timeout=300)
-        self.add_item(SetupHubSelect())
+        self.add_item(SetupHubSelect(config))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4294,6 +4500,22 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                               after.id, f"granting an admin role to {after}")
 
 
+def _command_usage(ctx: commands.Context) -> str:
+    """Builds a `.command <arg1> [arg2]` usage string from the command's
+    actual signature, so error messages can show real usage instead of just
+    pointing at `.help` and making the person go dig for it themselves."""
+    cmd = ctx.command
+    if cmd is None:
+        return f"{PREFIX}{ctx.invoked_with}"
+    parts = [f"{PREFIX}{cmd.qualified_name}"]
+    for name, param in cmd.clean_params.items():
+        if param.default is param.empty:
+            parts.append(f"<{name}>")
+        else:
+            parts.append(f"[{name}]")
+    return " ".join(parts)
+
+
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.CommandNotFound):
@@ -4302,10 +4524,12 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         await send_reply(ctx, f"⏳ Slow down — try that again in `{error.retry_after:.1f}s`.", delete_after=5)
         return
     if isinstance(error, commands.MissingRequiredArgument):
-        await send_reply(ctx, f"⚠️ Missing argument: `{error.param.name}`. Check `{PREFIX}help`.")
+        usage = _command_usage(ctx)
+        await send_reply(ctx, f"⚠️ Missing argument: `{error.param.name}`.\n**Usage:** `{usage}`")
         return
     if isinstance(error, commands.TooManyArguments):
-        await send_reply(ctx, f"⚠️ Too many arguments for that command. Check `{PREFIX}help`.")
+        usage = _command_usage(ctx)
+        await send_reply(ctx, f"⚠️ Too many arguments.\n**Usage:** `{usage}`")
         return
     if isinstance(error, commands.MissingPermissions):
         return  # staff_tier_check() and friends already message the user themselves
@@ -4323,8 +4547,18 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.NoPrivateMessage):
         await send_reply(ctx, "⚠️ That command only works in a server, not in DMs.")
         return
+    if isinstance(error, (commands.MemberNotFound, commands.UserNotFound)):
+        await send_reply(ctx, f"⚠️ Couldn't find that member — try mentioning them (`@user`) or pasting their ID.")
+        return
+    if isinstance(error, commands.RoleNotFound):
+        await send_reply(ctx, f"⚠️ Couldn't find that role — try mentioning it, or pasting the exact name/ID.")
+        return
+    if isinstance(error, commands.ChannelNotFound):
+        await send_reply(ctx, f"⚠️ Couldn't find that channel — try mentioning it (`#channel`) or pasting its ID.")
+        return
     if isinstance(error, commands.BadArgument):
-        await send_reply(ctx, f"⚠️ Bad argument: {error}")
+        usage = _command_usage(ctx)
+        await send_reply(ctx, f"⚠️ Bad argument: {error}\n**Usage:** `{usage}`")
         return
 
     # CommandInvokeError wraps whatever actually went wrong inside the command
@@ -4377,6 +4611,79 @@ async def on_error(event_method: str, *args, **kwargs):
 @bot.command(name="ping")
 async def ping_cmd(ctx: commands.Context):
     await send_reply(ctx, f"🏓 Pong! `{round(bot.latency * 1000)}ms`")
+
+
+@bot.command(name="checklist", aliases=["configstatus", "setupstatus"])
+async def checklist_cmd(ctx: commands.Context):
+    """At-a-glance view of what's configured vs still missing, grouped by
+    category — instead of opening the setup hub and checking each dropdown
+    one by one to figure out what's left. ✅ = set, ⚠️ = not set but optional,
+    ❌ = not set and probably worth doing."""
+    config = await get_config(ctx.guild.id, bot.db)
+
+    def has(key) -> bool:
+        val = config.get(key)
+        return bool(val) if not isinstance(val, list) else len(val) > 0
+
+    def line(label: str, key: str, critical: bool = False) -> str:
+        if has(key):
+            return f"✅ {label}"
+        return f"❌ {label}" if critical else f"⚠️ {label}"
+
+    staff_lines = [
+        line("Trial Moderator role", "staffrole_trial"),
+        line("Moderator role", "staffrole_mod"),
+        line("Senior Moderator role", "staffrole_senior"),
+    ]
+    staff_done = sum(1 for k in ("staffrole_trial", "staffrole_mod", "staffrole_senior") if has(k))
+
+    logs_keys = [
+        ("Mod Log", "modlog_channel", True),
+        ("Automod Logs", "automod_log_channel", False),
+        ("Server Logs", "log_server_channel", False),
+        ("Entry/Exit Logs", "log_entryexit_channel", False),
+        ("Anti-Nuke Alerts", "log_alerts_channel", True),
+        ("Bot Logs", "log_bot_channel", False),
+    ]
+    logs_lines = [line(label, key, critical) for label, key, critical in logs_keys]
+    logs_done = sum(1 for label, key, critical in logs_keys if has(key))
+
+    extras_lines = [
+        line("Welcome Channel", "welcome_channel"),
+        line("Invite Tracker", "invite_log_channel"),
+        line("Autoroles", "autoroles"),
+        line("Members/Boosts Counters", "members_stats_channel"),
+        line("Tickets (category + support role)", "ticket_category_id"),
+    ]
+
+    antinuke_on = sum(1 for key, _, _ in ANTINUKE_FEATURES if config.get(f"antinuke_{key}", True))
+    automod_on = sum(1 for key, _, _ in AUTOMOD_FEATURES if config.get(f"automod_{key}", True))
+
+    protection_lines = [
+        f"🚨 Anti-Nuke: **{antinuke_on}/{len(ANTINUKE_FEATURES)}** protections on",
+        f"🛡️ Automod: **{automod_on}/{len(AUTOMOD_FEATURES)}** filters on",
+    ]
+
+    overall_critical_missing = [label for label, key, critical in logs_keys if critical and not has(key)] + \
+                                ([ "Staff roles" ] if staff_done == 0 else [])
+
+    embed = discord.Embed(
+        title="📋 aj's crib — Setup Checklist",
+        color=discord.Color.orange() if overall_critical_missing else discord.Color.green(),
+        description=(
+            "Run `.setup` to open the interactive hub and fix anything below."
+            if overall_critical_missing else
+            "Core setup looks complete — anything marked ⚠️ below is optional."
+        ),
+    )
+    embed.add_field(name=f"🪪 Staff Roles ({staff_done}/3)", value="\n".join(staff_lines), inline=True)
+    embed.add_field(name=f"📚 Logs ({logs_done}/{len(logs_keys)})", value="\n".join(logs_lines), inline=True)
+    embed.add_field(name="🔧 Extras", value="\n".join(extras_lines), inline=False)
+    embed.add_field(name="🛡️ Protection Systems", value="\n".join(protection_lines), inline=False)
+    if overall_critical_missing:
+        embed.add_field(name="⚠️ Worth fixing first", value=", ".join(overall_critical_missing), inline=False)
+    embed.set_footer(text="✅ set · ❌ missing (recommended) · ⚠️ missing (optional)")
+    await ctx.send(embed=embed)
 
 
 @bot.command(name="botinfo", aliases=["uptime", "status"])
@@ -4465,7 +4772,11 @@ async def help_cmd(ctx: commands.Context, category: str = None):
                 f"**Lockdown:** `{PREFIX}serverlockdown` / `{PREFIX}serverunlock` *(Senior+)*\n"
                 f"`{PREFIX}lockdown [#ch]` / `{PREFIX}unlock [#ch]` — one channel *(Senior+)*\n"
                 f"**Nuke protection:** mass deletes, ban/kick sprees, webhook spam, admin grants → "
-                f"instantly strips + mutes the culprit, alerts owner. Nobody is exempt but the owner."
+                f"instantly strips + mutes the culprit, alerts owner. Nobody is exempt but the owner. "
+                f"Repeat offenders get longer timeouts automatically.\n"
+                f"`{PREFIX}release <user_id>` — undo a containment *(Senior+)*\n"
+                f"`{PREFIX}antinukestrikes <user_id>` — see their trip history *(Mod+)*\n"
+                f"`{PREFIX}antinukereset <user_id>` — clear strikes after a false positive *(Senior+)*"
             ),
         },
         "tickets": {
@@ -4515,6 +4826,7 @@ async def help_cmd(ctx: commands.Context, category: str = None):
             "title": "Setup & Config",
             "value": (
                 f"`{PREFIX}quicksetup` — counter channels + config hub\n"
+                f"`{PREFIX}checklist` — see what's configured vs missing, at a glance\n"
                 f"`{PREFIX}setwelcome` / `{PREFIX}setinvitelog <template>` — `{{user}} {{server}} {{count}}`\n"
                 f"`{PREFIX}testwelcome` / `{PREFIX}testinvitelog` — preview\n"
                 f"`{PREFIX}config [key] [value]` *(Admin)*\n"
@@ -5455,7 +5767,8 @@ async def quicksetup_cmd(ctx: commands.Context):
             "**Want more?** Pick a category below — level roles, automod, anti-nuke, tickets, logs, and more."
         ),
     )
-    await msg.edit(content=None, embed=embed, view=SetupHubView())
+    fresh_config = await bot.db.get_config(guild.id)
+    await msg.edit(content=None, embed=embed, view=SetupHubView(fresh_config))
 
 
 
@@ -5541,12 +5854,43 @@ async def raidage_cmd(ctx: commands.Context, hours: int = None):
 async def release_cmd(ctx: commands.Context, user_id: int):
     """Restore a member anti-nuke contained — gives back exactly the roles
     they held before containment and lifts their timeout. Use this if
-    anti-nuke caught a false positive."""
+    anti-nuke caught a false positive. Note: this does NOT clear their
+    escalation strike count — use `.antinukereset` for that separately, so a
+    released false-positive doesn't quietly also wipe a real strike history."""
     restored = await antinuke_release(ctx.guild, user_id)
     if restored == 0:
         await send_reply(ctx, "nothing to restore — either they're not contained or they left")
         return
     await send_reply(ctx, f"🔓 released <@{user_id}> — restored **{restored}** role(s) and lifted timeout")
+
+
+@bot.command(name="antinukereset")
+@staff_tier_check(TIER_SENIOR)
+async def antinukereset_cmd(ctx: commands.Context, user_id: int):
+    """Clears a user's lifetime anti-nuke strike count back to zero, so their
+    next trip (if any) gets the standard 1st-strike response instead of an
+    escalated one. Use this after confirming a trip (or trips) were false
+    positives — it does NOT release an active containment, use `.release`
+    for that."""
+    strikes = await bot.db.get_antinuke_strikes(ctx.guild.id, user_id)
+    if strikes == 0:
+        await send_reply(ctx, f"<@{user_id}> has no anti-nuke strikes on record")
+        return
+    await bot.db.reset_antinuke_strikes(ctx.guild.id, user_id)
+    await send_reply(ctx, f"🧹 cleared **{strikes}** anti-nuke strike(s) for <@{user_id}> — next trip starts fresh")
+
+
+@bot.command(name="antinukestrikes")
+@staff_tier_check(TIER_MOD)
+async def antinukestrikes_cmd(ctx: commands.Context, user_id: int):
+    """Shows how many times a user has tripped anti-nuke (lifetime, survives
+    `.release` and bot restarts)."""
+    strikes = await bot.db.get_antinuke_strikes(ctx.guild.id, user_id)
+    if strikes == 0:
+        await send_reply(ctx, f"<@{user_id}> has no anti-nuke strikes on record")
+        return
+    next_duration = ANTINUKE_ESCALATION.get(strikes + 1, ANTINUKE_ESCALATION_MAX)
+    await send_reply(ctx, f"<@{user_id}> has **{strikes}** anti-nuke strike(s) — their next trip would escalate to a **{_format_escalation_duration(next_duration)}** timeout")
 
 
 @bot.command(name="analytics")
