@@ -1513,28 +1513,37 @@ def _has_banned_word(content: str, guild_id: int, config: dict) -> bool:
     return bool(pattern and pattern.search(content))
 
 
-async def run_automod(message: discord.Message, config: dict, allow_invites: bool = False) -> Optional[str]:
+async def run_automod(message: discord.Message, config: dict, allow_invites: bool = False,
+                      content_filter_exempt: bool = False) -> Optional[str]:
     """Returns a human-readable violation reason, or None if the message is clean.
     Checks text content AND attachments/images — image spam is just as disruptive
-    as text spam and is now detected and actioned exactly the same way."""
+    as text spam and is now detected and actioned exactly the same way.
+
+    content_filter_exempt=True skips word/invite/link/shortener filters for Mod-tier+
+    staff (those are legitimate mod tools), but NEVER skips scam links, spam, flood,
+    mention-spam, zalgo, or emoji-spam — staff can abuse those just as easily."""
     content = message.content or ""
     key = (message.guild.id, message.author.id)
 
+    # Scam/phishing — always checked, no staff exemption.
     if config.get("automod_scamlinks", True) and _has_scam_link(content):
         return "posting a known scam/phishing link"
 
-    if config.get("automod_bannedwords", True) and _has_banned_word(content, message.guild.id, config):
-        return "using a banned word/phrase"
+    # Content filters — Mod-tier+ staff skip these (posting invites/links is their job).
+    if not content_filter_exempt:
+        if config.get("automod_bannedwords", True) and _has_banned_word(content, message.guild.id, config):
+            return "using a banned word/phrase"
 
-    if config.get("automod_antiinvite", True) and not allow_invites and _has_invite(content):
-        return "posting an unauthorized invite link"
+        if config.get("automod_antiinvite", True) and not allow_invites and _has_invite(content):
+            return "posting an unauthorized invite link"
 
-    if config.get("automod_antishortener", True) and not allow_invites and not _is_media_link_only(content) and _has_shortener_link(content):
-        return "posting a link-shortener (hides the real destination)"
+        if config.get("automod_antishortener", True) and not allow_invites and not _is_media_link_only(content) and _has_shortener_link(content):
+            return "posting a link-shortener (hides the real destination)"
 
-    if config.get("automod_antilink", False) and not allow_invites and not _is_media_link_only(content) and _has_link(content):
-        return "posting an unauthorized link"
+        if config.get("automod_antilink", False) and not allow_invites and not _is_media_link_only(content) and _has_link(content):
+            return "posting an unauthorized link"
 
+    # Spam/abuse checks — always checked, no staff exemption.
     if config.get("automod_mentionspam", True) and _is_mention_spam(message):
         return "mass-mention spam"
 
@@ -1818,7 +1827,18 @@ async def has_partnership_perm(member: discord.Member, config: dict) -> bool:
 
 
 async def is_automod_exempt(member: discord.Member, config: dict) -> bool:
-    """Mod-tier and above are trusted not to get caught by spam/zalgo/mention filters."""
+    """Returns True ONLY for the server owner — nobody else gets a blanket automod
+    pass. Staff abuse (spam, scam links, mention spam, etc.) is handled separately
+    inside handle_automod_violation, which strips their staff role(s) and mutes them
+    instead of the normal warn path."""
+    return bool(member.guild.owner_id and member.id == member.guild.owner_id)
+
+
+async def _is_content_filter_exempt(member: discord.Member, config: dict) -> bool:
+    """Mod-tier+ staff and admins may bypass the word filter, invite filter,
+    link filter, and shortener filter — posting those is legitimately part of
+    their job. They are NOT exempt from spam, flood, scam-link, mention-spam,
+    zalgo, or emoji-spam checks."""
     if member.guild_permissions.administrator or member.guild_permissions.manage_messages:
         return True
     tier = await get_staff_tier(member, config)
@@ -4016,10 +4036,15 @@ async def on_message(message: discord.Message):
 
     config = await get_config(message.guild.id, bot.db)
 
-    # ── Automod (mod-tier+ staff are trusted; Partnership Manager bypasses invites only) ──
+    # ── Automod: only the server owner is fully exempt.
+    # Mod-tier+ staff still bypass word/invite/link filters (legitimate mod tools),
+    # but spam, flood, scam-link, mention-spam, zalgo, and emoji-spam are ALWAYS
+    # checked — staff can abuse those just like anyone else.
     if not await is_automod_exempt(message.author, config):
         allow_invites = await can_post_invites(message.author, config)
-        reason = await run_automod(message, config, allow_invites=allow_invites)
+        content_filter_exempt = await _is_content_filter_exempt(message.author, config)
+        reason = await run_automod(message, config, allow_invites=allow_invites,
+                                   content_filter_exempt=content_filter_exempt)
         if reason:
             await handle_automod_violation(message, config, reason)
             return  # deleted message — don't award XP or process it as a command
